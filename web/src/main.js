@@ -307,8 +307,12 @@ const fieldLabels = {
   start_diameter: "Start diameter",
   end_diameter: "End diameter",
   origin: "Origin",
+  plane_normal: "Sketch plane normal",
   direction: "Axis direction",
   x_direction: "Sketch X direction",
+  support_patch_id: "Sketch support surface",
+  terminating_patch_id: "Termination surface",
+  extent_kind: "Feature extent",
   outer: "Outer profile",
   profile: "Sketch profile",
   holes: "Profile openings",
@@ -337,6 +341,7 @@ const enumValues = {
   mode: ["add", "cut", "fillet", "chamfer"],
   selector: ["all", "circle", "outer", "nearest"],
   end: ["start", "end", "both"],
+  extent_kind: ["distance", "through_all", "up_to_patch"],
 };
 
 const internalFields = new Set([
@@ -398,7 +403,7 @@ function labelFor(key, index = null) {
 }
 
 function isDimensionPath(path) {
-  return !path.includes("direction") && !path.endsWith("feature_index");
+  return !path.includes("direction") && !path.includes("normal") && !path.endsWith("feature_index");
 }
 
 function numberStep(value, path) {
