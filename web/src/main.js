@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
+import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import "./styles.css";
 
 const app = document.querySelector("#app");
@@ -216,8 +217,11 @@ class MeshViewer {
   }
 
   async load(buffer, { resetCamera = true } = {}) {
-    const geometry = new STLLoader().parse(buffer);
-    geometry.computeVertexNormals();
+    const rawGeometry = new STLLoader().parse(buffer);
+    // STL stores independent triangle normals, so computeVertexNormals alone
+    // still makes exact CAD cylinders look polygonal. Average only across
+    // shallow tessellation edges; real mechanical creases remain sharp.
+    const geometry = toCreasedNormals(rawGeometry, THREE.MathUtils.degToRad(30));
     const hadMesh = Boolean(this.mesh);
     if (this.mesh) {
       this.scene.remove(this.mesh);

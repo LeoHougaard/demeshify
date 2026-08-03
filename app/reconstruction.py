@@ -48,6 +48,7 @@ from .profiles import (
     mesh_has_conical_patch,
     mesh_has_spatially_curved_patch,
     mesh_has_toroidal_patch,
+    rank_curve_aligned_axes,
     section_shape,
 )
 from .schemas import (
@@ -317,7 +318,11 @@ def reconstruct(
     # sharing the machine. Process CPU time makes candidate coverage stable
     # across browser use and parallel benchmark workers; the outer worker
     # timeout remains the wall-clock safety boundary.
-    search_deadline = time.process_time() + 210.0
+    search_seconds = max(
+        15.0,
+        float(environ.get("MESHMIND_MAX_SEARCH_SECONDS", "120")),
+    )
+    search_deadline = time.process_time() + search_seconds
     budget_warning_added = False
 
     def search_budget_available() -> bool:
@@ -326,8 +331,8 @@ def reconstruct(
             return True
         if not budget_warning_added:
             warnings.append(
-                "The bounded refinement search reached 210 seconds; the best valid "
-                "construction found so far was exported."
+                f"The bounded refinement search reached {search_seconds:g} "
+                "seconds; the best valid construction found so far was exported."
             )
             budget_warning_added = True
         return False
@@ -892,16 +897,26 @@ def reconstruct(
         measured_cylinder_plans = generate_oriented_cylinder_candidates(
             data,
             best.plan,
+            cuts_only=True,
         )
         if "CYLINDER" in existing_surface_types and not measured_cylinder_plans:
             return
-        candidate_plans = [*measured_cylinder_plans]
+        # The generator returns the all-missing-patches plan first, followed by
+        # one-patch diagnostic alternatives. Coverage is now mandatory, so the
+        # individual alternatives cannot win when more than one patch is
+        # missing and only multiply expensive B-rep rebuilds.
+        candidate_plans = measured_cylinder_plans[:1]
         if "CYLINDER" not in existing_surface_types:
             candidate_plans.extend(
                 generate_round_boundary_feature_candidates(data, best.plan)[:12]
             )
-        analytic: list[ScoredCandidate] = []
+        baseline_operation_count = len(best.plan.operations)
+        analytic: list[tuple[ScoredCandidate, int]] = []
         for index, cylinder_plan in enumerate(candidate_plans):
+            recovered_feature_count = max(
+                0,
+                len(cylinder_plan.operations) - baseline_operation_count,
+            )
             try:
                 candidate = score_plan(
                     data,
@@ -917,55 +932,38 @@ def reconstruct(
                     and "CYLINDER" in candidate_surface_types
                     and required_existing_types.issubset(candidate_surface_types)
                 ):
-                    analytic.append(candidate)
+                    analytic.append((candidate, recovered_feature_count))
             except Exception as exc:
                 warnings.append(
                     f"Final cylinder candidate {index + 1} could not be built: {exc}"
                 )
         if not analytic:
             return
-        cylinder_best = min(
+        # The first measured candidate intentionally combines every missing
+        # cylindrical patch.  Choosing by operation count used to prefer a
+        # single cut, leaving the remaining bores trapped as slightly
+        # different circles in adjacent slab profiles.  Those rings render as
+        # stepped holes and are not useful editable CAD.  Coverage is therefore
+        # the primary invariant; score and feature count only break ties among
+        # candidates that recover the same number of measured cylinders.
+        maximum_recovered_count = max(count for _, count in analytic)
+        cylinder_best, _ = min(
             analytic,
-            key=lambda candidate: (
-                len(candidate.plan.operations),
-                candidate.report.score,
+            key=lambda item: (
+                -item[1],
+                item[0].report.score,
+                len(item[0].plan.operations),
             ),
         )
-        compact: list[ScoredCandidate] = []
-        if len(cylinder_best.plan.operations) > len(best.plan.operations):
-            for drop_index in range(len(best.plan.operations)):
-                simplified = cylinder_best.plan.model_copy(deep=True)
-                simplified.operations.pop(drop_index)
-                try:
-                    candidate = score_plan(
-                        data,
-                        simplified,
-                        destination
-                        / "candidates"
-                        / f"final-cylinder-{label}-compact-{drop_index:02d}",
-                        candidate_count=len(generated) + drop_index + 1,
-                    )
-                    candidate_surface_types = exported_surface_types(candidate)
-                    if (
-                        geometry_is_acceptable(candidate)
-                        and "CYLINDER" in candidate_surface_types
-                        and required_existing_types.issubset(
-                            candidate_surface_types
-                        )
-                    ):
-                        compact.append(candidate)
-                except Exception:
-                    pass
-        best = min(
-            compact or [cylinder_best],
-            key=lambda candidate: (
-                len(candidate.plan.operations),
-                candidate.report.score,
-            ),
-        )
+        # Do not run the generic one-operation-at-a-time deletion sweep here.
+        # Besides rebuilding large models dozens of times, that sweep can
+        # trade semantic feature coverage for a tiny score change. Dedicated
+        # compaction passes run before this topology-preservation invariant.
+        best = cylinder_best
         warnings.append(
-            "Preserved a detected smooth round patch as an analytic cylinder "
-            "in the final STEP feature tree."
+            f"Preserved {maximum_recovered_count} detected smooth round "
+            "patches as continuous analytic cylinders in the final STEP "
+            "feature tree."
         )
 
     def preserve_detected_spheres(label: str) -> None:
@@ -1074,21 +1072,84 @@ def reconstruct(
                 "radius-change loft features and analytic conical faces."
             )
 
+    def recover_curve_aligned_layering(label: str) -> None:
+        """Rebuild shallow tangent arcs in sketches normal to their axis.
+
+        A shallow partial cylinder is not a full-cylinder feature.  Modeling it
+        with slabs normal to another axis creates the visible staircase seen on
+        tangent wing curves.  When an alternate cardinal section repeatedly
+        contains fitted arcs, build the ordered layers in that axis instead,
+        then recover every measured cross-axis cylinder and cone explicitly.
+        """
+
+        nonlocal best
+        base_axis = getattr(best.plan.base, "axis", None)
+        if (
+            not weighted_layer_complete
+            or not isinstance(base_axis, Axis)
+            or len(best.plan.operations) < 15
+            or not has_spatially_curved_patch()
+            or has_toroidal_patch()
+        ):
+            return
+
+        ranked_axes = rank_curve_aligned_axes(data, excluded_axis=base_axis)
+        if not ranked_axes or ranked_axes[0][1] < 2:
+            return
+        curve_axis = ranked_axes[0][0]
+        plans = generate_change_weighted_layer_candidates(
+            data,
+            name,
+            curve_axis,
+            layer_budget=30,
+        )
+        if not plans:
+            return
+        curve_plan = plans[0]
+        cylinder_plans = generate_oriented_cylinder_candidates(data, curve_plan)
+        if cylinder_plans:
+            curve_plan = cylinder_plans[0]
+        cone_plans = generate_conical_hole_candidates(data, curve_plan)
+        if cone_plans:
+            curve_plan = cone_plans[0]
+        try:
+            candidate = score_plan(
+                data,
+                curve_plan,
+                destination / "candidates" / f"curve-aligned-{label}",
+                candidate_count=len(generated) + 1,
+            )
+        except Exception as exc:
+            warnings.append(
+                f"Curve-aligned reconstruction could not be built: {exc}"
+            )
+            return
+        if (
+            geometry_is_acceptable(candidate)
+            and candidate.report.volume_error_percent <= 1.5
+            and candidate.report.chamfer_p95_mm
+            <= _acceptance_threshold(data.diagonal)
+        ):
+            best = candidate
+            warnings.append(
+                f"Reoriented the ordered construction to {curve_axis.value} so "
+                "shallow tangent curves remain analytic sketch arcs, then "
+                "recovered cross-axis holes as continuous cylinders."
+            )
+
     def recover_smooth_loft(label: str) -> None:
         nonlocal best
         if (
             (weighted_layer_complete and geometry_is_acceptable(best))
-            or
-            len(best.plan.operations) <= 9
+            or len(best.plan.operations) <= 9
             or "CONE" in exported_surface_types(best)
             or not has_spatially_curved_patch()
             or has_conical_patch()
         ):
             return
         lofts: list[ScoredCandidate] = []
-        for index, loft_plan in enumerate(
-            generate_smooth_loft_candidates(data, name)
-        ):
+        loft_plans = generate_smooth_loft_candidates(data, name)
+        for index, loft_plan in enumerate(loft_plans):
             try:
                 candidate = score_plan(
                     data,
@@ -1098,7 +1159,11 @@ def reconstruct(
                 )
                 if (
                     geometry_is_acceptable(candidate)
-                    and len(candidate.plan.operations) < len(best.plan.operations)
+                    and (
+                        len(candidate.plan.operations) < len(best.plan.operations)
+                        or candidate.report.chamfer_p95_mm
+                        < best.report.chamfer_p95_mm
+                    )
                 ):
                     lofts.append(candidate)
                     if len(candidate.plan.operations) == 1:
@@ -1111,13 +1176,14 @@ def reconstruct(
             best = min(
                 lofts,
                 key=lambda candidate: (
-                    len(candidate.plan.operations),
                     candidate.report.score,
+                    len(candidate.plan.operations),
                 ),
             )
             warnings.append(
-                "Replaced a dense changing-profile slab stack with one editable "
-                "multi-section smooth loft."
+                "Replaced continuous portions of a changing-profile slab stack "
+                "with editable tangent lofts while retaining sharp topology "
+                "changes."
             )
 
     def recover_profiled_endcap_cylinder(label: str) -> None:
@@ -1562,6 +1628,22 @@ def reconstruct(
         weighted_scored: list[ScoredCandidate] = []
         detected_cone = has_conical_patch()
         detected_torus = has_toroidal_patch()
+
+        def weighted_is_acceptable(candidate: ScoredCandidate) -> bool:
+            if geometry_is_acceptable(candidate):
+                return True
+            return (
+                detected_torus
+                and candidate.report.valid_solid
+                and candidate.report.volume_error_percent <= 2.0
+                and candidate.report.chamfer_p95_mm
+                <= _acceptance_threshold(data.diagonal) * 1.5
+                and any(
+                    isinstance(operation, EdgeFinishFeature)
+                    and operation.mode == "fillet"
+                    for operation in candidate.plan.operations
+                )
+            )
         thin_axis = min(
             Axis,
             key=lambda axis: float(data.mesh.extents[axis_index[axis]]),
@@ -1571,12 +1653,18 @@ def reconstruct(
             if isinstance(base_axis, Axis)
             else [thin_axis, *(axis for axis in Axis if axis != thin_axis)]
         )
-        layer_budgets = (
-            (26,)
-            if isinstance(best.plan.base, OrientedExtrudeFeature)
+        if (
+            isinstance(best.plan.base, OrientedExtrudeFeature)
             and not geometry_is_acceptable(best)
-            else (10, 12, 18, 24, 25, 26)
-        )
+        ):
+            layer_budgets = (26,)
+        elif detected_torus:
+            # Toroidal rounds need meaningful section density. The 12-layer
+            # variant is commonly no better than 10 while consuming the score
+            # slot needed to reach 24 within the bounded search.
+            layer_budgets = (10, 18, 24, 26)
+        else:
+            layer_budgets = (10, 12, 18, 24, 25, 26)
         weighted_index = 0
         for weighted_axis in weighted_axes:
             for layer_budget in layer_budgets:
@@ -1615,6 +1703,22 @@ def reconstruct(
                     elif detected_torus and finish_modes == {"fillet"}:
                         filtered_weighted.append(weighted_plan)
                 weighted_candidates = filtered_weighted
+                if detected_torus:
+                    torus_candidates = [
+                        weighted_plan
+                        for weighted_plan in weighted_candidates
+                        if any(
+                            isinstance(operation, EdgeFinishFeature)
+                            and operation.mode == "fillet"
+                            for operation in weighted_plan.operations
+                        )
+                    ]
+                    if torus_candidates:
+                        # A positively detected toroidal target must retain a
+                        # fillet. Scoring the otherwise identical plain slab
+                        # plan at every layer budget wastes half the bounded
+                        # search without satisfying the topology constraint.
+                        weighted_candidates = torus_candidates[:1]
                 for weighted_plan in weighted_candidates:
                     if not search_budget_available():
                         break
@@ -1652,7 +1756,7 @@ def reconstruct(
                         )
                     weighted_index += 1
                 if any(
-                    geometry_is_acceptable(candidate)
+                    weighted_is_acceptable(candidate)
                     and len(candidate.plan.operations) <= 26
                     and any(
                         isinstance(operation, EdgeFinishFeature)
@@ -1664,7 +1768,7 @@ def reconstruct(
                 if not search_budget_available():
                     break
             if any(
-                geometry_is_acceptable(candidate)
+                weighted_is_acceptable(candidate)
                 and len(candidate.plan.operations) <= 26
                 and any(
                     isinstance(operation, EdgeFinishFeature)
@@ -1676,7 +1780,7 @@ def reconstruct(
         acceptable_weighted = [
             candidate
             for candidate in weighted_scored
-            if geometry_is_acceptable(candidate)
+            if weighted_is_acceptable(candidate)
             and len(candidate.plan.operations) <= 26
         ]
         if acceptable_weighted:
@@ -2380,6 +2484,10 @@ def reconstruct(
     # recovery.  Give that final exported plan one small, topology-focused pass
     # even when the broader exploratory search has consumed its CPU budget.
     final_refinements: list[tuple[str, Callable[[], None]]] = [
+        (
+            "recover_curve_aligned_layering",
+            lambda: recover_curve_aligned_layering("final"),
+        ),
         ("compact_coplanar_regions", lambda: compact_coplanar_regions("final")),
         ("compact_round_hole_patterns", lambda: compact_round_hole_patterns("final")),
         (

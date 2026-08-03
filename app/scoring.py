@@ -62,7 +62,10 @@ def score_plan(
     directory: Path,
     candidate_count: int,
 ) -> ScoredCandidate:
-    export_plan(plan, directory)
+    # Search candidates use a coarser preview tessellation. The STEP B-rep is
+    # identical, while avoiding high-quality browser meshing for every plan in
+    # the search. The selected final model is exported at display quality.
+    export_plan(plan, directory, high_quality_stl=False)
     candidate_mesh = _load_candidate(directory / "reconstruction.stl")
 
     target_points = surface_samples(data.mesh)

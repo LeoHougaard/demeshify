@@ -589,12 +589,30 @@ def build_plan(plan: ReconstructionPlan) -> cq.Workplane:
     return result
 
 
-def export_plan(plan: ReconstructionPlan, directory: Path) -> cq.Workplane:
+def export_plan(
+    plan: ReconstructionPlan,
+    directory: Path,
+    *,
+    high_quality_stl: bool = True,
+) -> cq.Workplane:
     directory.mkdir(parents=True, exist_ok=True)
     normalize_plan(plan)
     result = build_plan(plan)
     cq.exporters.export(result, str(directory / "reconstruction.step"))
-    cq.exporters.export(result, str(directory / "reconstruction.stl"), tolerance=0.02)
+    if high_quality_stl:
+        cq.exporters.export(
+            result,
+            str(directory / "reconstruction.stl"),
+            tolerance=0.01,
+            angularTolerance=0.04,
+        )
+    else:
+        cq.exporters.export(
+            result,
+            str(directory / "reconstruction.stl"),
+            tolerance=0.02,
+            angularTolerance=0.1,
+        )
     (directory / "reconstruction.py").write_text(plan_to_source(plan), encoding="utf-8")
     (directory / "plan.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
     return result

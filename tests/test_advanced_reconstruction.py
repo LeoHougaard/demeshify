@@ -31,6 +31,7 @@ from app.profiles import (
     generate_profiled_endcap_cylinder_candidates,
     generate_spherical_corner_finish_candidates,
     mesh_has_conical_patch,
+    rank_curve_aligned_axes,
 )
 from app.reconstruction import reconstruct
 from app.schemas import (
@@ -150,6 +151,46 @@ def test_change_weighted_layers_reuse_probe_sections(tmp_path: Path) -> None:
 
     assert candidates
     assert len(data.section_cache) == 12
+
+
+def test_curve_axis_ranking_is_driven_by_shallow_arc_geometry(
+    tmp_path: Path,
+) -> None:
+    radius = 20.0
+    start_angle = math.radians(-30.0)
+    mid_angle = math.radians(-15.0)
+    tangent_stock = (
+        cq.Workplane("XY")
+        .moveTo(-20.0, -10.0)
+        .lineTo(radius * math.cos(start_angle), radius * math.sin(start_angle))
+        .threePointArc(
+            (radius * math.cos(mid_angle), radius * math.sin(mid_angle)),
+            (radius, 0.0),
+        )
+        .lineTo(radius, 10.0)
+        .lineTo(-20.0, 10.0)
+        .close()
+        .extrude(8.0)
+    )
+    stl_path = step_to_stl(tangent_stock, tmp_path, "generic_tangent_stock")
+    data = load_mesh(stl_path, stl_path.name, "mm")
+
+    ranked = rank_curve_aligned_axes(data, excluded_axis=Axis.Y)
+
+    assert ranked
+    assert ranked[0][0] == Axis.Z
+    assert ranked[0][1] >= 3
+
+
+def test_curve_axis_ranking_does_not_trigger_for_plain_box(tmp_path: Path) -> None:
+    stl_path = step_to_stl(
+        cq.Workplane("XY").box(20, 12, 8),
+        tmp_path,
+        "plain_box",
+    )
+    data = load_mesh(stl_path, stl_path.name, "mm")
+
+    assert rank_curve_aligned_axes(data, excluded_axis=Axis.Y) == []
 
 
 def test_equal_cost_revolve_fit_keeps_full_tangent_arc() -> None:

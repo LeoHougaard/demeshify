@@ -2539,6 +2539,327 @@ def generate_change_weighted_layer_candidates(
     return candidates
 
 
+def rank_curve_aligned_axes(
+    data: MeshData,
+    excluded_axis: Axis | None = None,
+) -> list[tuple[Axis, int]]:
+    """Rank cardinal construction axes by repeated outer sketch-arc evidence."""
+
+    ranked: list[tuple[Axis, int]] = []
+    for axis, (_, _, _, axis_index) in AXES.items():
+        if axis == excluded_axis:
+            continue
+        lower, upper = data.mesh.bounds[:, axis_index]
+        support = 0
+        for fraction in (0.1, 0.3, 0.5, 0.7, 0.9):
+            section = section_shape(
+                data,
+                axis,
+                float(lower + (upper - lower) * fraction),
+            )
+            if section is None or not isinstance(section.outer, PathProfile):
+                continue
+            support += sum(
+                isinstance(segment, ArcSegment)
+                for segment in section.outer.segments
+            )
+        if support:
+            ranked.append((axis, support))
+    return sorted(ranked, key=lambda item: (-item[1], item[0].value))
+
+
+def generate_segmented_smooth_layer_candidates(
+    data: MeshData,
+    name: str,
+    axis: Axis,
+    sample_count: int = 48,
+    layer_budget: int = 20,
+) -> list[ReconstructionPlan]:
+    """Replace changing extrusion slabs with continuous, topology-safe lofts.
+
+    The ordinary weighted-layer fallback is deliberately conservative, but a
+    stack of constant sections leaves stair steps on a tangent or tapered
+    surface.  This variant samples the same measured sections, separates true
+    topology changes from continuous shape changes, and lofts only within the
+    continuous runs.  Circular openings are emitted as independent axial hole
+    features so their walls remain continuous instead of inheriting a slightly
+    different radius from every section.
+    """
+
+    _, _, _, axis_index = AXES[axis]
+    axis_start, axis_end = data.mesh.bounds[:, axis_index]
+    probe_levels = np.linspace(axis_start, axis_end, sample_count + 1)
+    probe_midpoints = (probe_levels[:-1] + probe_levels[1:]) / 2.0
+    probe_sections: list[SectionShape] = []
+    for midpoint in probe_midpoints:
+        section = section_shape(data, axis, float(midpoint))
+        if section is None:
+            return []
+        probe_sections.append(section)
+
+    mean_area = float(np.mean([section.area for section in probe_sections]))
+    baseline = mean_area * 0.003
+    changes = np.asarray(
+        [
+            section.polygon.symmetric_difference(
+                probe_sections[min(index + 1, len(probe_sections) - 1)].polygon
+            ).area
+            + baseline
+            for index, section in enumerate(probe_sections)
+        ],
+        dtype=float,
+    )
+    cumulative = np.r_[0.0, np.cumsum(changes)]
+    indices = [
+        int(np.argmin(np.abs(cumulative - target)))
+        for target in np.linspace(0.0, float(cumulative[-1]), layer_budget + 1)
+    ]
+    indices[0] = 0
+    indices[-1] = sample_count
+    indices = sorted(set(indices))
+    levels = probe_levels[indices]
+    if len(levels) < 4:
+        return []
+
+    sections: list[SectionShape] = []
+    midpoints: list[float] = []
+    for start, end in zip(levels, levels[1:], strict=False):
+        midpoint = float((start + end) / 2.0)
+        probe_index = int(np.argmin(np.abs(probe_midpoints - midpoint)))
+        sections.append(probe_sections[probe_index])
+        midpoints.append(midpoint)
+
+    # A discontinuity remains a sharp extrusion boundary.  Smooth lofts are
+    # restricted to runs whose connected-region topology is stable and whose
+    # adjacent section change is small enough to represent a tangent surface.
+    split_before = {0}
+    for index in range(1, len(sections)):
+        previous = sections[index - 1]
+        current = sections[index]
+        shape_change = previous.polygon.symmetric_difference(current.polygon).area
+        reference_area = max(previous.area, current.area, 1e-9)
+        if (
+            len(previous.additional_regions) != len(current.additional_regions)
+            or shape_change / reference_area > 0.16
+        ):
+            split_before.add(index)
+    group_starts = sorted(split_before)
+    groups = [
+        (start, group_starts[index + 1] - 1)
+        if index + 1 < len(group_starts)
+        else (start, len(sections) - 1)
+        for index, start in enumerate(group_starts)
+    ]
+
+    first_midpoint = midpoints[0]
+    base = ExtrudeFeature(
+        axis=axis,
+        start=float(levels[0]),
+        depth=max(first_midpoint - float(levels[0]), 1e-6),
+        outer=sections[0].outer,
+    )
+    operations: list[
+        BooleanExtrudeFeature | RoundHoleFeature | TaperedAddFeature
+    ] = []
+    smooth_run_count = 0
+    for group_start, group_end in groups:
+        boundary_start = float(levels[group_start])
+        boundary_end = float(levels[group_end + 1])
+        first = midpoints[group_start]
+        last = midpoints[group_end]
+        if group_start > 0 and first > boundary_start + 1e-7:
+            operations.append(
+                BooleanExtrudeFeature(
+                    mode="add",
+                    axis=axis,
+                    start=boundary_start,
+                    depth=first - boundary_start,
+                    outer=sections[group_start].outer,
+                )
+            )
+        if group_end > group_start:
+            intermediate_indices = list(range(group_start + 1, group_end))
+            # Equal-count measured boundary points give OCCT compatible loft
+            # wires even when fitted source profiles contain different counts
+            # of lines and arcs. Phase/orientation alignment prevents twist;
+            # dense points retain tangent arcs without rounding sharp corners.
+            loft_profiles: list[PolygonProfile] = []
+            previous_points: np.ndarray | None = None
+            point_count = 96
+            for section_index in range(group_start, group_end + 1):
+                polygon = sections[section_index].polygon
+                if isinstance(polygon, MultiPolygon):
+                    polygon = max(polygon.geoms, key=lambda item: item.area)
+                points = np.asarray(
+                    [
+                        polygon.exterior.interpolate(
+                            point_index / point_count,
+                            normalized=True,
+                        ).coords[0]
+                        for point_index in range(point_count)
+                    ],
+                    dtype=float,
+                )
+                if previous_points is not None:
+                    variants = (
+                        np.roll(oriented, shift, axis=0)
+                        for oriented in (points, points[::-1])
+                        for shift in range(point_count)
+                    )
+                    points = min(
+                        variants,
+                        key=lambda item: float(
+                            np.mean((item - previous_points) ** 2)
+                        ),
+                    )
+                previous_points = points
+                loft_profiles.append(
+                    PolygonProfile(
+                        points=[
+                            (_clean(point[0]), _clean(point[1]))
+                            for point in points
+                        ]
+                    )
+                )
+            operations.append(
+                TaperedAddFeature(
+                    axis=axis,
+                    start=first - max(data.diagonal * 2e-6, 0.0001),
+                    depth=(
+                        last
+                        - first
+                        + 2 * max(data.diagonal * 2e-6, 0.0001)
+                    ),
+                    start_outer=loft_profiles[0],
+                    end_outer=loft_profiles[-1],
+                    intermediate_offsets=[
+                        midpoints[index]
+                        - first
+                        + max(data.diagonal * 2e-6, 0.0001)
+                        for index in intermediate_indices
+                    ],
+                    intermediate_profiles=loft_profiles[1:-1],
+                    smooth=True,
+                )
+            )
+            smooth_run_count += 1
+        if last < boundary_end - 1e-7:
+            operations.append(
+                BooleanExtrudeFeature(
+                    mode="add",
+                    axis=axis,
+                    start=last,
+                    depth=boundary_end - last,
+                    outer=sections[group_end].outer,
+                )
+            )
+
+    # Preserve disconnected islands without asking a loft to change topology.
+    for index, section in enumerate(sections):
+        start = float(levels[index])
+        depth = float(levels[index + 1] - levels[index])
+        for region in section.additional_regions:
+            operations.append(
+                BooleanExtrudeFeature(
+                    mode="add",
+                    axis=axis,
+                    start=start,
+                    depth=depth,
+                    outer=region.outer,
+                    holes=region.holes,
+                )
+            )
+
+    # Track circular section openings by centre.  Consecutive observations
+    # with a stable radius become one editable hole; a real counterbore or
+    # taper naturally starts a new axial interval.
+    center_tolerance = max(data.diagonal * 0.002, 0.025)
+    radius_tolerance = max(data.diagonal * 0.001, 0.012)
+    tracks: list[list[tuple[int, CircleProfile]]] = []
+    for section_index, section in enumerate(sections):
+        used_tracks: set[int] = set()
+        for hole in section.holes:
+            if not isinstance(hole, CircleProfile):
+                operations.append(
+                    BooleanExtrudeFeature(
+                        mode="cut",
+                        axis=axis,
+                        start=float(levels[section_index]),
+                        depth=float(
+                            levels[section_index + 1] - levels[section_index]
+                        ),
+                        outer=hole,
+                    )
+                )
+                continue
+            circle = hole
+            match_index = next(
+                (
+                    index
+                    for index, track in enumerate(tracks)
+                    if index not in used_tracks
+                    and track[-1][0] == section_index - 1
+                    and np.linalg.norm(
+                        np.asarray(track[-1][1].center)
+                        - np.asarray(circle.center)
+                    )
+                    <= center_tolerance
+                ),
+                None,
+            )
+            if match_index is None:
+                tracks.append([(section_index, circle)])
+                used_tracks.add(len(tracks) - 1)
+            else:
+                tracks[match_index].append((section_index, circle))
+                used_tracks.add(match_index)
+
+    for track in tracks:
+        run: list[tuple[int, CircleProfile]] = []
+        runs: list[list[tuple[int, CircleProfile]]] = []
+        for observation in track:
+            if run and abs(observation[1].radius - run[-1][1].radius) > radius_tolerance:
+                runs.append(run)
+                run = []
+            run.append(observation)
+        if run:
+            runs.append(run)
+        for radius_run in runs:
+            first_index = radius_run[0][0]
+            last_index = radius_run[-1][0]
+            center = np.median(
+                np.asarray([item[1].center for item in radius_run], dtype=float),
+                axis=0,
+            )
+            radius = float(np.median([item[1].radius for item in radius_run]))
+            operations.append(
+                RoundHoleFeature(
+                    axis=axis,
+                    center=(_clean(center[0]), _clean(center[1])),
+                    diameter=_clean(radius * 2.0),
+                    start=float(levels[first_index]),
+                    depth=float(levels[last_index + 1] - levels[first_index]),
+                    through=(first_index == 0 and last_index == len(sections) - 1),
+                )
+            )
+
+    if smooth_run_count == 0:
+        return []
+    return [
+        ReconstructionPlan(
+            name=name,
+            base=base,
+            operations=operations,
+            assumptions=[
+                f"Recovered {smooth_run_count} continuously changing "
+                f"{axis.value}-axis profile runs as editable tangent lofts.",
+                "Kept measured topology changes sharp and promoted section "
+                "openings to continuous analytic hole features.",
+            ],
+        )
+    ]
+
+
 def generate_smooth_loft_candidates(
     data: MeshData,
     name: str,
@@ -5351,6 +5672,8 @@ def generate_cylindrical_stock_candidates(
 def generate_oriented_cylinder_candidates(
     data: MeshData,
     source: ReconstructionPlan,
+    *,
+    cuts_only: bool = False,
 ) -> list[ReconstructionPlan]:
     tolerance = max(data.diagonal * 0.002, 0.025)
     existing_holes = _existing_round_holes(source)
@@ -5358,6 +5681,51 @@ def generate_oriented_cylinder_candidates(
     for fitted in _mesh_cylindrical_features(data):
         direction = np.asarray(fitted.direction, dtype=float)
         cardinal_index = int(np.argmax(np.abs(direction)))
+        if fitted.mode == "add" and abs(direction[cardinal_index]) >= 0.999:
+            axis = (Axis.X, Axis.Y, Axis.Z)[cardinal_index]
+            origin = np.asarray(fitted.origin, dtype=float)
+            endpoint = origin + direction * fitted.depth
+            center = _project(origin.reshape(1, 3), axis)[0]
+            fitted_start = min(
+                float(origin[cardinal_index]),
+                float(endpoint[cardinal_index]),
+            )
+            fitted_end = max(
+                float(origin[cardinal_index]),
+                float(endpoint[cardinal_index]),
+            )
+            already_profiled = False
+            for operation in [source.base, *source.operations]:
+                if (
+                    getattr(operation, "axis", None) != axis
+                    or getattr(operation, "mode", "add") != "add"
+                    or not hasattr(operation, "outer")
+                ):
+                    continue
+                operation_start = float(getattr(operation, "start", 0.0))
+                operation_end = operation_start + float(
+                    getattr(operation, "depth", 0.0)
+                )
+                if (
+                    abs(operation_start - fitted_start) > tolerance
+                    or abs(operation_end - fitted_end) > tolerance
+                ):
+                    continue
+                profiles = [operation.outer]
+                profiles.extend(getattr(operation, "additional_regions", []))
+                if any(
+                    isinstance(profile, CircleProfile)
+                    and np.linalg.norm(
+                        np.asarray(profile.center) - center
+                    )
+                    <= tolerance
+                    and abs(profile.radius - fitted.radius) <= tolerance
+                    for profile in profiles
+                ):
+                    already_profiled = True
+                    break
+            if already_profiled:
+                continue
         if fitted.mode != "cut" or abs(direction[cardinal_index]) < 0.999:
             features.append(fitted)
             continue
@@ -5410,6 +5778,13 @@ def generate_oriented_cylinder_candidates(
                     ),
                 )
             )
+    if cuts_only:
+        features = [
+            feature
+            for feature in features
+            if isinstance(feature, RoundHoleFeature)
+            or feature.mode == "cut"
+        ]
     if not features:
         return []
 
