@@ -8,6 +8,7 @@ import cadquery as cq
 import numpy as np
 import pytest
 from shapely.geometry import Point
+from shapely.geometry import Polygon as ShapelyPolygon
 
 import app.profiles as profiles_module
 import app.reconstruction as reconstruction_module
@@ -28,6 +29,7 @@ from app.profiles import (
     generate_embedded_circle_promotion_candidates,
     generate_end_finish_candidates,
     generate_feature_round_finish_candidates,
+    generate_local_tangent_envelope_candidates,
     generate_oriented_cylinder_candidates,
     generate_profiled_endcap_cylinder_candidates,
     generate_spherical_corner_finish_candidates,
@@ -569,6 +571,89 @@ def test_layer_profile_circles_promote_on_every_cardinal_plane() -> None:
                 if isinstance(profile, CircleProfile)
             )
     assert not retained_profile_circles
+
+
+def test_local_tangent_envelope_uses_alternate_plane_spline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    curve = np.asarray(
+        [
+            (2.0, 10.0),
+            (1.6, 9.3),
+            (1.2, 8.5),
+            (0.8, 7.5),
+            (0.4, 6.2),
+            (0.15, 4.8),
+            (0.03, 3.2),
+            (0.0, 1.6),
+            (0.0, 0.0),
+        ]
+    )
+    profile = PathProfile(
+        start=(2.0, 10.0),
+        segments=[
+            SplineSegment(
+                points=[tuple(point) for point in curve[1:-1]],
+                end=(0.0, 0.0),
+                start_tangent=(-0.5, -0.8),
+                end_tangent=(0.0, -1.0),
+            ),
+            LineSegment(end=(8.0, 0.0)),
+            LineSegment(end=(8.0, 10.0)),
+            LineSegment(end=(2.0, 10.0)),
+        ],
+    )
+    polygon = ShapelyPolygon([*curve, (8.0, 0.0), (8.0, 10.0)])
+    section = profiles_module.SectionShape(
+        outer=profile,
+        holes=[],
+        additional_regions=[],
+        area=polygon.area,
+        polygon=polygon,
+    )
+    monkeypatch.setattr(
+        profiles_module,
+        "section_shape",
+        lambda _data, axis, _location: section if axis == Axis.Z else None,
+    )
+
+    centers = np.column_stack(
+        (
+            np.interp(np.linspace(0, len(curve) - 1, 10), np.arange(len(curve)), curve[:, 0]),
+            np.interp(np.linspace(0, len(curve) - 1, 10), np.arange(len(curve)), curve[:, 1]),
+            np.linspace(0.4, 5.9, 10),
+        )
+    )
+    vertices = np.repeat(centers, 3, axis=0)
+    vertices[:, 2] += np.tile(np.asarray([-0.01, 0.0, 0.01]), len(centers))
+    mesh = SimpleNamespace(
+        bounds=np.asarray([[0.0, 0.0, 0.0], [8.0, 10.0, 6.0]]),
+        triangles_center=centers,
+        face_normals=np.tile(np.asarray([1.0, 0.0, 0.0]), (len(centers), 1)),
+        faces=np.arange(len(vertices)).reshape(-1, 3),
+        vertices=vertices,
+    )
+    data = SimpleNamespace(diagonal=15.0, mesh=mesh)
+    source = ReconstructionPlan(
+        name="layered-tangent",
+        base=ExtrudeFeature(
+            axis=Axis.Y,
+            start=0,
+            depth=10,
+            outer=PolygonProfile(points=[(0, 0), (8, 0), (8, 6), (0, 6)]),
+        ),
+    )
+
+    candidates = generate_local_tangent_envelope_candidates(data, source)
+
+    assert candidates
+    repaired = candidates[0]
+    assert any(
+        isinstance(operation, BooleanExtrudeFeature)
+        and operation.axis == Axis.Z
+        for operation in repaired.operations
+    )
+    assert "tangent boundary curves" in repaired.assumptions[-1]
 
 
 def test_cone_preservation_can_search_smaller_repeated_hole_boundaries() -> None:

@@ -9,7 +9,7 @@ import numpy as np
 import trimesh
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, Point, Polygon, box
 from shapely.geometry.multipolygon import MultiPolygon
 from shapely.ops import unary_union
 
@@ -2566,6 +2566,192 @@ def rank_curve_aligned_axes(
         if support:
             ranked.append((axis, support))
     return sorted(ranked, key=lambda item: (-item[1], item[0].value))
+
+
+def generate_local_tangent_envelope_candidates(
+    data: MeshData,
+    source: ReconstructionPlan,
+) -> list[ReconstructionPlan]:
+    """Replace boundary stair steps with local plane-specific spline sketches.
+
+    A layered construction can be accurate everywhere except a tangent outer
+    curve that is normal to another cardinal axis.  Find fitted spline chains
+    that touch a section envelope, measure their actual axial face extent from
+    the mesh, then repair only a narrow band: add the measured interior and cut
+    the measured exterior.  Interior features outside that band are untouched.
+    """
+
+    base_axis = getattr(source.base, "axis", None)
+    if not isinstance(base_axis, Axis):
+        return []
+    profile_tolerance = max(data.diagonal * 0.00013, 0.003)
+    boundary_tolerance = max(data.diagonal * 0.0015, 0.02)
+    inner_margin = max(data.diagonal * 0.015, 0.1)
+    outer_margin = max(data.diagonal * 0.002, 0.02)
+    boolean_margin = max(data.diagonal * 0.000015, 0.0005)
+    candidates: list[ReconstructionPlan] = []
+
+    def geometry_polygons(geometry: object) -> list[Polygon]:
+        if isinstance(geometry, Polygon):
+            return [geometry]
+        if isinstance(geometry, MultiPolygon):
+            return list(geometry.geoms)
+        return [
+            item
+            for item in getattr(geometry, "geoms", [])
+            if isinstance(item, Polygon)
+        ]
+
+    def fitted_region(polygon: Polygon) -> tuple[Profile, list[Profile]] | None:
+        outer = _profile_from_ring(
+            np.asarray(polygon.exterior.coords),
+            profile_tolerance,
+        )
+        if outer is None:
+            return None
+        holes: list[Profile] = []
+        for interior in polygon.interiors:
+            fitted = _profile_from_ring(
+                np.asarray(interior.coords),
+                profile_tolerance,
+            )
+            if fitted is None:
+                return None
+            holes.append(fitted[0])
+        return outer[0], holes
+
+    for axis, (_, _, _, axis_index) in AXES.items():
+        if axis == base_axis:
+            continue
+        axial_bounds = data.mesh.bounds[:, axis_index]
+        midpoint = float(np.mean(axial_bounds))
+        section = section_shape(data, axis, midpoint)
+        if section is None:
+            continue
+        transverse_bounds = section.polygon.bounds
+        region_profiles = [section.outer]
+        region_profiles.extend(
+            region.outer for region in section.additional_regions
+        )
+        boundary_curves: list[np.ndarray] = []
+        for profile in region_profiles:
+            if not isinstance(profile, PathProfile):
+                continue
+            previous = np.asarray(profile.start, dtype=float)
+            for segment in profile.segments:
+                if isinstance(segment, SplineSegment):
+                    curve = np.asarray(
+                        [previous, *segment.points, segment.end],
+                        dtype=float,
+                    )
+                    u_span = float(np.ptp(curve[:, 0]))
+                    v_span = float(np.ptp(curve[:, 1]))
+                    touches_u = min(
+                        abs(float(np.min(curve[:, 0])) - transverse_bounds[0]),
+                        abs(float(np.max(curve[:, 0])) - transverse_bounds[2]),
+                    ) <= boundary_tolerance
+                    touches_v = min(
+                        abs(float(np.min(curve[:, 1])) - transverse_bounds[1]),
+                        abs(float(np.max(curve[:, 1])) - transverse_bounds[3]),
+                    ) <= boundary_tolerance
+                    if (
+                        len(curve) >= 6
+                        and max(u_span, v_span) >= data.diagonal * 0.04
+                        and ((u_span <= v_span and touches_u) or touches_v)
+                    ):
+                        boundary_curves.append(curve)
+                previous = np.asarray(segment.end, dtype=float)
+        if not boundary_curves:
+            continue
+
+        plan = source.model_copy(deep=True)
+        repaired_count = 0
+        projected_centers = _project(data.mesh.triangles_center, axis)
+        for curve in boundary_curves:
+            curve_line = LineString(curve)
+            near_faces = np.asarray(
+                [
+                    curve_line.distance(Point(point)) <= boundary_tolerance
+                    and abs(data.mesh.face_normals[index, axis_index]) <= 0.15
+                    for index, point in enumerate(projected_centers)
+                ],
+                dtype=bool,
+            )
+            face_indices = np.flatnonzero(near_faces)
+            if len(face_indices) < 8:
+                continue
+            vertex_indices = np.unique(data.mesh.faces[face_indices])
+            axial = data.mesh.vertices[vertex_indices, axis_index]
+            start = float(np.min(axial))
+            end = float(np.max(axial))
+            if end - start < data.diagonal * 0.05:
+                continue
+
+            min_u, min_v, max_u, max_v = transverse_bounds
+            curve_min_u, curve_min_v = np.min(curve, axis=0)
+            curve_max_u, curve_max_v = np.max(curve, axis=0)
+            if float(np.ptp(curve[:, 0])) <= float(np.ptp(curve[:, 1])):
+                if abs(curve_min_u - min_u) <= abs(curve_max_u - max_u):
+                    strip = box(
+                        min_u - outer_margin,
+                        min_v - outer_margin,
+                        curve_max_u + inner_margin,
+                        max_v + outer_margin,
+                    )
+                else:
+                    strip = box(
+                        curve_min_u - inner_margin,
+                        min_v - outer_margin,
+                        max_u + outer_margin,
+                        max_v + outer_margin,
+                    )
+            elif abs(curve_min_v - min_v) <= abs(curve_max_v - max_v):
+                strip = box(
+                    min_u - outer_margin,
+                    min_v - outer_margin,
+                    max_u + outer_margin,
+                    curve_max_v + inner_margin,
+                )
+            else:
+                strip = box(
+                    min_u - outer_margin,
+                    curve_min_v - inner_margin,
+                    max_u + outer_margin,
+                    max_v + outer_margin,
+                )
+
+            for mode, geometry in (
+                ("add", section.polygon.intersection(strip)),
+                ("cut", strip.difference(section.polygon)),
+            ):
+                for polygon in geometry_polygons(geometry):
+                    if polygon.area <= profile_tolerance**2:
+                        continue
+                    fitted = fitted_region(polygon)
+                    if fitted is None:
+                        continue
+                    outer, holes = fitted
+                    plan.operations.append(
+                        BooleanExtrudeFeature(
+                            mode=mode,
+                            axis=axis,
+                            start=_clean(start - boolean_margin),
+                            depth=_clean(
+                                end - start + boolean_margin * 2
+                            ),
+                            outer=outer,
+                            holes=holes,
+                        )
+                    )
+            repaired_count += 1
+
+        if repaired_count:
+            plan.assumptions.append(
+                f"Reconstructed {repaired_count} tangent boundary curves as "
+                f"local editable spline sketches on the {axis.value} plane."
+            )
+            candidates.append(plan)
+    return candidates
 
 
 def generate_segmented_smooth_layer_candidates(

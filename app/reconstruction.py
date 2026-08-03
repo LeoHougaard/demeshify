@@ -35,6 +35,7 @@ from .profiles import (
     generate_internal_circular_finish_candidates,
     generate_layer_envelope_candidates,
     generate_layered_candidates,
+    generate_local_tangent_envelope_candidates,
     generate_oriented_cylinder_candidates,
     generate_partial_cone_adaptive_candidates,
     generate_prismatic_candidates,
@@ -1037,6 +1038,53 @@ def reconstruct(
             warnings.append(
                 f"Promoted layered circle sketches into {promoted_count} "
                 "ordered, editable hole features on their measured planes."
+            )
+
+    def recover_local_tangent_envelopes(label: str) -> None:
+        """Repair only alternate-plane spline bands in a layered body."""
+
+        nonlocal best
+        recovered: list[ScoredCandidate] = []
+        for index, plan in enumerate(
+            generate_local_tangent_envelope_candidates(data, best.plan)
+        ):
+            try:
+                candidate = score_plan(
+                    data,
+                    plan,
+                    destination
+                    / "candidates"
+                    / f"local-tangent-envelope-{label}-{index:02d}",
+                    candidate_count=len(generated) + index + 1,
+                )
+            except Exception as exc:
+                warnings.append(
+                    f"Local tangent-envelope candidate {index + 1} could "
+                    f"not be built: {exc}"
+                )
+                continue
+            if (
+                candidate.report.valid_solid
+                and candidate.report.chamfer_p95_mm
+                <= best.report.chamfer_p95_mm
+                + max(0.01, data.diagonal * 0.0002)
+                and candidate.report.chamfer_rms_mm
+                <= best.report.chamfer_rms_mm
+                + max(0.01, data.diagonal * 0.0002)
+                and candidate.report.volume_error_percent
+                <= best.report.volume_error_percent + 0.02
+                and (
+                    candidate.report.score < best.report.score
+                    or candidate.report.volume_error_percent
+                    < best.report.volume_error_percent - 0.02
+                )
+            ):
+                recovered.append(candidate)
+        if recovered:
+            best = min(recovered, key=lambda candidate: candidate.report.score)
+            warnings.append(
+                "Replaced stepped tangent boundary bands with local editable "
+                "spline sketches on their measured construction planes."
             )
 
     def preserve_detected_spheres(label: str) -> None:
@@ -2594,6 +2642,10 @@ def reconstruct(
         (
             "promote_embedded_profile_circles",
             lambda: promote_embedded_profile_circles("final"),
+        ),
+        (
+            "recover_local_tangent_envelopes",
+            lambda: recover_local_tangent_envelopes("final"),
         ),
         ("compact_coplanar_regions", lambda: compact_coplanar_regions("final")),
         ("compact_round_hole_patterns", lambda: compact_round_hole_patterns("final")),
