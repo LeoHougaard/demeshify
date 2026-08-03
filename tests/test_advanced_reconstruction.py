@@ -577,6 +577,91 @@ def test_layer_profile_circles_promote_on_every_cardinal_plane() -> None:
     assert not retained_profile_circles
 
 
+def test_promoted_hole_replaces_polygon_and_chorded_circle_fragments() -> None:
+    angles = np.linspace(0, 2 * math.pi, 17)[:-1]
+    radii = np.asarray([2.01 if index % 2 else 1.99 for index in range(16)])
+    points = np.column_stack((radii * np.cos(angles), radii * np.sin(angles)))
+    polygon_circle = PolygonProfile(
+        points=[tuple(point) for point in points]
+    )
+    chorded_circle = PathProfile(
+        start=tuple(points[0]),
+        segments=[
+            LineSegment(end=tuple(point))
+            for point in [*points[1:], points[0]]
+        ],
+    )
+    partial_arc_region = PathProfile(
+        start=(-4, -1),
+        segments=[
+            LineSegment(end=(-2, -1)),
+            ArcSegment(mid=(-1, 0), end=(-2, 1)),
+            LineSegment(end=(-4, 1)),
+            LineSegment(end=(-4, -1)),
+        ],
+    )
+    source = ReconstructionPlan(
+        name="mixed-circle-representations",
+        base=ExtrudeFeature(
+            axis=Axis.Z,
+            start=0,
+            depth=5,
+            outer=PolygonProfile(
+                points=[(-6, -6), (6, -6), (6, 6), (-6, 6)]
+            ),
+        ),
+        operations=[
+            BooleanExtrudeFeature(
+                mode="cut",
+                axis=Axis.Z,
+                start=0,
+                depth=5,
+                outer=polygon_circle,
+            ),
+            BooleanExtrudeFeature(
+                mode="cut",
+                axis=Axis.Z,
+                start=0,
+                depth=5,
+                outer=chorded_circle,
+            ),
+            BooleanExtrudeFeature(
+                mode="cut",
+                axis=Axis.Z,
+                start=0,
+                depth=5,
+                outer=partial_arc_region,
+            ),
+        ],
+    )
+
+    cleaned = profiles_module._replace_profile_circles_with_round_holes(
+        source,
+        [
+            RoundHoleFeature(
+                axis=Axis.Z,
+                center=(0, 0),
+                diameter=4,
+                start=0,
+                depth=5,
+            )
+        ],
+        tolerance=0.03,
+    )
+
+    remaining_cuts = [
+        operation
+        for operation in cleaned.operations
+        if isinstance(operation, BooleanExtrudeFeature)
+    ]
+    assert len(remaining_cuts) == 1
+    assert remaining_cuts[0].outer == partial_arc_region
+    assert sum(
+        isinstance(operation, RoundHoleFeature)
+        for operation in cleaned.operations
+    ) == 1
+
+
 def test_local_tangent_envelope_uses_alternate_plane_spline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -625,7 +710,7 @@ def test_local_tangent_envelope_uses_alternate_plane_spline(
         (
             np.interp(np.linspace(0, len(curve) - 1, 10), np.arange(len(curve)), curve[:, 0]),
             np.interp(np.linspace(0, len(curve) - 1, 10), np.arange(len(curve)), curve[:, 1]),
-            np.linspace(0.4, 5.9, 10),
+            np.linspace(0.1, 5.9, 10),
         )
     )
     vertices = np.repeat(centers, 3, axis=0)
@@ -652,10 +737,43 @@ def test_local_tangent_envelope_uses_alternate_plane_spline(
 
     assert candidates
     repaired = candidates[0]
+    alternate_operations = [
+        operation
+        for operation in repaired.operations
+        if isinstance(operation, BooleanExtrudeFeature)
+        and operation.axis == Axis.Z
+    ]
+    assert alternate_operations
+    additions = [
+        operation
+        for operation in alternate_operations
+        if operation.mode == "add"
+    ]
+    removals = [
+        operation
+        for operation in alternate_operations
+        if operation.mode == "cut"
+    ]
+    assert additions
+    assert removals
+    assert min(operation.start for operation in alternate_operations) <= 0
+    assert max(
+        operation.start + operation.depth
+        for operation in alternate_operations
+    ) >= 6
+    assert all(
+        isinstance(profile, PolygonProfile)
+        for operation in additions
+        for profile in [operation.outer, *operation.additional_regions]
+    )
     assert any(
         isinstance(operation, BooleanExtrudeFeature)
-        and operation.axis == Axis.Z
-        for operation in repaired.operations
+        and any(
+            isinstance(segment, SplineSegment)
+            for segment in operation.outer.segments
+        )
+        for operation in removals
+        if isinstance(operation.outer, PathProfile)
     )
     assert "tangent boundary curves" in repaired.assumptions[-1]
 

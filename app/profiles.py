@@ -2689,6 +2689,16 @@ def generate_local_tangent_envelope_candidates(
             end = float(np.max(axial))
             if end - start < data.diagonal * 0.05:
                 continue
+            # A shallow cap chamfer/fillet makes the main curved wall stop just
+            # short of the mesh bound. The parent sketch still owns the curve
+            # all the way to the stock end; the finish belongs later in the
+            # feature tree. Snap only narrow end gaps so genuine shoulders
+            # retain their measured extent.
+            cap_tolerance = max(data.diagonal * 0.01, 0.05)
+            if start - float(axial_bounds[0]) <= cap_tolerance:
+                start = float(axial_bounds[0])
+            if float(axial_bounds[1]) - end <= cap_tolerance:
+                end = float(axial_bounds[1])
 
             min_u, min_v, max_u, max_v = transverse_bounds
             curve_min_u, curve_min_v = np.min(curve, axis=0)
@@ -2723,8 +2733,15 @@ def generate_local_tangent_envelope_candidates(
                     max_v + outer_margin,
                 )
 
+            # Normalize the entire local band to simple oversized stock first,
+            # then let one analytic removal define the final curved boundary.
+            # Adding only the measured interior left the old layer chords and
+            # the new spline coincident in the B-rep; depending on which side a
+            # chord fell, both outlines could remain visible.  A full stock
+            # band buries every prior approximation before the cut and makes
+            # the removal the sole owner of the finished contour.
             for mode, geometry in (
-                ("add", section.polygon.intersection(strip)),
+                ("add", strip),
                 ("cut", strip.difference(section.polygon)),
             ):
                 for polygon in geometry_polygons(geometry):
@@ -7051,6 +7068,118 @@ def _round_cut_substantially_covers(
     return overlap / max(end - start, tolerance) >= minimum_fraction
 
 
+def _profile_circle_samples(profile: Profile) -> np.ndarray | None:
+    """Sample a closed profile without assuming its stored primitive type."""
+
+    if isinstance(profile, PolygonProfile):
+        points = np.asarray(profile.points, dtype=float)
+        return np.vstack((points, points[0]))
+    if isinstance(profile, SplineProfile):
+        points = np.asarray(profile.points, dtype=float)
+        return np.vstack((points, points[0]))
+    if not isinstance(profile, PathProfile):
+        return None
+
+    current = np.asarray(profile.start, dtype=float)
+    sampled = [current]
+    for segment in profile.segments:
+        endpoint = np.asarray(segment.end, dtype=float)
+        if isinstance(segment, LineSegment):
+            sampled.append(endpoint)
+        elif isinstance(segment, SplineSegment):
+            sampled.extend(np.asarray(segment.points, dtype=float))
+            sampled.append(endpoint)
+        else:
+            fitted = _circle_values(
+                np.vstack((current, np.asarray(segment.mid), endpoint))
+            )
+            if fitted is None:
+                return None
+            center_x, center_y, radius, _ = fitted
+            start_angle = math.atan2(current[1] - center_y, current[0] - center_x)
+            mid_angle = math.atan2(
+                segment.mid[1] - center_y,
+                segment.mid[0] - center_x,
+            )
+            end_angle = math.atan2(
+                endpoint[1] - center_y,
+                endpoint[0] - center_x,
+            )
+            while mid_angle - start_angle > math.pi:
+                mid_angle -= 2 * math.pi
+            while mid_angle - start_angle < -math.pi:
+                mid_angle += 2 * math.pi
+            while end_angle - mid_angle > math.pi:
+                end_angle -= 2 * math.pi
+            while end_angle - mid_angle < -math.pi:
+                end_angle += 2 * math.pi
+            count = max(4, int(math.ceil(abs(end_angle - start_angle) / (math.pi / 12))))
+            angles = np.linspace(start_angle, end_angle, count + 1)[1:]
+            sampled.extend(
+                np.column_stack(
+                    (
+                        center_x + radius * np.cos(angles),
+                        center_y + radius * np.sin(angles),
+                    )
+                )
+            )
+        current = endpoint
+    return np.asarray(sampled, dtype=float).reshape(-1, 2)
+
+
+def _profile_is_full_circle_approximation(
+    profile: Profile,
+    center: np.ndarray,
+    radius: float,
+    tolerance: float,
+) -> bool:
+    """Prove that a closed polygon/path represents one complete circle.
+
+    Layer slicing may store a cylindrical opening as chords, mixed arcs, or a
+    periodic spline.  Once the analytic cylinder is known, retaining that
+    sampled boundary creates two competing walls.  The radial, closure, area,
+    and angular-coverage gates below deliberately reject partial arcs, slots,
+    tangent blends, and unrelated polygonal regions.
+    """
+
+    if isinstance(profile, CircleProfile):
+        return bool(
+            np.linalg.norm(np.asarray(profile.center) - center) <= tolerance
+            and abs(profile.radius - radius) <= tolerance
+        )
+    points = _profile_circle_samples(profile)
+    if points is None or len(points) < 8:
+        return False
+    radial_tolerance = max(tolerance, radius * 0.012)
+    if np.linalg.norm(points[0] - points[-1]) > radial_tolerance * 2:
+        return False
+    ring = points[:-1]
+    radii = np.linalg.norm(ring - center, axis=1)
+    if (
+        float(np.max(np.abs(radii - radius))) > radial_tolerance
+        or float(np.percentile(np.abs(radii - radius), 90))
+        > radial_tolerance * 0.65
+    ):
+        return False
+    angles = np.sort(
+        np.mod(
+            np.arctan2(
+                ring[:, 1] - center[1],
+                ring[:, 0] - center[0],
+            ),
+            2 * math.pi,
+        )
+    )
+    gaps = np.diff(np.r_[angles, angles[0] + 2 * math.pi])
+    if float(np.max(gaps)) > math.pi / 2:
+        return False
+    polygon = Polygon(ring)
+    if not polygon.is_valid:
+        polygon = polygon.buffer(0)
+    area_ratio = float(polygon.area) / max(math.pi * radius * radius, 1e-12)
+    return 0.90 <= area_ratio <= 1.12
+
+
 def _replace_profile_circles_with_round_holes(
     plan: ReconstructionPlan,
     holes: list[RoundHoleFeature],
@@ -7089,14 +7218,13 @@ def _replace_profile_circles_with_round_holes(
         ]
 
     def matches(profile: Profile, covering: list[RoundHoleFeature]) -> bool:
-        # A PathProfile can contain one or more intentional open-angle arcs.
-        # Only an actual closed CircleProfile is safe to supersede here.
-        return isinstance(profile, CircleProfile) and any(
-            np.linalg.norm(
-                np.asarray(profile.center) - np.asarray(hole.center)
+        return any(
+            _profile_is_full_circle_approximation(
+                profile,
+                np.asarray(hole.center, dtype=float),
+                hole.diameter / 2,
+                tolerance,
             )
-            <= tolerance
-            and abs(profile.radius - hole.diameter / 2) <= tolerance
             for hole in covering
         )
 
