@@ -5737,10 +5737,16 @@ def generate_oriented_cylinder_candidates(
         start = min(float(origin[cardinal_index]), float(endpoint[cardinal_index]))
         end = max(float(origin[cardinal_index]), float(endpoint[cardinal_index]))
         if any(
-            found_axis == axis
-            and np.linalg.norm(found_center - center) <= tolerance
-            and abs(found_radius - fitted.radius) <= tolerance
-            for found_axis, found_center, found_radius in existing_holes
+            _round_cut_covers(
+                existing,
+                axis=axis,
+                center=center,
+                radius=fitted.radius,
+                start=start,
+                end=end,
+                tolerance=tolerance,
+            )
+            for existing in existing_holes
         ):
             continue
         bounds = data.mesh.bounds[:, cardinal_index]
@@ -5789,56 +5795,31 @@ def generate_oriented_cylinder_candidates(
         return []
 
     feature_groups = [features]
+    cardinal_groups: dict[Axis, list[OrientedCylinderFeature | RoundHoleFeature]] = {}
+    for feature in features:
+        if isinstance(feature, RoundHoleFeature):
+            cardinal_groups.setdefault(feature.axis, []).append(feature)
+    feature_groups.extend(
+        group
+        for group in cardinal_groups.values()
+        if 1 < len(group) < len(features)
+    )
     feature_groups.extend([feature] for feature in features)
     candidates: list[ReconstructionPlan] = []
     for group in feature_groups[:12]:
-        plan = source.model_copy(deep=True)
-        for feature in group:
-            is_cut = isinstance(feature, RoundHoleFeature) or feature.mode == "cut"
-            if is_cut:
-                if isinstance(feature, RoundHoleFeature):
-                    axis = feature.axis
-                    center = np.asarray(feature.center)
-                    radius = feature.diameter / 2.0
-                else:
-                    direction = np.asarray(feature.direction)
-                    cardinal_index = int(np.argmax(np.abs(direction)))
-                    axis = (
-                        (Axis.X, Axis.Y, Axis.Z)[cardinal_index]
-                        if abs(direction[cardinal_index]) >= 0.999
-                        else None
-                    )
-                    center = (
-                        _project(
-                            np.asarray(feature.origin, dtype=float).reshape(1, 3),
-                            axis,
-                        )[0]
-                        if axis is not None
-                        else None
-                    )
-                    radius = feature.radius
-                if axis is not None and center is not None:
-                    for existing in [plan.base, *plan.operations]:
-                        holes = getattr(existing, "holes", None)
-                        if (
-                            holes is None
-                            or getattr(existing, "axis", None) != axis
-                        ):
-                            continue
-                        existing.holes = [
-                            profile
-                            for profile in holes
-                            if not any(
-                                np.linalg.norm(
-                                    np.asarray(circle.center) - center
-                                )
-                                <= tolerance
-                                and abs(circle.radius - radius)
-                                <= tolerance
-                                for circle in _profile_round_boundaries(profile)
-                            )
-                        ]
-            plan.operations.append(feature.model_copy(deep=True))
+        round_holes = [
+            feature for feature in group if isinstance(feature, RoundHoleFeature)
+        ]
+        plan = _replace_profile_circles_with_round_holes(
+            source,
+            round_holes,
+            tolerance,
+        )
+        plan.operations.extend(
+            feature.model_copy(deep=True)
+            for feature in group
+            if not isinstance(feature, RoundHoleFeature)
+        )
         plan.assumptions.append(
             "Recovered smooth mesh patches as editable analytic cylinders with "
             "their measured 3D axes, radii, and add/cut orientation."
@@ -6642,21 +6623,226 @@ def _circular_holes(section: SectionShape) -> list[CircleProfile]:
     return holes
 
 
-def _existing_round_holes(plan: ReconstructionPlan) -> list[tuple[Axis, np.ndarray, float]]:
-    found: list[tuple[Axis, np.ndarray, float]] = []
+@dataclass(slots=True)
+class _RoundCutExtent:
+    """One analytic circular cut, including its extent normal to the sketch.
+
+    Center and radius alone are not enough to decide that a reconstructed
+    hole already exists.  A counterbore or one adaptive-layer fragment can
+    share both values with a longer bore.  Keeping the axial interval in the
+    identity prevents that fragment from suppressing the complete feature.
+    """
+
+    axis: Axis
+    center: np.ndarray
+    radius: float
+    start: float
+    end: float
+
+
+def _existing_round_holes(plan: ReconstructionPlan) -> list[_RoundCutExtent]:
+    found: list[_RoundCutExtent] = []
     base = plan.base
     if isinstance(base, CylinderFeature) and base.inner_radius is not None:
-        found.append((base.axis, np.asarray(base.center), base.inner_radius))
+        found.append(
+            _RoundCutExtent(
+                axis=base.axis,
+                center=np.asarray(base.center),
+                radius=base.inner_radius,
+                start=base.start,
+                end=base.start + base.depth,
+            )
+        )
     for operation in plan.operations:
         if isinstance(operation, RoundHoleFeature):
             found.append(
-                (
-                    operation.axis,
-                    np.asarray(operation.center),
-                    operation.diameter / 2,
+                _RoundCutExtent(
+                    axis=operation.axis,
+                    center=np.asarray(operation.center),
+                    radius=operation.diameter / 2,
+                    start=operation.start,
+                    end=operation.start + operation.depth,
+                )
+            )
+        elif (
+            isinstance(operation, OrientedCylinderFeature)
+            and operation.mode == "cut"
+        ):
+            direction = np.asarray(operation.direction, dtype=float)
+            direction_length = float(np.linalg.norm(direction))
+            if direction_length <= 1e-12:
+                continue
+            direction /= direction_length
+            axis_index = int(np.argmax(np.abs(direction)))
+            if abs(direction[axis_index]) < 0.999:
+                continue
+            axis = (Axis.X, Axis.Y, Axis.Z)[axis_index]
+            origin = np.asarray(operation.origin, dtype=float)
+            endpoint = origin + direction * operation.depth
+            found.append(
+                _RoundCutExtent(
+                    axis=axis,
+                    center=_project(origin.reshape(1, 3), axis)[0],
+                    radius=operation.radius,
+                    start=min(origin[axis_index], endpoint[axis_index]),
+                    end=max(origin[axis_index], endpoint[axis_index]),
                 )
             )
     return found
+
+
+def _round_cut_covers(
+    existing: _RoundCutExtent,
+    *,
+    axis: Axis,
+    center: np.ndarray,
+    radius: float,
+    start: float,
+    end: float,
+    tolerance: float,
+) -> bool:
+    return (
+        existing.axis == axis
+        and np.linalg.norm(existing.center - center) <= tolerance
+        and abs(existing.radius - radius) <= tolerance
+        and existing.start <= start + tolerance
+        and existing.end >= end - tolerance
+    )
+
+
+def _round_cut_substantially_covers(
+    existing: _RoundCutExtent,
+    *,
+    axis: Axis,
+    center: np.ndarray,
+    radius: float,
+    start: float,
+    end: float,
+    tolerance: float,
+    minimum_fraction: float = 0.9,
+) -> bool:
+    """Accept small section-sampling overrun around an existing bore.
+
+    Sections through a countersink or terminating cap can extend a circle
+    cluster slightly beyond its true cylindrical wall.  A nearly complete
+    analytic hole should not be replaced by that overrun.  Materially short
+    fragments still fail this test and are promoted to the full measured
+    interval by ``_round_cut_covers`` callers.
+    """
+
+    if (
+        existing.axis != axis
+        or np.linalg.norm(existing.center - center) > tolerance
+        or abs(existing.radius - radius) > tolerance
+    ):
+        return False
+    overlap = max(0.0, min(existing.end, end) - max(existing.start, start))
+    return overlap / max(end - start, tolerance) >= minimum_fraction
+
+
+def _replace_profile_circles_with_round_holes(
+    plan: ReconstructionPlan,
+    holes: list[RoundHoleFeature],
+    tolerance: float,
+) -> ReconstructionPlan:
+    """Promote measured circles without leaving duplicate slab geometry.
+
+    Adaptive layers may encode one bore as many circle regions.  Once a
+    continuous analytic hole has been recovered, those same-radius regions
+    must be removed or their tiny per-layer fit differences produce stepped
+    walls.  Different radii and all path profiles are retained so counterbores
+    and genuine partial-arc outlines are not flattened into a simple hole.
+    """
+
+    cleaned = plan.model_copy(deep=True)
+    existing_analytic_holes = [
+        operation
+        for operation in cleaned.operations
+        if isinstance(operation, RoundHoleFeature)
+    ]
+    analytic_holes = [*existing_analytic_holes, *holes]
+
+    def covering_holes(feature: object) -> list[RoundHoleFeature]:
+        axis = getattr(feature, "axis", None)
+        feature_start = getattr(feature, "start", None)
+        feature_depth = getattr(feature, "depth", None)
+        if axis is None or feature_start is None or feature_depth is None:
+            return []
+        feature_end = float(feature_start) + float(feature_depth)
+        return [
+            hole
+            for hole in analytic_holes
+            if hole.axis == axis
+            and hole.start <= float(feature_start) + tolerance
+            and hole.start + hole.depth >= feature_end - tolerance
+        ]
+
+    def matches(profile: Profile, covering: list[RoundHoleFeature]) -> bool:
+        # A PathProfile can contain one or more intentional open-angle arcs.
+        # Only an actual closed CircleProfile is safe to supersede here.
+        return isinstance(profile, CircleProfile) and any(
+            np.linalg.norm(
+                np.asarray(profile.center) - np.asarray(hole.center)
+            )
+            <= tolerance
+            and abs(profile.radius - hole.diameter / 2) <= tolerance
+            for hole in covering
+        )
+
+    retained_operations = []
+    for feature in [cleaned.base, *cleaned.operations]:
+        if isinstance(feature, RoundHoleFeature) and any(
+            replacement.axis == feature.axis
+            and np.linalg.norm(
+                np.asarray(replacement.center) - np.asarray(feature.center)
+            )
+            <= tolerance
+            and abs(replacement.diameter - feature.diameter) <= tolerance * 2
+            and replacement.start <= feature.start + tolerance
+            and replacement.start + replacement.depth
+            >= feature.start + feature.depth - tolerance
+            for replacement in holes
+        ):
+            # The measured complete bore replaces a shorter feature with the
+            # same sketch circle. Leaving both in the tree is geometrically
+            # redundant and makes dimension editing ambiguous.
+            continue
+        covering = covering_holes(feature)
+        if not covering:
+            if feature is not cleaned.base:
+                retained_operations.append(feature)
+            continue
+
+        feature_holes = getattr(feature, "holes", None)
+        if feature_holes is not None and not (
+            isinstance(feature, BooleanExtrudeFeature)
+            and feature.mode == "cut"
+        ):
+            feature.holes = [
+                profile
+                for profile in feature_holes
+                if not matches(profile, covering)
+            ]
+
+        if (
+            isinstance(feature, BooleanExtrudeFeature)
+            and feature.mode == "cut"
+        ):
+            regions = [feature.outer, *feature.additional_regions]
+            regions = [
+                profile for profile in regions if not matches(profile, covering)
+            ]
+            if not regions:
+                continue
+            feature.outer = regions[0]
+            feature.additional_regions = regions[1:]
+
+        if feature is not cleaned.base:
+            retained_operations.append(feature)
+
+    cleaned.operations = retained_operations
+    cleaned.operations.extend(hole.model_copy(deep=True) for hole in holes)
+    return cleaned
 
 
 def _replace_fragmented_profile_holes(
@@ -6664,35 +6850,11 @@ def _replace_fragmented_profile_holes(
     holes: list[RoundHoleFeature],
     tolerance: float,
 ) -> ReconstructionPlan:
-    cleaned = plan.model_copy(deep=True)
-    for feature in [cleaned.base, *cleaned.operations]:
-        feature_holes = getattr(feature, "holes", None)
-        if feature_holes is None:
-            continue
-        matching = [
-            hole
-            for hole in holes
-            if hole.axis == feature.axis
-        ]
-        if not matching:
-            continue
-        feature.holes = [
-            profile
-            for profile in feature_holes
-            if not (
-                isinstance(profile, CircleProfile)
-                and any(
-                    np.linalg.norm(
-                        np.asarray(profile.center) - np.asarray(hole.center)
-                    )
-                    <= tolerance
-                    and abs(profile.radius - hole.diameter / 2) <= tolerance
-                    for hole in matching
-                )
-            )
-        ]
-    cleaned.operations.extend(holes)
-    return cleaned
+    return _replace_profile_circles_with_round_holes(
+        plan,
+        holes,
+        tolerance,
+    )
 
 
 def generate_round_hole_candidates(
@@ -6744,16 +6906,31 @@ def generate_round_hole_candidates(
         for cluster in clusters:
             center = np.asarray(cluster["center"])
             radius = float(cluster["radius"])
-            if any(
-                found_axis == axis
-                and np.linalg.norm(center - found_center) <= tolerance
-                and abs(radius - found_radius) <= tolerance
-                for found_axis, found_center, found_radius in existing
-            ):
-                continue
             spans = cluster["spans"]
             start = min(span[0] for span in spans)
             end = max(span[1] for span in spans)
+            if any(
+                _round_cut_covers(
+                    found,
+                    axis=axis,
+                    center=center,
+                    radius=radius,
+                    start=start,
+                    end=end,
+                    tolerance=tolerance,
+                )
+                or _round_cut_substantially_covers(
+                    found,
+                    axis=axis,
+                    center=center,
+                    radius=radius,
+                    start=start,
+                    end=end,
+                    tolerance=tolerance,
+                )
+                for found in existing
+            ):
+                continue
             margin = max(data.diagonal * 0.001, 0.01)
             holes.append(
                 RoundHoleFeature(
@@ -6784,6 +6961,40 @@ def generate_round_hole_candidates(
             "through-hole features."
         )
         candidates.append(combined)
+    repeated_diameter_groups: list[list[RoundHoleFeature]] = []
+    for hole in all_holes:
+        matching_group = next(
+            (
+                group
+                for group in repeated_diameter_groups
+                if group[0].axis == hole.axis
+                and abs(group[0].diameter - hole.diameter) <= tolerance * 2
+                and abs(group[0].start - hole.start) <= tolerance * 2
+                and abs(
+                    group[0].start
+                    + group[0].depth
+                    - hole.start
+                    - hole.depth
+                )
+                <= tolerance * 2
+            ),
+            None,
+        )
+        if matching_group is None:
+            repeated_diameter_groups.append([hole])
+        else:
+            matching_group.append(hole)
+    repeated_diameter_groups.sort(key=lambda group: (-len(group), group[0].diameter))
+    for group in repeated_diameter_groups[:12]:
+        if len(group) == len(all_holes):
+            continue
+        plan = _replace_fragmented_profile_holes(source, group, tolerance)
+        plan.assumptions.append(
+            f"Consolidated {len(group)} repeated same-diameter circular voids "
+            f"on the {group[0].axis.value} sketch plane into continuous "
+            "editable hole features."
+        )
+        candidates.append(plan)
     if len(detected_by_axis) <= 1:
         return candidates
     for holes in detected_by_axis.values():

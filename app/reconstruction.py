@@ -901,21 +901,42 @@ def reconstruct(
         )
         if "CYLINDER" in existing_surface_types and not measured_cylinder_plans:
             return
-        # The generator returns the all-missing-patches plan first, followed by
-        # one-patch diagnostic alternatives. Coverage is now mandatory, so the
-        # individual alternatives cannot win when more than one patch is
-        # missing and only multiply expensive B-rep rebuilds.
-        candidate_plans = measured_cylinder_plans[:1]
+        # The generator returns the all-patches plan first, then cardinal-axis
+        # groups, then one-patch diagnostics.  Score the combined plan and the
+        # small set of axis groups: promoting circles on the body's layering
+        # axis can be redundant, while an orthogonal group is exactly the
+        # multi-plane feature set that must replace fragmented holes.
+        candidate_plans = measured_cylinder_plans[:4]
         if "CYLINDER" not in existing_surface_types:
             candidate_plans.extend(
                 generate_round_boundary_feature_candidates(data, best.plan)[:12]
             )
-        baseline_operation_count = len(best.plan.operations)
+        baseline_round_holes = [
+            operation
+            for operation in best.plan.operations
+            if isinstance(operation, RoundHoleFeature)
+        ]
+        round_hole_tolerance = max(data.diagonal * 0.002, 0.025)
         analytic: list[tuple[ScoredCandidate, int]] = []
         for index, cylinder_plan in enumerate(candidate_plans):
-            recovered_feature_count = max(
-                0,
-                len(cylinder_plan.operations) - baseline_operation_count,
+            recovered_feature_count = sum(
+                1
+                for operation in cylinder_plan.operations
+                if isinstance(operation, RoundHoleFeature)
+                and not any(
+                    existing.axis == operation.axis
+                    and np.linalg.norm(
+                        np.asarray(existing.center)
+                        - np.asarray(operation.center)
+                    )
+                    <= round_hole_tolerance
+                    and abs(existing.diameter - operation.diameter)
+                    <= round_hole_tolerance * 2
+                    and existing.start <= operation.start + round_hole_tolerance
+                    and existing.start + existing.depth
+                    >= operation.start + operation.depth - round_hole_tolerance
+                    for existing in baseline_round_holes
+                )
             )
             try:
                 candidate = score_plan(
@@ -931,6 +952,14 @@ def reconstruct(
                     geometry_is_acceptable(candidate)
                     and "CYLINDER" in candidate_surface_types
                     and required_existing_types.issubset(candidate_surface_types)
+                    and candidate.report.chamfer_p95_mm
+                    <= best.report.chamfer_p95_mm
+                    + max(0.01, data.diagonal * 0.0002)
+                    and candidate.report.chamfer_rms_mm
+                    <= best.report.chamfer_rms_mm
+                    + max(0.01, data.diagonal * 0.0002)
+                    and candidate.report.volume_error_percent
+                    <= best.report.volume_error_percent + 0.05
                 ):
                     analytic.append((candidate, recovered_feature_count))
             except Exception as exc:
@@ -939,13 +968,11 @@ def reconstruct(
                 )
         if not analytic:
             return
-        # The first measured candidate intentionally combines every missing
-        # cylindrical patch.  Choosing by operation count used to prefer a
-        # single cut, leaving the remaining bores trapped as slightly
-        # different circles in adjacent slab profiles.  Those rings render as
-        # stepped holes and are not useful editable CAD.  Coverage is therefore
-        # the primary invariant; score and feature count only break ties among
-        # candidates that recover the same number of measured cylinders.
+        # Among the fidelity-qualified combined/axis-group candidates, retain
+        # the one with greatest measured coverage. Choosing by operation count
+        # used to prefer a single cut, leaving neighboring bores trapped as
+        # slightly different circles in adjacent slab profiles. Those rings
+        # render as stepped holes and are not useful editable CAD.
         maximum_recovered_count = max(count for _, count in analytic)
         cylinder_best, _ = min(
             analytic,
@@ -1129,6 +1156,14 @@ def reconstruct(
             and candidate.report.volume_error_percent <= 1.5
             and candidate.report.chamfer_p95_mm
             <= _acceptance_threshold(data.diagonal)
+            and candidate.report.chamfer_p95_mm
+            <= best.report.chamfer_p95_mm
+            + max(0.01, data.diagonal * 0.0002)
+            and candidate.report.chamfer_rms_mm
+            <= best.report.chamfer_rms_mm
+            + max(0.01, data.diagonal * 0.0002)
+            and candidate.report.volume_error_percent
+            <= best.report.volume_error_percent + 0.05
         ):
             best = candidate
             warnings.append(
@@ -1932,44 +1967,66 @@ def reconstruct(
                 "slab and duplicate analytic refinements."
             )
 
-    for index, hole_plan in enumerate(
-        []
-        if is_turning_plan() or dense_adaptive_complete
-        else generate_round_hole_candidates(data, best.plan)
-    ):
-        if not search_budget_available():
+    hole_score_index = 0
+    for _hole_pass in range(4):
+        if (
+            is_turning_plan()
+            or dense_adaptive_complete
+            or not search_budget_available()
+        ):
             break
-        try:
-            hole_candidate = score_plan(
-                data,
-                hole_plan,
-                destination / "candidates" / f"holes-{index:02d}",
-                candidate_count=len(generated) + index + 1,
-            )
-            geometrically_equivalent = (
-                hole_candidate.report.valid_solid
-                and hole_candidate.report.chamfer_p95_mm
-                <= best.report.chamfer_p95_mm
-                + max(
-                    # Open meshes have no volume check and often omit one side
-                    # of tiny drilled details.  Give a detected analytic hole
-                    # enough surface-distance headroom to win while requiring
-                    # the completed solid to remain inside the normal gate.
-                    0.02 if not data.report.watertight else 0.01,
-                    data.diagonal
-                    * (0.001 if not data.report.watertight else 0.0002),
+        accepted_hole_group = False
+        # Regenerate after each accepted group. Candidates from the previous
+        # plan are alternatives, not deltas; continuing through that stale
+        # list used to let a later single hole replace an already accepted
+        # repeated-diameter group.
+        hole_plans = generate_round_hole_candidates(data, best.plan)
+        for hole_plan in hole_plans:
+            if not search_budget_available():
+                break
+            try:
+                hole_candidate = score_plan(
+                    data,
+                    hole_plan,
+                    destination
+                    / "candidates"
+                    / f"holes-{hole_score_index:02d}",
+                    candidate_count=len(generated) + hole_score_index + 1,
                 )
-                and hole_candidate.report.volume_error_percent
-                <= best.report.volume_error_percent + 0.05
-                and geometry_is_acceptable(hole_candidate)
-            )
-            if (
-                hole_candidate.report.score < best.report.score
-                or geometrically_equivalent
-            ):
-                best = hole_candidate
-        except Exception as exc:
-            warnings.append(f"Round-hole candidate {index + 1} could not be built: {exc}")
+                geometrically_equivalent = (
+                    hole_candidate.report.valid_solid
+                    and hole_candidate.report.chamfer_p95_mm
+                    <= best.report.chamfer_p95_mm
+                    + max(
+                        # Open meshes have no volume check and often omit one
+                        # side of tiny drilled details. Give a detected
+                        # analytic hole enough surface-distance headroom to
+                        # win while requiring the completed solid to remain
+                        # inside the normal gate.
+                        0.02 if not data.report.watertight else 0.01,
+                        data.diagonal
+                        * (0.001 if not data.report.watertight else 0.0002),
+                    )
+                    and hole_candidate.report.volume_error_percent
+                    <= best.report.volume_error_percent + 0.05
+                    and geometry_is_acceptable(hole_candidate)
+                )
+                if (
+                    hole_candidate.report.score < best.report.score
+                    or geometrically_equivalent
+                ):
+                    best = hole_candidate
+                    accepted_hole_group = True
+                    hole_score_index += 1
+                    break
+            except Exception as exc:
+                warnings.append(
+                    f"Round-hole candidate {hole_score_index + 1} "
+                    f"could not be built: {exc}"
+                )
+            hole_score_index += 1
+        if not accepted_hole_group:
+            break
 
     for index, conical_plan in enumerate(
         []

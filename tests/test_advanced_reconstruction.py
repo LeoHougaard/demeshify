@@ -312,6 +312,202 @@ def test_cross_axis_cylinders_become_round_holes_on_x_y_and_z(
     assert build_plan(candidates[0]).val().isValid()
 
 
+def test_complete_multi_plane_holes_replace_only_covered_circle_fragments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = ReconstructionPlan(
+        name="fragmented-three-axis-holes",
+        base=ExtrudeFeature(
+            axis=Axis.Z,
+            start=-5,
+            depth=10,
+            outer=PolygonProfile(
+                points=[(-10, -10), (10, -10), (10, 10), (-10, 10)]
+            ),
+        ),
+        operations=[
+            BooleanExtrudeFeature(
+                mode="cut",
+                axis=Axis.X,
+                start=-5,
+                depth=5,
+                outer=CircleProfile(center=(0, 0), radius=2.001),
+            ),
+            BooleanExtrudeFeature(
+                mode="cut",
+                axis=Axis.X,
+                start=0,
+                depth=5,
+                outer=CircleProfile(center=(0, 0), radius=1.999),
+            ),
+            BooleanExtrudeFeature(
+                mode="cut",
+                axis=Axis.Y,
+                start=-5,
+                depth=10,
+                outer=CircleProfile(center=(0, 0), radius=2.002),
+                # A distinct stepped portion must survive promotion of the
+                # measured radius-two bore.
+                additional_regions=[
+                    CircleProfile(center=(4, 0), radius=1.0)
+                ],
+            ),
+            # This short feature used to suppress the complete Z-axis bore
+            # because matching ignored start and depth.
+            RoundHoleFeature(
+                axis=Axis.Z,
+                center=(0, 0),
+                diameter=4,
+                start=-5,
+                depth=4,
+                through=False,
+            ),
+            # A path with arcs is not assumed to be a full circle and must not
+            # be deleted by circle deduplication.
+            BooleanExtrudeFeature(
+                mode="cut",
+                axis=Axis.Z,
+                start=-5,
+                depth=10,
+                outer=PathProfile(
+                    start=(-4, -1),
+                    segments=[
+                        LineSegment(end=(-2, -1)),
+                        ArcSegment(mid=(-1, 0), end=(-2, 1)),
+                        LineSegment(end=(-4, 1)),
+                        ArcSegment(mid=(-5, 0), end=(-4, -1)),
+                    ],
+                ),
+            ),
+        ],
+    )
+    measured = [
+        OrientedCylinderFeature(
+            mode="cut",
+            origin=(-5, 0, 0),
+            direction=(1, 0, 0),
+            depth=10,
+            radius=2,
+        ),
+        OrientedCylinderFeature(
+            mode="cut",
+            origin=(0, -5, 0),
+            direction=(0, 1, 0),
+            depth=10,
+            radius=2,
+        ),
+        OrientedCylinderFeature(
+            mode="cut",
+            origin=(0, 0, -5),
+            direction=(0, 0, 1),
+            depth=10,
+            radius=2,
+        ),
+        OrientedCylinderFeature(
+            mode="cut",
+            origin=(5, 0, -5),
+            direction=(0, 0, 1),
+            depth=10,
+            radius=2,
+        ),
+    ]
+    monkeypatch.setattr(
+        profiles_module,
+        "_mesh_cylindrical_features",
+        lambda _data: measured,
+    )
+    data = SimpleNamespace(
+        diagonal=30.0,
+        mesh=SimpleNamespace(bounds=np.asarray([[-5, -5, -5], [5, 5, 5]])),
+    )
+
+    candidate = generate_oriented_cylinder_candidates(
+        data,
+        source,
+        cuts_only=True,
+    )[0]
+
+    holes = [
+        operation
+        for operation in candidate.operations
+        if isinstance(operation, RoundHoleFeature)
+    ]
+    assert len(holes) == 4
+    assert {hole.axis for hole in holes} == {Axis.X, Axis.Y, Axis.Z}
+    assert all(hole.start == -5 and hole.depth == 10 for hole in holes)
+    assert any(
+        len(axis_holes) == 2
+        and {hole.axis for hole in axis_holes} == {Axis.Z}
+        for grouped_candidate in generate_oriented_cylinder_candidates(
+            data,
+            source,
+            cuts_only=True,
+        )[1:]
+        if (
+            axis_holes := [
+                operation
+                for operation in grouped_candidate.operations
+                if isinstance(operation, RoundHoleFeature)
+            ]
+        )
+    )
+    circle_cuts = [
+        profile
+        for operation in candidate.operations
+        if isinstance(operation, BooleanExtrudeFeature)
+        and operation.mode == "cut"
+        for profile in [operation.outer, *operation.additional_regions]
+        if isinstance(profile, CircleProfile)
+    ]
+    assert [(circle.center, circle.radius) for circle in circle_cuts] == [
+        ((4.0, 0.0), 1.0)
+    ]
+    assert any(
+        isinstance(operation, BooleanExtrudeFeature)
+        and isinstance(operation.outer, PathProfile)
+        and operation.axis == Axis.Z
+        for operation in candidate.operations
+    )
+
+
+@pytest.mark.parametrize("axis", [Axis.X, Axis.Y, Axis.Z])
+def test_arc_sketch_boolean_builds_on_every_cardinal_plane(axis: Axis) -> None:
+    capsule = PathProfile(
+        start=(-3, -1),
+        segments=[
+            LineSegment(end=(3, -1)),
+            ArcSegment(mid=(4, 0), end=(3, 1)),
+            LineSegment(end=(-3, 1)),
+            ArcSegment(mid=(-4, 0), end=(-3, -1)),
+        ],
+    )
+    plan = ReconstructionPlan(
+        name=f"{axis.value.lower()}-plane-arc-sketch",
+        base=ExtrudeFeature(
+            axis=Axis.Z,
+            start=-5,
+            depth=10,
+            outer=PolygonProfile(
+                points=[(-10, -10), (10, -10), (10, 10), (-10, 10)]
+            ),
+        ),
+        operations=[
+            BooleanExtrudeFeature(
+                mode="cut",
+                axis=axis,
+                start=-11,
+                depth=22,
+                outer=capsule,
+            )
+        ],
+    )
+
+    result = build_plan(plan).val()
+
+    assert result.isValid()
+    assert "CYLINDER" in {face.geomType() for face in result.Faces()}
+
+
 def test_cone_preservation_can_search_smaller_repeated_hole_boundaries() -> None:
     plan = ReconstructionPlan(
         name="layered_ring",
