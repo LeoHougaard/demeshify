@@ -7596,6 +7596,185 @@ def generate_round_hole_candidates(
     return candidates
 
 
+_BoreSegment = tuple[float, float, float, float, bool]
+
+
+def _consolidate_continuous_bore_segments(
+    segments: list[_BoreSegment],
+    *,
+    axial_tolerance: float,
+    radial_tolerance: float,
+) -> list[_BoreSegment]:
+    """Collapse noisy layer measurements into semantic bore sections.
+
+    Sectioning a model at every planar mesh level can observe the same
+    cylindrical wall many times.  Emitting one cut per interval leaves tiny
+    radius steps and coincident circular edges in the final B-rep.  Merge only
+    adjacent cylindrical intervals whose radii agree within the measurement
+    tolerance; a real counterbore or stepped hole therefore remains split.
+    """
+
+    ordered = sorted(segments, key=lambda item: (item[0], item[1]))
+    merged: list[_BoreSegment] = []
+    for segment in ordered:
+        start, end, start_radius, end_radius, is_conical = segment
+        if end <= start:
+            continue
+        if merged:
+            (
+                previous_start,
+                previous_end,
+                previous_start_radius,
+                previous_end_radius,
+                previous_is_conical,
+            ) = merged[-1]
+            radius_limit = max(
+                radial_tolerance * 1.5,
+                max(
+                    previous_start_radius,
+                    previous_end_radius,
+                    start_radius,
+                    end_radius,
+                )
+                * 0.003,
+            )
+            radii = np.asarray(
+                [
+                    previous_start_radius,
+                    previous_end_radius,
+                    start_radius,
+                    end_radius,
+                ],
+                dtype=float,
+            )
+            if (
+                not previous_is_conical
+                and not is_conical
+                and start <= previous_end + axial_tolerance
+                and float(np.ptp(radii)) <= radius_limit
+            ):
+                previous_depth = previous_end - previous_start
+                segment_depth = end - start
+                nominal_radius = (
+                    previous_start_radius * previous_depth
+                    + start_radius * segment_depth
+                ) / max(previous_depth + segment_depth, 1e-12)
+                merged[-1] = (
+                    min(previous_start, start),
+                    max(previous_end, end),
+                    nominal_radius,
+                    nominal_radius,
+                    False,
+                )
+                continue
+        merged.append(segment)
+
+    # A cone and its adjoining cylinder are measurements of one continuous
+    # wall.  Snap sub-tolerance endpoint disagreement to the cylinder radius
+    # so OpenCascade does not retain a microscopic annular ledge.
+    stitched = list(merged)
+    for index in range(len(stitched) - 1):
+        left = stitched[index]
+        right = stitched[index + 1]
+        if abs(right[0] - left[1]) > axial_tolerance:
+            continue
+        radius_limit = max(
+            radial_tolerance * 1.5,
+            max(left[3], right[2]) * 0.003,
+        )
+        if abs(left[3] - right[2]) > radius_limit:
+            continue
+        if left[4] and not right[4]:
+            stitched[index] = (left[0], left[1], left[2], right[2], True)
+        elif not left[4] and right[4]:
+            stitched[index + 1] = (
+                right[0],
+                right[1],
+                left[3],
+                right[3],
+                True,
+            )
+    return stitched
+
+
+def _remove_sampled_bore_circle_cuts(
+    plan: ReconstructionPlan,
+    *,
+    axis: Axis,
+    center: np.ndarray,
+    segments: list[_BoreSegment],
+    axial_tolerance: float,
+    radial_tolerance: float,
+) -> None:
+    """Remove constant-radius layer proxies superseded by one analytic bore.
+
+    A conical opening sampled at the middle of a thin mesh band appears in a
+    layered fallback as a short cylindrical circle cut.  Keeping that proxy
+    after recovering the cone makes the two cutters compete, which leaves a
+    partial ledge around the hole.  Only complete circles at the recovered
+    center and expected mid-band radius are removed; unrelated regions in a
+    shared sketch remain intact.
+    """
+
+    def radius_at(location: float) -> float | None:
+        for start, end, start_radius, end_radius, _is_conical in segments:
+            if start - axial_tolerance <= location <= end + axial_tolerance:
+                fraction = float(
+                    np.clip(
+                        (location - start) / max(end - start, 1e-12),
+                        0.0,
+                        1.0,
+                    )
+                )
+                return start_radius + (end_radius - start_radius) * fraction
+        return None
+
+    retained_operations = []
+    for operation in plan.operations:
+        if not (
+            isinstance(operation, BooleanExtrudeFeature)
+            and operation.mode == "cut"
+            and operation.axis == axis
+        ):
+            retained_operations.append(operation)
+            continue
+        operation_start = operation.start
+        operation_end = operation.start + operation.depth
+        expected_radius = radius_at((operation_start + operation_end) / 2)
+        if (
+            expected_radius is None
+            or radius_at(operation_start + axial_tolerance * 0.25) is None
+            or radius_at(operation_end - axial_tolerance * 0.25) is None
+        ):
+            retained_operations.append(operation)
+            continue
+        profile_tolerance = max(
+            radial_tolerance * 2.0,
+            expected_radius * 0.012,
+        )
+
+        def is_proxy(
+            profile: Profile,
+            expected: float = expected_radius,
+            tolerance: float = profile_tolerance,
+        ) -> bool:
+            return _profile_is_full_circle_approximation(
+                profile,
+                center,
+                expected,
+                tolerance,
+            )
+
+        regions = [operation.outer, *operation.additional_regions]
+        retained_regions = [profile for profile in regions if not is_proxy(profile)]
+        if not retained_regions:
+            continue
+        operation.outer = retained_regions[0]
+        operation.additional_regions = retained_regions[1:]
+        retained_operations.append(operation)
+    plan.operations = retained_operations
+
+
 def _oriented_cylinder_matches_conical_group(
     operation: OrientedCylinderFeature,
     axis: Axis,
@@ -7903,7 +8082,15 @@ def generate_conical_hole_candidates(
             else:
                 match[1].append(segment)
         reconstructed.extend(
-            (axis, center, sorted(group_segments))
+            (
+                axis,
+                center,
+                _consolidate_continuous_bore_segments(
+                    group_segments,
+                    axial_tolerance=radial_tolerance,
+                    radial_tolerance=radial_tolerance,
+                ),
+            )
             for center, group_segments in groups
             if any(segment[4] for segment in group_segments)
         )
@@ -7939,6 +8126,14 @@ def generate_conical_hole_candidates(
         )
     ]
     for axis, center, segments in reconstructed:
+        _remove_sampled_bore_circle_cuts(
+            plan,
+            axis=axis,
+            center=center,
+            segments=segments,
+            axial_tolerance=radial_tolerance,
+            radial_tolerance=radial_tolerance,
+        )
         for feature in [plan.base, *plan.operations]:
             feature_holes = getattr(feature, "holes", None)
             if feature_holes is None or feature.axis != axis:

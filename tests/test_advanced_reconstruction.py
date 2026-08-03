@@ -1692,7 +1692,13 @@ def test_recovers_cylinder_then_countersink_cones(
         for operation in candidates[0].operations
         if isinstance(operation, ConicalHoleFeature)
     ]
+    bores = [
+        operation
+        for operation in candidates[0].operations
+        if isinstance(operation, RoundHoleFeature)
+    ]
     assert len(cones) == 4
+    assert len(bores) == 4
     assert all(cone.start == pytest.approx(-0.06, abs=0.02) for cone in cones)
     assert all(cone.start_diameter == pytest.approx(0.29, abs=0.03) for cone in cones)
     assert all(cone.end_diameter == pytest.approx(0.87, abs=0.03) for cone in cones)
@@ -1728,6 +1734,129 @@ def test_recovers_cylinder_then_countersink_cones(
         isinstance(operation, ConicalHoleFeature)
         for operation in report.plan.operations
     )
+
+
+def test_continuous_bore_segments_merge_without_erasing_real_steps() -> None:
+    segments = [
+        (-12.0, -11.6, 2.5, 2.1, True),
+        (-11.6, -4.0, 2.100, 2.100, False),
+        (-4.0, -1.984, 2.104, 2.104, False),
+        (-1.984, -0.7, 2.0965, 2.0965, False),
+        (-0.7, 0.5, 2.095, 2.095, False),
+        (0.5, 2.7, 2.095, 2.095, False),
+        (2.7, 4.502, 2.0975, 2.0975, False),
+        # This is an intentional counterbore shoulder, not measurement noise.
+        (4.502, 6.0, 2.4, 2.4, False),
+    ]
+
+    consolidated = profiles_module._consolidate_continuous_bore_segments(
+        segments,
+        axial_tolerance=0.012,
+        radial_tolerance=0.012,
+    )
+
+    assert len(consolidated) == 3
+    cone, bore, counterbore = consolidated
+    assert cone[4]
+    assert not bore[4]
+    assert not counterbore[4]
+    assert bore[:2] == pytest.approx((-11.6, 4.502))
+    assert bore[2] == pytest.approx(bore[3])
+    assert cone[3] == pytest.approx(bore[2])
+    assert counterbore[:2] == pytest.approx((4.502, 6.0))
+    assert counterbore[2] == pytest.approx(2.4)
+
+
+def test_recovered_bore_removes_only_its_sampled_layer_circle() -> None:
+    proxy = CircleProfile(center=(4, -2), radius=2.326)
+    unrelated = CircleProfile(center=(-4, 2), radius=1.25)
+    deliberate_step = CircleProfile(center=(4, -2), radius=2.8)
+    plan = ReconstructionPlan(
+        name="sampled_bore_proxy",
+        base=ExtrudeFeature(
+            axis=Axis.Y,
+            start=-12,
+            depth=12,
+            outer=PolygonProfile(
+                points=[(-8, -6), (8, -6), (8, 6), (-8, 6)]
+            ),
+        ),
+        operations=[
+            BooleanExtrudeFeature(
+                mode="cut",
+                axis=Axis.Y,
+                start=-12,
+                depth=0.346,
+                outer=proxy,
+                additional_regions=[unrelated, deliberate_step],
+            )
+        ],
+    )
+    segments = [
+        (-12.0, -11.6, 2.5, 2.1, True),
+        (-11.6, 0.0, 2.1, 2.1, False),
+    ]
+
+    profiles_module._remove_sampled_bore_circle_cuts(
+        plan,
+        axis=Axis.Y,
+        center=np.asarray((4, -2)),
+        segments=segments,
+        axial_tolerance=0.012,
+        radial_tolerance=0.012,
+    )
+
+    assert len(plan.operations) == 1
+    cut = plan.operations[0]
+    assert isinstance(cut, BooleanExtrudeFeature)
+    assert cut.outer == unrelated
+    assert cut.additional_regions == [deliberate_step]
+
+
+@pytest.mark.parametrize("axis", [Axis.X, Axis.Y, Axis.Z])
+def test_consolidated_bore_builds_as_one_cylinder_on_every_cardinal_plane(
+    axis: Axis,
+) -> None:
+    segments = [
+        (0.0, 2.0, 1.001, 1.001, False),
+        (2.0, 5.0, 0.999, 0.999, False),
+        (5.0, 8.0, 1.0, 1.0, False),
+    ]
+    consolidated = profiles_module._consolidate_continuous_bore_segments(
+        segments,
+        axial_tolerance=0.01,
+        radial_tolerance=0.01,
+    )
+    assert len(consolidated) == 1
+    start, end, radius, _, _ = consolidated[0]
+    plan = ReconstructionPlan(
+        name=f"continuous_{axis.value}_bore",
+        base=ExtrudeFeature(
+            axis=axis,
+            start=0,
+            depth=8,
+            outer=PolygonProfile(
+                points=[(-3, -3), (3, -3), (3, 3), (-3, 3)]
+            ),
+        ),
+        operations=[
+            RoundHoleFeature(
+                axis=axis,
+                center=(0, 0),
+                diameter=radius * 2,
+                start=start,
+                depth=end - start,
+                through=True,
+            )
+        ],
+    )
+
+    result = build_plan(plan).val()
+    cylindrical_faces = [
+        face for face in result.Faces() if face.geomType() == "CYLINDER"
+    ]
+    assert result.isValid()
+    assert len(cylindrical_faces) == 1
 
 
 def test_recovers_arbitrary_axis_annular_cylinder_from_mesh(
