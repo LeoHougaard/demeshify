@@ -28,6 +28,7 @@ from .profiles import (
     generate_constant_stock_cylinder_cut_candidates,
     generate_cross_axis_residual_candidates,
     generate_cylindrical_stock_candidates,
+    generate_embedded_circle_promotion_candidates,
     generate_end_finish_candidates,
     generate_envelope_candidates,
     generate_feature_round_finish_candidates,
@@ -992,6 +993,51 @@ def reconstruct(
             "patches as continuous analytic cylinders in the final STEP "
             "feature tree."
         )
+
+    def promote_embedded_profile_circles(label: str) -> None:
+        """Make every layered circle one editable, plane-specific feature."""
+
+        nonlocal best
+        plans = generate_embedded_circle_promotion_candidates(data, best.plan)
+        if not plans:
+            return
+        try:
+            candidate = score_plan(
+                data,
+                plans[0],
+                destination / "candidates" / f"profile-circles-{label}",
+                candidate_count=len(generated) + 1,
+            )
+        except Exception as exc:
+            warnings.append(
+                f"Profile-circle promotion could not be built: {exc}"
+            )
+            return
+        # Circle lifting is a topology/parameterization refinement.  Its B-rep
+        # volume should be nearly identical, while coarse STL resampling can
+        # move a tail-distance statistic slightly.  Keep strict solid/volume
+        # guards and a bounded geometric allowance so semantic reconstruction
+        # is not defeated by tessellation noise.
+        if (
+            candidate.report.valid_solid
+            and candidate.report.volume_error_percent
+            <= best.report.volume_error_percent + 0.05
+            and candidate.report.chamfer_p95_mm
+            <= best.report.chamfer_p95_mm
+            + max(0.02, data.diagonal * 0.00035)
+            and candidate.report.chamfer_rms_mm
+            <= best.report.chamfer_rms_mm
+            + max(0.03, data.diagonal * 0.0005)
+        ):
+            best = candidate
+            promoted_count = sum(
+                isinstance(operation, RoundHoleFeature)
+                for operation in best.plan.operations
+            )
+            warnings.append(
+                f"Promoted layered circle sketches into {promoted_count} "
+                "ordered, editable hole features on their measured planes."
+            )
 
     def preserve_detected_spheres(label: str) -> None:
         nonlocal best
@@ -2544,6 +2590,10 @@ def reconstruct(
         (
             "recover_curve_aligned_layering",
             lambda: recover_curve_aligned_layering("final"),
+        ),
+        (
+            "promote_embedded_profile_circles",
+            lambda: promote_embedded_profile_circles("final"),
         ),
         ("compact_coplanar_regions", lambda: compact_coplanar_regions("final")),
         ("compact_round_hole_patterns", lambda: compact_round_hole_patterns("final")),

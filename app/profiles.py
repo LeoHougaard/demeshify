@@ -5746,6 +5746,16 @@ def generate_oriented_cylinder_candidates(
                 end=end,
                 tolerance=tolerance,
             )
+            or _round_cut_substantially_covers(
+                existing,
+                axis=axis,
+                center=center,
+                radius=fitted.radius,
+                start=start,
+                end=end,
+                tolerance=tolerance,
+                minimum_fraction=0.97,
+            )
             for existing in existing_holes
         ):
             continue
@@ -6855,6 +6865,156 @@ def _replace_fragmented_profile_holes(
         holes,
         tolerance,
     )
+
+
+def generate_embedded_circle_promotion_candidates(
+    data: MeshData,
+    source: ReconstructionPlan,
+) -> list[ReconstructionPlan]:
+    """Lift repeated layer-profile circles into ordered hole features.
+
+    A layered reconstruction can reproduce a bore by putting essentially the
+    same circle in every additive slab.  That is geometrically close, but it
+    leaves a stepped wall and makes the diameter impossible to edit as one
+    feature.  Cluster those observations independently for every sketch plane
+    and radius, remove only the covered circle profiles, and append continuous
+    analytic cuts at the point in the ordered tree where all stock exists.
+
+    Path profiles are deliberately excluded: a path containing an arc may be
+    a partial circle, tangent blend, slot, or arbitrary outer boundary.
+    """
+
+    # Keep diameter steps distinct.  The broader cylinder-detection tolerance
+    # is intentionally inappropriate here: on a small counterbore it can make
+    # neighboring measured radii look interchangeable and delete the wrong
+    # layer circle.
+    tolerance = max(data.diagonal * 0.001, 0.02)
+    radius_tolerance = max(data.diagonal * 0.00015, 0.003)
+    boolean_margin = max(data.diagonal * 0.000015, 0.0005)
+    observations: list[dict[str, object]] = []
+
+    for feature in [source.base, *source.operations]:
+        axis = getattr(feature, "axis", None)
+        start = getattr(feature, "start", None)
+        depth = getattr(feature, "depth", None)
+        if (
+            isinstance(feature, BooleanExtrudeFeature)
+            and feature.mode == "cut"
+        ):
+            circle_regions = [feature.outer, *feature.additional_regions]
+        else:
+            circle_regions = list(getattr(feature, "holes", None) or [])
+        if (
+            not isinstance(axis, Axis)
+            or start is None
+            or depth is None
+            or not circle_regions
+        ):
+            continue
+        interval_start = float(start)
+        interval_end = interval_start + float(depth)
+        for profile in circle_regions:
+            if not isinstance(profile, CircleProfile):
+                continue
+            center = np.asarray(profile.center, dtype=float)
+            cluster = next(
+                (
+                    item
+                    for item in observations
+                    if item["axis"] == axis
+                    and np.linalg.norm(
+                        np.asarray(item["center"], dtype=float) - center
+                    )
+                    <= tolerance
+                    and abs(float(item["radius"]) - profile.radius)
+                    <= radius_tolerance
+                ),
+                None,
+            )
+            if cluster is None:
+                observations.append(
+                    {
+                        "axis": axis,
+                        "centers": [center],
+                        "center": center,
+                        "radii": [profile.radius],
+                        "radius": profile.radius,
+                        "intervals": [(interval_start, interval_end)],
+                    }
+                )
+            else:
+                cluster["centers"].append(center)
+                cluster["radii"].append(profile.radius)
+                cluster["intervals"].append((interval_start, interval_end))
+                cluster["center"] = np.median(
+                    np.asarray(cluster["centers"], dtype=float), axis=0
+                )
+                cluster["radius"] = float(np.median(cluster["radii"]))
+
+    existing = _existing_round_holes(source)
+    promoted: list[RoundHoleFeature] = []
+    for cluster in observations:
+        intervals = sorted(cluster["intervals"])
+        axis = cluster["axis"]
+        center = np.asarray(cluster["center"], dtype=float)
+        radius = float(cluster["radius"])
+        contiguous_runs: list[list[tuple[float, float]]] = []
+        for interval in intervals:
+            if (
+                not contiguous_runs
+                or interval[0] > contiguous_runs[-1][-1][1] + tolerance
+            ):
+                contiguous_runs.append([interval])
+            else:
+                contiguous_runs[-1].append(interval)
+        for run in contiguous_runs:
+            start = min(interval[0] for interval in run)
+            end = max(interval[1] for interval in run)
+            if any(
+                _round_cut_covers(
+                    hole,
+                    axis=axis,
+                    center=center,
+                    radius=radius,
+                    start=start,
+                    end=end,
+                    tolerance=tolerance,
+                )
+                for hole in existing
+            ):
+                continue
+            axis_index = (Axis.X, Axis.Y, Axis.Z).index(axis)
+            bounds = data.mesh.bounds[:, axis_index]
+            promoted.append(
+                RoundHoleFeature(
+                    axis=axis,
+                    center=(_clean(center[0]), _clean(center[1])),
+                    diameter=_clean(radius * 2),
+                    # Coincident cut/layer faces can leave a zero-thickness
+                    # cap in OCCT.  A micron-scale axial overlap is far below
+                    # the mesh fitting tolerance and makes the Boolean result
+                    # both topologically clean and geometrically equivalent.
+                    start=_clean(start - boolean_margin),
+                    depth=_clean(end - start + boolean_margin * 2),
+                    through=(
+                        start <= float(bounds[0]) + tolerance
+                        and end >= float(bounds[1]) - tolerance
+                    ),
+                )
+            )
+
+    if not promoted:
+        return []
+    candidate = _replace_profile_circles_with_round_holes(
+        source,
+        promoted,
+        tolerance,
+    )
+    candidate.assumptions.append(
+        f"Promoted {len(promoted)} repeated layer-profile circles on "
+        "their measured sketch planes into editable analytic hole features."
+    )
+    return [candidate]
 
 
 def generate_round_hole_candidates(

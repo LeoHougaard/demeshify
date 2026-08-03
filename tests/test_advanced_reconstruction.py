@@ -25,6 +25,7 @@ from app.profiles import (
     generate_circular_end_finish_candidates,
     generate_conical_hole_candidates,
     generate_cross_axis_residual_candidates,
+    generate_embedded_circle_promotion_candidates,
     generate_end_finish_candidates,
     generate_feature_round_finish_candidates,
     generate_oriented_cylinder_candidates,
@@ -506,6 +507,68 @@ def test_arc_sketch_boolean_builds_on_every_cardinal_plane(axis: Axis) -> None:
 
     assert result.isValid()
     assert "CYLINDER" in {face.geomType() for face in result.Faces()}
+
+
+def test_layer_profile_circles_promote_on_every_cardinal_plane() -> None:
+    square = PolygonProfile(points=[(-5, -5), (5, -5), (5, 5), (-5, 5)])
+    source = ReconstructionPlan(
+        name="three-plane-layer-circles",
+        base=ExtrudeFeature(
+            axis=Axis.Z,
+            start=-5,
+            depth=2,
+            outer=square,
+            holes=[CircleProfile(center=(0, 0), radius=1)],
+        ),
+        operations=[
+            BooleanExtrudeFeature(
+                mode="cut",
+                axis=Axis.Y,
+                start=-5,
+                depth=2,
+                outer=CircleProfile(center=(1, 0), radius=1.5),
+            ),
+            BooleanExtrudeFeature(
+                mode="add",
+                axis=Axis.X,
+                start=-5,
+                depth=2,
+                outer=square,
+                holes=[CircleProfile(center=(-1, 0), radius=2)],
+            ),
+        ],
+    )
+    data = SimpleNamespace(
+        diagonal=20.0,
+        mesh=SimpleNamespace(
+            bounds=np.asarray([[-5.0, -5.0, -5.0], [5.0, 5.0, 5.0]])
+        ),
+    )
+
+    candidates = generate_embedded_circle_promotion_candidates(data, source)
+
+    assert len(candidates) == 1
+    promoted = candidates[0]
+    holes = [
+        operation
+        for operation in promoted.operations
+        if isinstance(operation, RoundHoleFeature)
+    ]
+    assert {hole.axis for hole in holes} == {Axis.X, Axis.Y, Axis.Z}
+    retained_profile_circles = []
+    for feature in [promoted.base, *promoted.operations]:
+        retained_profile_circles.extend(
+            profile
+            for profile in getattr(feature, "holes", [])
+            if isinstance(profile, CircleProfile)
+        )
+        if isinstance(feature, BooleanExtrudeFeature) and feature.mode == "cut":
+            retained_profile_circles.extend(
+                profile
+                for profile in [feature.outer, *feature.additional_regions]
+                if isinstance(profile, CircleProfile)
+            )
+    assert not retained_profile_circles
 
 
 def test_cone_preservation_can_search_smaller_repeated_hole_boundaries() -> None:
