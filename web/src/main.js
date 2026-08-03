@@ -908,14 +908,21 @@ button.addEventListener("click", async () => {
 
 async function renderResult(report, options = {}) {
   const complete = report.status === "complete";
+  const semantic = report.plan?.representation !== "sampled_approximation";
   document.querySelector("#resultTitle").textContent = complete
     ? "Editable model ready"
     : report.status === "best_effort"
-      ? "Best editable model produced"
+      ? semantic
+        ? "Best editable model produced"
+        : "Geometric approximation produced"
       : "Automatic reconstruction stopped";
   const confidence = document.querySelector("#confidence");
   confidence.className = `confidence ${complete ? "good" : "caution"}`;
-  confidence.textContent = complete ? "High-confidence match" : "Best effort";
+  confidence.textContent = complete
+    ? "High-confidence match"
+    : semantic
+      ? "Best effort"
+      : "Approximation only";
 
   if (report.score) {
     document.querySelector("#p95").textContent = report.score.chamfer_p95_mm.toFixed(3);

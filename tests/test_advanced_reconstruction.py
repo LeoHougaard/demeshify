@@ -153,6 +153,10 @@ def test_change_weighted_layers_reuse_probe_sections(tmp_path: Path) -> None:
     )
 
     assert candidates
+    assert all(
+        candidate.representation == "sampled_approximation"
+        for candidate in candidates
+    )
     assert len(data.section_cache) == 12
 
 
@@ -1667,6 +1671,119 @@ def test_recovers_arbitrary_axis_annular_cylinder_from_mesh(
     assert build_plan(candidates[0]).val().isValid()
 
 
+def test_angled_through_hole_is_attached_to_entry_and_exit_patches(
+    tmp_path: Path,
+) -> None:
+    direction = cq.Vector(0.4, 0.25, 1).normalized()
+    stock = cq.Workplane("XY").box(
+        20,
+        16,
+        8,
+        centered=(True, True, False),
+    )
+    bore = cq.Workplane(
+        obj=cq.Solid.makeCylinder(
+            2,
+            16,
+            cq.Vector(-3 * direction.x, -3 * direction.y, -3),
+            direction,
+        )
+    )
+    model = stock.cut(bore)
+    stl_path = step_to_stl(model, tmp_path, "angled_through_hole")
+    data = load_mesh(stl_path, stl_path.name, "mm")
+    source = ReconstructionPlan(
+        name="angled_through_hole",
+        base=ExtrudeFeature(
+            axis=Axis.Z,
+            start=0,
+            depth=8,
+            outer=PolygonProfile(
+                points=[(-10, -8), (10, -8), (10, 8), (-10, 8)]
+            ),
+        ),
+    )
+
+    candidates = generate_oriented_cylinder_candidates(
+        data,
+        source,
+        cuts_only=True,
+    )
+
+    assert candidates
+    holes = [
+        operation
+        for operation in candidates[0].operations
+        if isinstance(operation, OrientedCylinderFeature)
+        and operation.mode == "cut"
+    ]
+    assert holes
+    hole = min(holes, key=lambda feature: abs(feature.radius - 2))
+    assert hole.radius == pytest.approx(2, abs=0.03)
+    assert abs(hole.direction[0]) > 0.1
+    assert abs(hole.direction[1]) > 0.1
+    assert hole.support_patch_id is not None
+    assert hole.terminating_patch_id is not None
+    assert hole.support_patch_id != hole.terminating_patch_id
+    assert hole.through
+    assert build_plan(candidates[0]).val().isValid()
+
+
+def test_angled_hole_supports_rotate_with_the_part(tmp_path: Path) -> None:
+    support_normal = np.asarray([0.25, 0.45, 0.857], dtype=float)
+    support_normal /= np.linalg.norm(support_normal)
+    x_direction = np.asarray([1.0, 0.0, 0.0])
+    x_direction -= support_normal * float(x_direction @ support_normal)
+    x_direction /= np.linalg.norm(x_direction)
+    base_plan = ReconstructionPlan(
+        name="rotated_angled_hole",
+        base=OrientedExtrudeFeature(
+            origin=(0, 0, 0),
+            plane_normal=tuple(float(value) for value in support_normal),
+            direction=tuple(float(value) for value in support_normal),
+            x_direction=tuple(float(value) for value in x_direction),
+            depth=8,
+            outer=PolygonProfile(
+                points=[(-10, -8), (10, -8), (10, 8), (-10, 8)]
+            ),
+        ),
+    )
+    stock = build_plan(base_plan)
+    bore_direction = support_normal + 0.3 * x_direction
+    bore_direction /= np.linalg.norm(bore_direction)
+    bore_start = -3 * bore_direction
+    bore = cq.Workplane(
+        obj=cq.Solid.makeCylinder(
+            1.5,
+            18,
+            cq.Vector(*bore_start),
+            cq.Vector(*bore_direction),
+        )
+    )
+    model = stock.cut(bore)
+    stl_path = step_to_stl(model, tmp_path, "rotated_angled_hole")
+    data = load_mesh(stl_path, stl_path.name, "mm")
+
+    candidates = generate_oriented_cylinder_candidates(
+        data,
+        base_plan,
+        cuts_only=True,
+    )
+
+    assert candidates
+    hole = next(
+        operation
+        for operation in candidates[0].operations
+        if isinstance(operation, OrientedCylinderFeature)
+        and operation.mode == "cut"
+    )
+    assert hole.radius == pytest.approx(1.5, abs=0.03)
+    assert hole.support_patch_id is not None
+    assert hole.terminating_patch_id is not None
+    assert hole.support_patch_id != hole.terminating_patch_id
+    assert hole.through
+
+
 def test_recovers_layered_arbitrary_axis_sketch_extrusions(
     tmp_path: Path,
 ) -> None:
@@ -1747,6 +1864,17 @@ def test_recovers_all_planar_arbitrary_axis_extrusion(
     )
 
     assert candidates
+    recovered = next(
+        candidate.plan.base
+        for candidate in candidates
+        if isinstance(candidate.plan.base, OrientedExtrudeFeature)
+        and len(candidate.plan.operations) == 0
+        and abs(candidate.plan.base.direction[1])
+        == pytest.approx(abs(direction[1]), abs=0.002)
+    )
+    assert recovered.support_patch_id is not None
+    assert recovered.terminating_patch_id is not None
+    assert recovered.support_patch_id != recovered.terminating_patch_id
     assert any(
         isinstance(candidate.plan.base, OrientedExtrudeFeature)
         and len(candidate.plan.operations) == 0

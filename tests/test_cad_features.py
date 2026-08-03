@@ -434,6 +434,48 @@ def test_layered_oriented_extrusion_generated_source_matches_runtime(
     )
 
 
+def test_surface_sketch_can_extrude_remove_along_independent_direction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = ReconstructionPlan(
+        name="angled-hole-from-planar-support",
+        base=ExtrudeFeature(
+            axis=Axis.Z,
+            start=0,
+            depth=6,
+            outer=rectangle(-8, -6, 8, 6),
+        ),
+        operations=[
+            OrientedBooleanExtrudeFeature(
+                mode="cut",
+                origin=(0, 0, -0.1),
+                plane_normal=(0, 0, 1),
+                direction=(0.4, 0, 1),
+                x_direction=(1, 0, 0),
+                depth=7,
+                outer=CircleProfile(center=(0, 0), radius=1.5),
+                support_patch_id="plane-entry",
+                terminating_patch_id="plane-exit",
+                extent_kind="up_to_patch",
+            )
+        ],
+    )
+
+    runtime = build_plan(plan)
+    generated = execute_generated_source(plan, tmp_path, monkeypatch)
+
+    assert runtime.val().isValid()
+    assert generated.val().isValid()
+    assert generated.val().Volume() == pytest.approx(
+        runtime.val().Volume(),
+        rel=1e-9,
+    )
+    operation = plan.operations[0]
+    assert isinstance(operation, OrientedBooleanExtrudeFeature)
+    assert operation.plane_normal != operation.direction
+
+
 def test_sphere_cut_is_editable_and_generated_source_matches(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

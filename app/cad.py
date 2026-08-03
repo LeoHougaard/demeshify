@@ -47,6 +47,14 @@ def _oriented_plane(
     return cq.Plane(origin=origin, xDir=x_direction, normal=direction)
 
 
+def _direction_vector(
+    direction: tuple[float, float, float],
+    depth: float,
+) -> cq.Vector:
+    vector = cq.Vector(*direction)
+    return vector.normalized().multiply(depth)
+
+
 def _profile_solid(profile: Profile, plane: cq.Plane, depth: float) -> cq.Workplane:
     workplane = cq.Workplane(plane)
     if isinstance(profile, CircleProfile):
@@ -109,6 +117,24 @@ def _profile_wire(profile: Profile, plane: cq.Plane) -> cq.Wire:
     raise TypeError(f"Unsupported profile: {type(profile).__name__}")
 
 
+def _profile_prism(
+    outer: Profile,
+    holes: list[Profile],
+    plane: cq.Plane,
+    direction: tuple[float, float, float],
+    depth: float,
+) -> cq.Workplane:
+    """Extrude a sketch along an arbitrary vector, independent of its plane."""
+
+    vector = _direction_vector(direction, depth)
+    solid = cq.Solid.extrudeLinear(
+        _profile_wire(outer, plane),
+        [_profile_wire(hole, plane) for hole in holes],
+        vector,
+    )
+    return cq.Workplane(obj=solid)
+
+
 def _revolve_plane(base: RevolveFeature) -> tuple[cq.Plane, cq.Vector, cq.Vector]:
     if base.axis == Axis.X:
         origin = cq.Vector(0, base.center[0], base.center[1])
@@ -156,12 +182,26 @@ def _build_base(
     if isinstance(base, OrientedExtrudeFeature):
         plane = _oriented_plane(
             base.origin,
-            base.direction,
+            base.plane_normal or base.direction,
             base.x_direction,
         )
-        result = _profile_solid(base.outer, plane, base.depth)
-        for hole in base.holes:
-            result = result.cut(_profile_solid(hole, plane, base.depth))
+        result = _profile_prism(
+            base.outer,
+            base.holes,
+            plane,
+            base.direction,
+            base.depth,
+        )
+        for region in base.additional_regions:
+            result = result.union(
+                _profile_prism(
+                    region,
+                    [],
+                    plane,
+                    base.direction,
+                    base.depth,
+                )
+            )
         return result
     plane = _plane(base.axis, base.start)
     if isinstance(base, CylinderFeature):
@@ -277,12 +317,26 @@ def _oriented_boolean_extrusion(
 ) -> cq.Workplane:
     plane = _oriented_plane(
         operation.origin,
-        operation.direction,
+        operation.plane_normal or operation.direction,
         operation.x_direction,
     )
-    result = _profile_solid(operation.outer, plane, operation.depth)
-    for hole in operation.holes:
-        result = result.cut(_profile_solid(hole, plane, operation.depth))
+    result = _profile_prism(
+        operation.outer,
+        operation.holes,
+        plane,
+        operation.direction,
+        operation.depth,
+    )
+    for region in operation.additional_regions:
+        result = result.union(
+            _profile_prism(
+                region,
+                [],
+                plane,
+                operation.direction,
+                operation.depth,
+            )
+        )
     return result
 
 
@@ -876,9 +930,10 @@ def plan_to_source(plan: ReconstructionPlan) -> str:
             "profile.val(), [], 360, axis_start, axis_end))"
         )
     elif isinstance(base, OrientedExtrudeFeature):
+        plane_normal = base.plane_normal or base.direction
         plane_expr = (
             f"cq.Plane(origin={base.origin!r}, "
-            f"xDir={base.x_direction!r}, normal={base.direction!r})"
+            f"xDir={base.x_direction!r}, normal={plane_normal!r})"
         )
         lines.append(f"plane = {plane_expr}")
     else:
@@ -934,11 +989,36 @@ def plan_to_source(plan: ReconstructionPlan) -> str:
             lines.append(f"result = result.union({variable}.extrude({base.depth!r}))")
     elif isinstance(base, OrientedExtrudeFeature):
         lines.extend(_profile_source(base.outer, "plane", "profile"))
-        lines.append(f"result = profile.extrude({base.depth!r})")
+        hole_names: list[str] = []
         for index, hole in enumerate(base.holes):
             variable = f"hole_{index}"
             lines.extend(_profile_source(hole, "plane", variable))
-            lines.append(f"result = result.cut({variable}.extrude({base.depth!r}))")
+            hole_names.append(f"{variable}.val()")
+        vector = tuple(
+            float(component) / sum(value * value for value in base.direction) ** 0.5
+            * base.depth
+            for component in base.direction
+        )
+        lines.extend(
+            [
+                "result = cq.Workplane(obj=cq.Solid.extrudeLinear(",
+                "    profile.val(),",
+                f"    [{', '.join(hole_names)}],",
+                f"    cq.Vector{vector!r},",
+                "))",
+            ]
+        )
+        for index, region in enumerate(base.additional_regions):
+            variable = f"base_region_{index}"
+            lines.extend(_profile_source(region, "plane", variable))
+            lines.extend(
+                [
+                    f"{variable}_solid = cq.Workplane(obj=cq.Solid.extrudeLinear(",
+                    f"    {variable}.val(), [], cq.Vector{vector!r},",
+                    "))",
+                    f"result = result.union({variable}_solid)",
+                ]
+            )
     feature_finishes: dict[int, list[tuple[int, EdgeFinishFeature]]] = {}
     for finish_index, operation in enumerate(plan.operations):
         if isinstance(operation, EdgeFinishFeature) and operation.feature_index is not None:
@@ -1002,28 +1082,53 @@ def plan_to_source(plan: ReconstructionPlan) -> str:
         if isinstance(operation, OrientedBooleanExtrudeFeature):
             plane_name = f"feature_plane_{index}"
             profile_name = f"feature_profile_{index}"
+            plane_normal = operation.plane_normal or operation.direction
+            direction_length = sum(
+                value * value for value in operation.direction
+            ) ** 0.5
+            vector = tuple(
+                float(component) / direction_length * operation.depth
+                for component in operation.direction
+            )
             lines.extend(
                 [
                     "",
                     f"{plane_name} = cq.Plane(",
                     f"    origin={operation.origin!r},",
                     f"    xDir={operation.x_direction!r},",
-                    f"    normal={operation.direction!r},",
+                    f"    normal={plane_normal!r},",
                     ")",
                 ]
             )
             lines.extend(
                 _profile_source(operation.outer, plane_name, profile_name)
             )
-            lines.append(
-                f"feature_{index} = {profile_name}.extrude({operation.depth!r})"
-            )
+            hole_names = []
             for hole_index, hole in enumerate(operation.holes):
                 hole_name = f"feature_{index}_hole_{hole_index}"
                 lines.extend(_profile_source(hole, plane_name, hole_name))
-                lines.append(
-                    f"feature_{index} = feature_{index}.cut("
-                    f"{hole_name}.extrude({operation.depth!r}))"
+                hole_names.append(f"{hole_name}.val()")
+            lines.extend(
+                [
+                    f"feature_{index} = cq.Workplane(obj=cq.Solid.extrudeLinear(",
+                    f"    {profile_name}.val(),",
+                    f"    [{', '.join(hole_names)}],",
+                    f"    cq.Vector{vector!r},",
+                    "))",
+                ]
+            )
+            for region_index, region in enumerate(operation.additional_regions):
+                region_name = f"feature_{index}_region_{region_index}"
+                lines.extend(_profile_source(region, plane_name, region_name))
+                lines.extend(
+                    [
+                        f"{region_name}_solid = cq.Workplane("
+                        "obj=cq.Solid.extrudeLinear(",
+                        f"    {region_name}.val(), [], cq.Vector{vector!r},",
+                        "))",
+                        f"feature_{index} = feature_{index}.union("
+                        f"{region_name}_solid)",
+                    ]
                 )
             method = "union" if operation.mode == "add" else "cut"
             lines.append(f"result = result.{method}(feature_{index})")

@@ -130,28 +130,42 @@ class OrientedExtrudeFeature(FeatureNode):
 
     kind: Literal["oriented_extrude"] = "oriented_extrude"
     origin: Point3D
+    # ``plane_normal`` defines the sketch plane while ``direction`` defines
+    # the prism vector.  Older plans omit it and retain the historical normal
+    # extrusion behavior by falling back to ``direction``.
+    plane_normal: Point3D | None = None
     direction: Point3D
     x_direction: Point3D
     depth: Annotated[float, Field(gt=0)]
     outer: Profile
     holes: list[Profile] = Field(default_factory=list)
+    additional_regions: list[Profile] = Field(default_factory=list)
+    support_patch_id: str | None = None
+    terminating_patch_id: str | None = None
+    extent_kind: Literal["distance", "through_all", "up_to_patch"] = "distance"
 
     @model_validator(mode="after")
     def validate_frame(self) -> OrientedExtrudeFeature:
         direction_length = sum(component * component for component in self.direction) ** 0.5
+        plane_normal = self.plane_normal or self.direction
+        normal_length = sum(component * component for component in plane_normal) ** 0.5
         x_length = sum(component * component for component in self.x_direction) ** 0.5
         dot = sum(
-            direction * x_direction
-            for direction, x_direction in zip(
-                self.direction,
+            normal * x_direction
+            for normal, x_direction in zip(
+                plane_normal,
                 self.x_direction,
                 strict=True,
             )
         )
-        if direction_length <= 1e-9 or x_length <= 1e-9:
-            raise ValueError("direction and x_direction must be non-zero")
-        if abs(dot) / (direction_length * x_length) > 1e-4:
-            raise ValueError("direction and x_direction must be perpendicular")
+        if direction_length <= 1e-9 or normal_length <= 1e-9 or x_length <= 1e-9:
+            raise ValueError(
+                "direction, plane_normal, and x_direction must be non-zero"
+            )
+        if abs(dot) / (normal_length * x_length) > 1e-4:
+            raise ValueError("plane_normal and x_direction must be perpendicular")
+        if self.extent_kind == "up_to_patch" and not self.terminating_patch_id:
+            raise ValueError("up_to_patch extrusions require terminating_patch_id")
         return self
 
 
@@ -169,6 +183,8 @@ class RoundHoleFeature(FeatureNode):
     start: float
     depth: Annotated[float, Field(gt=0)]
     through: bool = True
+    support_patch_id: str | None = None
+    terminating_patch_id: str | None = None
 
 
 class ConicalHoleFeature(FeatureNode):
@@ -179,6 +195,8 @@ class ConicalHoleFeature(FeatureNode):
     depth: Annotated[float, Field(gt=0)]
     start_diameter: Annotated[float, Field(gt=0)]
     end_diameter: Annotated[float, Field(gt=0)]
+    support_patch_id: str | None = None
+    terminating_patch_id: str | None = None
 
 
 class ConicalAddFeature(FeatureNode):
@@ -226,6 +244,9 @@ class OrientedCylinderFeature(FeatureNode):
     depth: Annotated[float, Field(gt=0)]
     radius: Annotated[float, Field(gt=0)]
     inner_radius: Annotated[float | None, Field(default=None, gt=0)] = None
+    support_patch_id: str | None = None
+    terminating_patch_id: str | None = None
+    through: bool = False
 
     @model_validator(mode="after")
     def validate_oriented_cylinder(self) -> OrientedCylinderFeature:
@@ -244,28 +265,39 @@ class OrientedBooleanExtrudeFeature(FeatureNode):
     kind: Literal["oriented_boolean_extrude"] = "oriented_boolean_extrude"
     mode: Literal["add", "cut"]
     origin: Point3D
+    plane_normal: Point3D | None = None
     direction: Point3D
     x_direction: Point3D
     depth: Annotated[float, Field(gt=0)]
     outer: Profile
     holes: list[Profile] = Field(default_factory=list)
+    additional_regions: list[Profile] = Field(default_factory=list)
+    support_patch_id: str | None = None
+    terminating_patch_id: str | None = None
+    extent_kind: Literal["distance", "through_all", "up_to_patch"] = "distance"
 
     @model_validator(mode="after")
     def validate_frame(self) -> OrientedBooleanExtrudeFeature:
         direction_length = sum(component * component for component in self.direction) ** 0.5
+        plane_normal = self.plane_normal or self.direction
+        normal_length = sum(component * component for component in plane_normal) ** 0.5
         x_length = sum(component * component for component in self.x_direction) ** 0.5
         dot = sum(
-            direction * x_direction
-            for direction, x_direction in zip(
-                self.direction,
+            normal * x_direction
+            for normal, x_direction in zip(
+                plane_normal,
                 self.x_direction,
                 strict=True,
             )
         )
-        if direction_length <= 1e-9 or x_length <= 1e-9:
-            raise ValueError("direction and x_direction must be non-zero")
-        if abs(dot) / (direction_length * x_length) > 1e-4:
-            raise ValueError("direction and x_direction must be perpendicular")
+        if direction_length <= 1e-9 or normal_length <= 1e-9 or x_length <= 1e-9:
+            raise ValueError(
+                "direction, plane_normal, and x_direction must be non-zero"
+            )
+        if abs(dot) / (normal_length * x_length) > 1e-4:
+            raise ValueError("plane_normal and x_direction must be perpendicular")
+        if self.extent_kind == "up_to_patch" and not self.terminating_patch_id:
+            raise ValueError("up_to_patch extrusions require terminating_patch_id")
         return self
 
 
@@ -374,6 +406,9 @@ class ReconstructionPlan(BaseModel):
     locked_parameters: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     source: Literal["deterministic", "ai", "hybrid"] = "deterministic"
+    # Sampled fallbacks can be useful previews, but they must never be
+    # advertised as a clean semantic feature reconstruction.
+    representation: Literal["semantic", "sampled_approximation"] = "semantic"
 
     @model_validator(mode="after")
     def normalize_feature_tree(self) -> ReconstructionPlan:

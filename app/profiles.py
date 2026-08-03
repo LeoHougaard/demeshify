@@ -39,6 +39,7 @@ from .schemas import (
     SplineSegment,
     TaperedAddFeature,
 )
+from .surface_graph import cylinder_support_patches, detect_surface_graph
 
 AXES: dict[Axis, tuple[np.ndarray, np.ndarray, np.ndarray, int]] = {
     Axis.X: (
@@ -2270,6 +2271,7 @@ def generate_adaptive_layer_candidates(
             f"Recovered continuously varying cross-axis detail as {slice_count} "
             f"editable analytic-profile slabs along the {axis.value} axis."
         ],
+        representation="sampled_approximation",
     )
     candidates = [plan]
 
@@ -2451,6 +2453,7 @@ def generate_change_weighted_layer_candidates(
             f"Allocated {len(levels) - 1} editable {axis.value}-axis layers "
             "by measured cross-section change rather than uniform spacing."
         ],
+        representation="sampled_approximation",
     )
     candidates = [plan]
 
@@ -5862,10 +5865,27 @@ def generate_oriented_cylinder_candidates(
     cuts_only: bool = False,
 ) -> list[ReconstructionPlan]:
     tolerance = max(data.diagonal * 0.002, 0.025)
+    surface_graph = detect_surface_graph(data)
     existing_holes = _existing_round_holes(source)
     features: list[OrientedCylinderFeature | RoundHoleFeature] = []
     for fitted in _mesh_cylindrical_features(data):
         direction = np.asarray(fitted.direction, dtype=float)
+        fitted_origin = np.asarray(fitted.origin, dtype=float)
+        support_patch_id, terminating_patch_id = cylinder_support_patches(
+            surface_graph,
+            fitted_origin,
+            direction,
+            fitted.depth,
+            tolerance,
+            fitted.radius,
+        )
+        fitted.support_patch_id = support_patch_id
+        fitted.terminating_patch_id = terminating_patch_id
+        fitted.through = bool(
+            support_patch_id is not None
+            and terminating_patch_id is not None
+            and support_patch_id != terminating_patch_id
+        )
         cardinal_index = int(np.argmax(np.abs(direction)))
         if fitted.mode == "add" and abs(direction[cardinal_index]) >= 0.999:
             axis = (Axis.X, Axis.Y, Axis.Z)[cardinal_index]
@@ -5978,6 +5998,8 @@ def generate_oriented_cylinder_candidates(
                         start <= float(bounds[0]) + tolerance
                         and end >= float(bounds[1]) - tolerance
                     ),
+                    support_patch_id=support_patch_id,
+                    terminating_patch_id=terminating_patch_id,
                 )
             )
     if cuts_only:
@@ -6028,6 +6050,7 @@ def generate_arbitrary_axis_prismatic_candidates(
     data: MeshData,
     name: str,
 ) -> list[PlanCandidate]:
+    surface_graph = detect_surface_graph(data)
     directions: list[np.ndarray] = []
     for feature in _mesh_cylindrical_features(data):
         direction = np.asarray(feature.direction, dtype=np.float64)
@@ -6150,15 +6173,58 @@ def generate_arbitrary_axis_prismatic_candidates(
             else:
                 continue
             origin = direction * start
+            cap_tolerance = max(data.diagonal * 0.001, 0.01)
+            parallel_patches = [
+                patch
+                for patch in surface_graph.planar_patches
+                if abs(float(patch.normal @ direction)) >= 0.999
+            ]
+            support_patch = min(
+                parallel_patches,
+                key=lambda patch: abs(float(patch.origin @ direction) - start),
+                default=None,
+            )
+            termination_patch = min(
+                parallel_patches,
+                key=lambda patch: abs(
+                    float(patch.origin @ direction) - (start + depth)
+                ),
+                default=None,
+            )
+            support_patch_id = (
+                support_patch.patch_id
+                if support_patch is not None
+                and abs(float(support_patch.origin @ direction) - start)
+                <= cap_tolerance
+                else None
+            )
+            terminating_patch_id = (
+                termination_patch.patch_id
+                if termination_patch is not None
+                and abs(
+                    float(termination_patch.origin @ direction)
+                    - (start + depth)
+                )
+                <= cap_tolerance
+                else None
+            )
             oriented = ReconstructionPlan(
                 name=local_candidate.plan.name,
                 base=OrientedExtrudeFeature(
                     origin=tuple(float(value) for value in origin),
+                    plane_normal=tuple(float(value) for value in direction),
                     direction=tuple(float(value) for value in direction),
                     x_direction=tuple(float(value) for value in first),
                     depth=_clean(depth),
                     outer=outer,
                     holes=holes,
+                    support_patch_id=support_patch_id,
+                    terminating_patch_id=terminating_patch_id,
+                    extent_kind=(
+                        "up_to_patch"
+                        if terminating_patch_id is not None
+                        else "distance"
+                    ),
                 ),
                 assumptions=[
                     *local_candidate.plan.assumptions,
@@ -6172,11 +6238,50 @@ def generate_arbitrary_axis_prismatic_candidates(
                     and operation.axis == Axis.Z
                 ):
                     operation_origin = direction * operation.start
+                    operation_termination = operation.start + operation.depth
+                    operation_support = min(
+                        parallel_patches,
+                        key=lambda patch: abs(
+                            float(patch.origin @ direction) - operation.start
+                        ),
+                        default=None,
+                    )
+                    operation_end_patch = min(
+                        parallel_patches,
+                        key=lambda patch: abs(
+                            float(patch.origin @ direction)
+                            - operation_termination
+                        ),
+                        default=None,
+                    )
+                    operation_support_id = (
+                        operation_support.patch_id
+                        if operation_support is not None
+                        and abs(
+                            float(operation_support.origin @ direction)
+                            - operation.start
+                        )
+                        <= cap_tolerance
+                        else None
+                    )
+                    operation_end_id = (
+                        operation_end_patch.patch_id
+                        if operation_end_patch is not None
+                        and abs(
+                            float(operation_end_patch.origin @ direction)
+                            - operation_termination
+                        )
+                        <= cap_tolerance
+                        else None
+                    )
                     oriented.operations.append(
                         OrientedBooleanExtrudeFeature(
                             mode=operation.mode,
                             origin=tuple(
                                 float(value) for value in operation_origin
+                            ),
+                            plane_normal=tuple(
+                                float(value) for value in direction
                             ),
                             direction=tuple(
                                 float(value) for value in direction
@@ -6187,6 +6292,16 @@ def generate_arbitrary_axis_prismatic_candidates(
                             depth=_clean(operation.depth),
                             outer=operation.outer,
                             holes=list(operation.holes),
+                            additional_regions=list(
+                                operation.additional_regions
+                            ),
+                            support_patch_id=operation_support_id,
+                            terminating_patch_id=operation_end_id,
+                            extent_kind=(
+                                "up_to_patch"
+                                if operation_end_id is not None
+                                else "distance"
+                            ),
                         )
                     )
             candidates.append(

@@ -2786,7 +2786,13 @@ def reconstruct(
         best.report.valid_solid
         and best.report.chamfer_p95_mm <= threshold
         and best.report.volume_error_percent <= 2.0
+        and best.plan.representation == "semantic"
     )
+    if best.plan.representation == "sampled_approximation":
+        warnings.append(
+            "The closest geometry is a sampled approximation, not a clean "
+            "semantic feature reconstruction; it was not marked complete."
+        )
     if not passed:
         warnings.append(
             "The closest supported editable construction does not meet the automatic "
