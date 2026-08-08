@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -162,6 +163,7 @@ class SurfaceBRepResult:
     warnings: list[str] = field(default_factory=list)
     faceted_patch_count: int = 0
     faceted_face_count: int = 0
+    source_mesh_fallback: bool = False
 
 
 def _point(value: np.ndarray) -> gp_Pnt:
@@ -2703,6 +2705,118 @@ def _sew_faces(
     return sewing, solids
 
 
+def build_faceted_brep(
+    data: MeshData,
+    graph: SurfaceGraph | None = None,
+    reason: str = "analytic reconstruction did not pass validation",
+) -> SurfaceBRepResult:
+    """Build an exact manifold B-rep carrier from a watertight source mesh.
+
+    This is deliberately different from making independent triangle faces and
+    asking sewing to infer connectivity. One TopoDS vertex is created for each
+    mesh node and one TopoDS edge for each undirected mesh edge. Every oriented
+    triangle wire reuses those same subshapes, so the shell is manifold by
+    construction and does not depend on a geometric welding tolerance.
+    """
+
+    mesh = data.mesh
+    if not bool(mesh.is_watertight and mesh.is_winding_consistent):
+        raise ValueError(
+            "A faceted solid fallback requires a watertight, consistently "
+            "oriented source mesh"
+        )
+    tolerance = max(data.diagonal * 1e-8, 1e-9)
+    builder = BRep_Builder()
+    vertices: list[TopoDS_Vertex] = []
+    for raw_point in np.asarray(mesh.vertices, dtype=float):
+        vertex = BRepBuilderAPI_MakeVertex(_point(raw_point)).Vertex()
+        builder.UpdateVertex(vertex, tolerance)
+        vertices.append(vertex)
+
+    edge_registry: dict[
+        tuple[int, int], tuple[TopoDS_Edge, tuple[int, int]]
+    ] = {}
+    faces: list[TopoDS_Face] = []
+    for raw_triangle in np.asarray(mesh.faces, dtype=np.int64):
+        triangle = tuple(int(value) for value in raw_triangle)
+        ordered_edges: list[TopoDS_Edge] = []
+        for first, second in (
+            (triangle[0], triangle[1]),
+            (triangle[1], triangle[2]),
+            (triangle[2], triangle[0]),
+        ):
+            key = tuple(sorted((first, second)))
+            stored = edge_registry.get(key)
+            if stored is None:
+                low, high = key
+                maker = BRepBuilderAPI_MakeEdge(vertices[low], vertices[high])
+                if not maker.IsDone():
+                    raise ValueError("Could not construct a source mesh edge")
+                stored = (maker.Edge(), (low, high))
+                edge_registry[key] = stored
+            edge, direction = stored
+            ordered_edges.append(
+                edge
+                if direction == (first, second)
+                else TopoDS.Edge_s(edge.Reversed())
+            )
+        wire_maker = BRepBuilderAPI_MakeWire()
+        for edge in ordered_edges:
+            wire_maker.Add(edge)
+        if not wire_maker.IsDone() or not wire_maker.Wire().Closed():
+            raise ValueError("Could not construct a closed source triangle wire")
+        face_maker = BRepBuilderAPI_MakeFace(wire_maker.Wire())
+        if not face_maker.IsDone():
+            raise ValueError("Could not construct a source triangle face")
+        faces.append(face_maker.Face())
+
+    shell = TopoDS_Shell()
+    builder.MakeShell(shell)
+    for face in faces:
+        builder.Add(shell, face)
+    shell.Closed(True)
+    solid_maker = BRepBuilderAPI_MakeSolid(shell)
+    if not solid_maker.IsDone():
+        raise ValueError("Could not construct a solid from source mesh topology")
+    solid = solid_maker.Solid()
+    shape = cq.Shape(solid)
+    if not BRepCheck_Analyzer(solid).IsValid() or not shape.isValid():
+        raise ValueError("Source mesh topology produced an invalid faceted solid")
+
+    retained_graph = graph or SurfaceGraph()
+    counts = {
+        "plane": len(retained_graph.planar_patches),
+        "cylinder": len(retained_graph.cylindrical_patches),
+        "cone": len(retained_graph.conical_patches),
+        "sphere": len(retained_graph.spherical_patches),
+        "torus": len(retained_graph.toroidal_patches),
+        "extrusion": len(retained_graph.extrusion_patches),
+        "revolution": len(retained_graph.revolution_patches),
+        "freeform": len(retained_graph.freeform_patches),
+    }
+    return SurfaceBRepResult(
+        shape=shape,
+        graph=retained_graph,
+        surface_counts=counts,
+        face_count=len(faces),
+        solid_count=1,
+        free_edge_count=0,
+        sewing_tolerance=tolerance,
+        valid=True,
+        closed=True,
+        faceted_fallback=True,
+        topology_vertex_count=len(vertices),
+        topology_edge_count=len(edge_registry),
+        warnings=[
+            "Used the exact source-mesh topology as a watertight faceted "
+            f"B-rep fallback because {reason}."
+        ],
+        faceted_patch_count=1,
+        faceted_face_count=len(faces),
+        source_mesh_fallback=True,
+    )
+
+
 def _free_boundary_fill_faces(
     sewing: BRepBuilderAPI_Sewing,
     tolerance: float,
@@ -3711,11 +3825,17 @@ def build_surface_brep(
     )
 
 
-def export_surface_brep(result: SurfaceBRepResult, directory: Path) -> None:
+def export_surface_brep(
+    result: SurfaceBRepResult,
+    directory: Path,
+    source_stl_path: Path | None = None,
+    *,
+    verify_roundtrip: bool = True,
+) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     step_path = directory / "reconstruction.step"
     cq.exporters.export(result.shape, str(step_path))
-    if result.closed:
+    if result.closed and verify_roundtrip:
         try:
             roundtrip = cq.importers.importStep(str(step_path)).val()
             exchange_valid = bool(roundtrip.isValid() and roundtrip.Solids())
@@ -3737,12 +3857,16 @@ def export_surface_brep(result: SurfaceBRepResult, directory: Path) -> None:
             result.joined_shape,
             str(directory / "joined_surfaces.step"),
         )
-    cq.exporters.export(
-        result.shape,
-        str(directory / "reconstruction.stl"),
-        tolerance=max(min(result.sewing_tolerance * 0.5, 0.01), 1e-7),
-        angularTolerance=0.04,
-    )
+    reconstruction_stl = directory / "reconstruction.stl"
+    if result.source_mesh_fallback and source_stl_path is not None:
+        shutil.copy2(source_stl_path, reconstruction_stl)
+    else:
+        cq.exporters.export(
+            result.shape,
+            str(reconstruction_stl),
+            tolerance=max(min(result.sewing_tolerance * 0.5, 0.01), 1e-7),
+            angularTolerance=0.04,
+        )
     (directory / "surface_graph.json").write_text(
         json.dumps(surface_graph_json(result.graph), indent=2),
         encoding="utf-8",

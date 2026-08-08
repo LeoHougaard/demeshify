@@ -10,7 +10,12 @@ import trimesh
 from shapely.geometry import Polygon
 
 import app.surface_brep as surface_brep
-from app.surface_brep import build_surface_brep, export_surface_brep
+import app.surface_reconstruction as surface_reconstruction
+from app.surface_brep import (
+    build_faceted_brep,
+    build_surface_brep,
+    export_surface_brep,
+)
 from app.surface_graph import (
     CylindricalPatch,
     FreeformPatch,
@@ -334,3 +339,47 @@ def test_faceted_residual_deforms_boundary_triangles_onto_analytic_trim(
     roundtrip = cq.importers.importStep(str(tmp_path / "reconstruction.step")).val()
     assert roundtrip.isValid()
     assert len(roundtrip.Solids()) == 1
+
+
+def test_source_topology_faceted_fallback_is_a_valid_step_solid(tmp_path) -> None:
+    mesh = trimesh.creation.icosphere(subdivisions=2, radius=4)
+    data = _mesh_data(mesh)
+
+    result = build_faceted_brep(data, reason="test recovery")
+    export_surface_brep(result, tmp_path)
+
+    assert result.source_mesh_fallback
+    assert result.closed
+    assert result.free_edge_count == 0
+    assert result.face_count == len(mesh.faces)
+    assert result.topology_vertex_count == len(mesh.vertices)
+    roundtrip = cq.importers.importStep(str(tmp_path / "reconstruction.step")).val()
+    assert roundtrip.isValid()
+    assert len(roundtrip.Solids()) == 1
+
+
+def test_native_worker_failure_recovers_as_faceted_solid(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    mesh = trimesh.creation.box(extents=(7, 5, 3))
+    stl_path = tmp_path / "input.stl"
+    mesh.export(stl_path)
+    monkeypatch.setattr(
+        surface_reconstruction.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=3221225477),
+    )
+
+    report = surface_reconstruction.reconstruct_surfaces(
+        "native-failure-test",
+        stl_path,
+        "input.stl",
+    )
+
+    assert report.status == "complete"
+    assert report.surface is not None
+    assert report.surface.faceted_fallback
+    assert report.surface.faceted_face_count == len(mesh.faces)
+    assert report.surface.closed
+    assert report.score is not None and report.score.valid_solid

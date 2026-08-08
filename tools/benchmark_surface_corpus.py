@@ -245,6 +245,12 @@ def main() -> None:
     )
     parser.add_argument("--id", action="append", default=[])
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument(
+        "--max-triangles",
+        type=int,
+        default=0,
+        help="Skip cases above this source triangle count (0 keeps all cases).",
+    )
     parser.add_argument("--case-timeout", type=int, default=180)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--no-resume", action="store_true")
@@ -263,6 +269,12 @@ def main() -> None:
     identifiers = set(arguments.id)
     if identifiers:
         cases = [case for case in cases if str(case["id"]) in identifiers]
+    if arguments.max_triangles > 0:
+        cases = [
+            case
+            for case in cases
+            if int(case.get("triangles", 0)) <= arguments.max_triangles
+        ]
     if arguments.limit > 0:
         cases = cases[: arguments.limit]
 

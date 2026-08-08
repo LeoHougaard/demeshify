@@ -77,6 +77,25 @@ The fallback now follows the local-repair pattern used by STL repair tools:
 This is intentionally atomic. Partially repaired regions would introduce the
 same T-junctions and unmatched boundaries that the fallback is meant to remove.
 
+## Full source-topology recovery
+
+If the assembled analytic/hybrid result is open, invalid, outside geometric
+tolerance, or invalid after STEP round-trip, a final recovery path constructs
+the complete STL topology directly:
+
+1. Create exactly one OpenCascade vertex for each STL node.
+2. Create exactly one OpenCascade edge for each undirected STL mesh edge.
+3. Reuse those subshapes in every oriented triangle wire.
+4. Add all triangle faces directly to one closed shell; do not ask geometric
+   sewing to rediscover connectivity.
+5. Validate the solid and its STEP import before returning `complete`.
+
+Native analytic fitting runs in a bounded child process. A kernel access
+violation or timeout therefore cannot terminate the conversion request; the
+parent process still owns the untouched source mesh and can build the exact
+faceted carrier. The 60-model Fusion holdout currently passes 60/60, with 38
+analytic/hybrid outputs and 22 full faceted recoveries.
+
 ## STEP output
 
 OpenCascade can translate manifold B-reps, faceted B-reps, shell-based surface
