@@ -62,11 +62,19 @@ app.innerHTML = `
               <option value="m">Metres</option>
             </select>
           </label>
+          <label class="field">
+            <span>Reconstruction method</span>
+            <select id="engine">
+              <option value="surface_brep">Recognized surfaces (recommended)</option>
+              <option value="feature_tree">Parametric feature history</option>
+            </select>
+            <small>Surface mode fits analytic and B-spline faces to mesh nodes, then sews them where their boundaries close.</small>
+          </label>
         </div>
 
         <div class="step-label prompt-label"><span>02</span> Optional design intent</div>
         <label class="field">
-          <span>Tell the AI what matters</span>
+          <span id="promptLabel">Tell the AI what matters</span>
           <textarea id="prompt" rows="3" placeholder="e.g. Keep the four mounting holes exact and use nominal dimensions"></textarea>
           <small id="promptHelp">Checking whether LLM refinement is configured.</small>
         </label>
@@ -129,12 +137,12 @@ app.innerHTML = `
       <div class="metric-grid">
         <article><span>Surface deviation P95</span><strong id="p95">—</strong><small>millimetres</small></article>
         <article><span>Volume difference</span><strong id="volumeError">—</strong><small>percent</small></article>
-        <article><span>Detected construction</span><strong id="construction">—</strong><small>parametric base feature</small></article>
+        <article><span>Detected construction</span><strong id="construction">—</strong><small id="constructionUnit">CAD representation</small></article>
         <article><span>Processing time</span><strong id="elapsed">—</strong><small>seconds</small></article>
       </div>
       <div class="result-grid">
         <article class="feature-card">
-          <h3>Editable feature plan</h3>
+          <h3 id="constructionHeading">Editable feature plan</h3>
           <div id="featurePlan"></div>
         </article>
         <article class="download-card">
@@ -179,15 +187,36 @@ app.innerHTML = `
   <footer><span>MeshMind CAD · local-first reverse engineering</span><span>Outputs are verified against the source mesh</span></footer>
 `;
 
+let aiConfigured = false;
+
+function updateEngineCopy() {
+  const surfaceMode = document.querySelector("#engine").value === "surface_brep";
+  const prompt = document.querySelector("#prompt");
+  prompt.disabled = surfaceMode;
+  document.querySelector("#promptLabel").textContent = surfaceMode
+    ? "Design intent is not needed"
+    : "Tell the AI what matters";
+  document.querySelector("#promptHelp").textContent = surfaceMode
+    ? "Surface mode reconstructs the final boundary directly from mesh geometry."
+    : aiConfigured
+      ? "Your instruction may revise the measured feature plan; geometry scoring still gates it."
+      : "LLM refinement is off. Instructions are saved, but reconstruction remains deterministic.";
+  document.querySelector("#reconstructButton span").textContent = surfaceMode
+    ? "Reconstruct surface B-rep"
+    : "Reconstruct editable CAD";
+}
+
+document.querySelector("#engine").addEventListener("change", updateEngineCopy);
+updateEngineCopy();
+
 fetch("/api/health")
   .then((response) => response.json())
   .then((health) => {
+    aiConfigured = Boolean(health.ai_configured);
     document.querySelector("#engineStatus").innerHTML = health.ai_configured
       ? "<span></span> Local geometry + LLM refinement"
       : "<span></span> Local geometry · LLM off";
-    document.querySelector("#promptHelp").textContent = health.ai_configured
-      ? "Your instruction may revise the measured feature plan; geometry scoring still gates it."
-      : "LLM refinement is off. Instructions are saved, but reconstruction remains deterministic.";
+    updateEngineCopy();
   })
   .catch(() => {
     document.querySelector("#engineStatus").innerHTML =
@@ -896,6 +925,7 @@ button.addEventListener("click", async () => {
   form.append("file", selectedFile);
   form.append("input_units", document.querySelector("#units").value);
   form.append("prompt", document.querySelector("#prompt").value);
+  form.append("engine", document.querySelector("#engine").value);
   try {
     const response = await fetch("/api/reconstruct/start", { method: "POST", body: form });
     const payload = await response.json();
@@ -913,26 +943,40 @@ button.addEventListener("click", async () => {
 
 async function renderResult(report, options = {}) {
   const complete = report.status === "complete";
+  const surfaceMode = report.engine === "surface_brep" && report.surface;
   const semantic = report.plan?.representation !== "sampled_approximation";
   document.querySelector("#resultTitle").textContent = complete
-    ? "Editable model ready"
+    ? surfaceMode
+      ? "Surface B-rep ready"
+      : "Editable model ready"
     : report.status === "best_effort"
-      ? semantic
+      ? surfaceMode
+        ? report.surface.closed
+          ? "Best fitted surface solid produced"
+          : "Surface recognition result ready"
+        : semantic
         ? "Best editable model produced"
         : "Geometric approximation produced"
       : "Automatic reconstruction stopped";
   const confidence = document.querySelector("#confidence");
   confidence.className = `confidence ${complete ? "good" : "caution"}`;
   confidence.textContent = complete
-    ? "High-confidence match"
-    : semantic
-      ? "Best effort"
-      : "Approximation only";
+    ? surfaceMode
+      ? "Watertight verified solid"
+      : "High-confidence match"
+    : surfaceMode
+      ? report.surface.closed
+        ? "Best effort"
+        : "Valid fitted surface set"
+      : semantic
+        ? "Best effort"
+        : "Approximation only";
 
   if (report.score) {
     document.querySelector("#p95").textContent = report.score.chamfer_p95_mm.toFixed(3);
-    document.querySelector("#volumeError").textContent =
-      report.score.volume_error_percent.toFixed(2);
+    document.querySelector("#volumeError").textContent = report.score.volume_comparable !== false
+      ? report.score.volume_error_percent.toFixed(2)
+      : "N/A";
   }
   document.querySelector("#elapsed").textContent = report.elapsed_seconds.toFixed(1);
   const featureCount = report.plan
@@ -945,9 +989,17 @@ async function renderResult(report, options = {}) {
     revolve: "Revolve",
   };
   document.querySelector("#construction").textContent =
-    featureCount > 1
+    surfaceMode
+      ? `${report.surface.recognized_surface_count} surfaces`
+      : featureCount > 1
       ? `${featureCount} features`
       : baseLabels[report.plan?.base?.kind] || "Parametric solid";
+  document.querySelector("#constructionUnit").textContent = surfaceMode
+    ? `${report.surface.brep_face_count} fitted B-rep faces`
+    : "parametric feature construction";
+  document.querySelector("#constructionHeading").textContent = surfaceMode
+    ? "Recognized surface model"
+    : "Editable feature plan";
 
   const base = report.plan?.base;
   const plan = document.querySelector("#featurePlan");
@@ -1027,10 +1079,62 @@ async function renderResult(report, options = {}) {
     plan.innerHTML = details
       .map(([label, value]) => `<div><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`)
       .join("");
+  } else if (surfaceMode) {
+    const surfaceLabels = {
+      plane: "Planes",
+      cylinder: "Cylinders",
+      cone: "Cones",
+      sphere: "Spheres",
+      torus: "Tori",
+      extrusion: "Profile extrusions",
+      revolution: "Profile revolutions",
+      freeform: "Freeform residuals",
+    };
+    const details = Object.entries(report.surface.surface_counts)
+      .filter(([, count]) => count > 0)
+      .map(([kind, count]) => [surfaceLabels[kind] || kind, String(count)]);
+    details.push(
+      [
+        "STEP representation",
+        report.surface.closed
+          ? report.surface.faceted_fallback
+            ? "Closed hybrid analytic/conforming-facet solid"
+            : "Closed analytic/B-spline solid"
+          : report.surface.faceted_fallback
+            ? "Hybrid analytic/conforming-facet face set"
+            : "Recognized analytic/B-spline face set",
+      ],
+      ["Node-fitted B-splines", String(report.surface.point_fitted_face_count || 0)],
+      [
+        "Conforming facet fallback",
+        report.surface.faceted_fallback
+          ? `${report.surface.faceted_patch_count || 0} regions / ${report.surface.faceted_face_count || 0} faces`
+          : "Not needed",
+      ],
+      ["Canonical vertices", String(report.surface.topology_vertex_count || 0)],
+      ["Canonical edges", String(report.surface.topology_edge_count || 0)],
+      ["Adjacent surface pairs", String(report.surface.adjacency_count)],
+      ["Sewn solids", String(report.surface.solid_count)],
+      ["Free edges", String(report.surface.free_edge_count)],
+    );
+    plan.innerHTML = details
+      .map(([label, value]) => `<div><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`)
+      .join("");
+  } else {
+    plan.innerHTML = "<p>No CAD representation was produced.</p>";
   }
 
   const fileBase = `/api/runs/${report.id}/files`;
-  document.querySelector("#downloads").innerHTML = `
+  document.querySelector("#downloads").innerHTML = surfaceMode
+    ? `
+    <a class="download-primary" href="${fileBase}/reconstruction.step" download>
+      <span><strong>STEP surface model</strong><small>${report.surface.closed ? "Watertight fitted OpenCascade B-rep" : "Valid fitted surface-recognition model"}</small></span><b>↓</b>
+    </a>
+    <a href="${fileBase}/surface_graph.json" download>Surface graph JSON <b>↓</b></a>
+    ${report.surface.closed ? "" : `<a href="${fileBase}/joined_surfaces.step" download>Joined-shell diagnostic <b>↓</b></a>`}
+    <a href="${fileBase}/report.json" download>Verification report <b>↓</b></a>
+  `
+    : `
     <a class="download-primary" href="${fileBase}/reconstruction.step" download>
       <span><strong>STEP model</strong><small>Neutral editable CAD solid</small></span><b>↓</b>
     </a>
@@ -1043,12 +1147,19 @@ async function renderResult(report, options = {}) {
     .map((warning) => `<div class="warning"><b>!</b><span>${escapeHtml(warning)}</span></div>`)
     .join("");
 
-  if (report.status !== "failed" && report.plan) {
-    initializeFeatureEditor(report);
+  if (report.status !== "failed") {
+    if (report.plan) {
+      initializeFeatureEditor(report);
+    } else {
+      activeReport = report;
+      editablePlan = null;
+      featureEditor.classList.add("hidden");
+    }
     const response = await fetch(
-      `${fileBase}/reconstruction.stl?revision=${report.plan.revision || 0}`,
+      `${fileBase}/reconstruction.stl?revision=${report.plan?.revision || 0}`,
       { cache: "no-store" },
     );
+    if (!response.ok) throw new Error("The reconstructed preview could not be loaded.");
     outputViewer ||= new MeshViewer(outputCanvas, 0x45b8ff);
     await outputViewer.load(await response.arrayBuffer());
     inputCanvas.classList.add("hidden");

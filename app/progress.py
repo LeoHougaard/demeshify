@@ -82,6 +82,60 @@ def apply_stage(progress: dict[str, Any], label: str) -> None:
             detail=f"Loaded {triangles:,} triangles",
             percent=max(progress["percent"], 10.0),
         )
+    elif label == "surface_detection_start":
+        progress.update(
+            stage="Recognizing analytic surfaces",
+            detail="Fitting planes, cylinders, cones, spheres, and tori",
+            percent=max(progress["percent"], 20.0),
+        )
+    elif label.startswith("surface_detection_done"):
+        count = _number(label, "surfaces") or 0
+        progress.update(
+            stage="Surface graph ready",
+            detail=f"Recognized {count} connected surface patches",
+            percent=max(progress["percent"], 42.0),
+            current_features=count,
+        )
+    elif label == "surface_intersections_done":
+        progress.update(
+            stage="Intersecting adjacent surfaces",
+            detail="Building shared OpenCascade trimming curves",
+            percent=max(progress["percent"], 58.0),
+        )
+    elif label.startswith("trimmed_faces_done"):
+        count = _number(label, "faces") or 0
+        progress.update(
+            stage="Constructing trimmed faces",
+            detail=f"Built {count} candidate B-rep faces",
+            percent=max(progress["percent"], 72.0),
+        )
+    elif label.startswith("surface_sewing_done"):
+        solids = _number(label, "solids") or 0
+        free_edges = _number(label, "free_edges") or 0
+        progress.update(
+            stage="Sewing watertight solids",
+            detail=f"{solids} solid · {free_edges} free edges",
+            percent=max(progress["percent"], 84.0),
+        )
+    elif label == "surface_export_start":
+        progress.update(
+            stage="Exporting surface B-rep",
+            detail="Writing analytic STEP and preview STL",
+            percent=max(progress["percent"], 91.0),
+        )
+    elif label.startswith("surface_verification_start"):
+        progress.update(
+            stage="Verifying reconstructed solid",
+            detail="Measuring surface deviation and volume",
+            percent=max(progress["percent"], 95.0),
+        )
+    elif label.startswith("surface_reconstruction_complete"):
+        progress.update(
+            status="complete",
+            stage="Surface B-rep ready",
+            detail=f"Completed with {progress['current_features']} surfaces",
+            percent=100.0,
+        )
     elif label.endswith("_generated") or "_generated count=" in label:
         count = _number(label, "count") or 0
         generated_steps = int(progress.get("generated_steps", 0)) + 1

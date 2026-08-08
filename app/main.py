@@ -17,6 +17,7 @@ from .progress import apply_stage, new_progress, public_progress
 from .reconstruction import reconstruct
 from .schemas import PlanEditRequest, ReconstructionReport
 from .storage import ROOT, load_report, run_dir
+from .surface_reconstruction import reconstruct_surfaces
 
 app = FastAPI(title="MeshMind CAD", version="0.1.0")
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
@@ -27,6 +28,8 @@ DOWNLOADS = {
     "reconstruction.py",
     "plan.json",
     "report.json",
+    "surface_graph.json",
+    "joined_surfaces.step",
 }
 EDIT_LOCKS: dict[str, asyncio.Lock] = {}
 RUN_PROGRESS: dict[str, dict[str, object]] = {}
@@ -36,7 +39,19 @@ RUN_TASKS: set[asyncio.Task[None]] = set()
 
 @app.get("/api/health")
 def health() -> dict[str, object]:
-    return {"status": "ok", "ai_configured": is_configured()}
+    return {
+        "status": "ok",
+        "ai_configured": is_configured(),
+        "engines": ["surface_brep", "feature_tree"],
+    }
+
+
+def _reconstructor(engine: str):
+    if engine == "surface_brep":
+        return reconstruct_surfaces
+    if engine == "feature_tree":
+        return reconstruct
+    raise HTTPException(400, "Unsupported reconstruction engine")
 
 
 async def _receive_upload(
@@ -69,11 +84,13 @@ async def reconstruct_endpoint(
     file: Annotated[UploadFile, File()],
     input_units: Annotated[str, Form()] = "mm",
     prompt: Annotated[str, Form()] = "",
+    engine: Annotated[str, Form()] = "surface_brep",
 ) -> ReconstructionReport:
+    reconstructor = _reconstructor(engine)
     run_id, target, safe_name = await _receive_upload(file, input_units)
     try:
         return await asyncio.to_thread(
-            reconstruct,
+            reconstructor,
             run_id,
             target,
             safe_name,
@@ -92,6 +109,7 @@ async def _run_reconstruction_job(
     safe_name: str,
     input_units: str,
     prompt: str,
+    engine: str,
 ) -> None:
     def update(label: str) -> None:
         with RUN_PROGRESS_LOCK:
@@ -101,7 +119,7 @@ async def _run_reconstruction_job(
 
     try:
         report = await asyncio.to_thread(
-            reconstruct,
+            _reconstructor(engine),
             run_id,
             target,
             safe_name,
@@ -117,15 +135,23 @@ async def _run_reconstruction_job(
                 detail=(
                     f"Completed with {1 + len(report.plan.operations)} features"
                     if report.plan is not None
-                    else "Reconstruction finished"
+                    else (
+                        f"Completed with {report.surface.recognized_surface_count} surfaces"
+                        if report.surface is not None
+                        else "Reconstruction finished"
+                    )
                 ),
                 percent=100.0,
                 current_features=(
-                    1 + len(report.plan.operations) if report.plan is not None else 0
+                    1 + len(report.plan.operations)
+                    if report.plan is not None
+                    else (
+                        report.surface.recognized_surface_count
+                        if report.surface is not None
+                        else 0
+                    )
                 ),
-                preview_path=(
-                    "reconstruction.stl" if report.plan is not None else None
-                ),
+                preview_path="reconstruction.stl",
             )
     except Exception as exc:
         with RUN_PROGRESS_LOCK:
@@ -143,7 +169,9 @@ async def start_reconstruction_endpoint(
     file: Annotated[UploadFile, File()],
     input_units: Annotated[str, Form()] = "mm",
     prompt: Annotated[str, Form()] = "",
+    engine: Annotated[str, Form()] = "surface_brep",
 ) -> dict[str, object]:
+    _reconstructor(engine)
     run_id, target, safe_name = await _receive_upload(file, input_units)
     with RUN_PROGRESS_LOCK:
         RUN_PROGRESS[run_id] = new_progress(run_id)
@@ -154,6 +182,7 @@ async def start_reconstruction_endpoint(
             safe_name,
             input_units,
             prompt,
+            engine,
         )
     )
     RUN_TASKS.add(task)
@@ -174,12 +203,25 @@ def progress_endpoint(run_id: str) -> dict[str, object]:
         report = load_report(run_id)
     except FileNotFoundError as exc:
         raise HTTPException(404, "Run not found") from exc
-    feature_count = 1 + len(report.plan.operations) if report.plan is not None else 0
+    feature_count = (
+        1 + len(report.plan.operations)
+        if report.plan is not None
+        else (
+            report.surface.recognized_surface_count
+            if report.surface is not None
+            else 0
+        )
+    )
+    unit_name = "features" if report.plan is not None else "surfaces"
     return {
         "id": run_id,
         "status": "complete",
-        "stage": "Editable model ready",
-        "detail": f"Completed with {feature_count} features",
+        "stage": (
+            "Editable model ready"
+            if report.plan is not None
+            else "Surface B-rep ready"
+        ),
+        "detail": f"Completed with {feature_count} {unit_name}",
         "percent": 100.0,
         "candidates_done": report.score.candidate_count if report.score else 0,
         "candidates_total": report.score.candidate_count if report.score else 0,

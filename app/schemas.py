@@ -546,13 +546,34 @@ class ScoreReport(BaseModel):
     volume_error_percent: float
     valid_solid: bool
     candidate_count: int
+    valid_brep: bool = True
+    volume_comparable: bool = True
+
+
+class SurfaceBRepReport(BaseModel):
+    recognized_surface_count: int
+    surface_counts: dict[str, int]
+    adjacency_count: int
+    brep_face_count: int
+    solid_count: int
+    free_edge_count: int
+    sewing_tolerance_mm: float
+    closed: bool = True
+    point_fitted_face_count: int = 0
+    topology_vertex_count: int = 0
+    topology_edge_count: int = 0
+    faceted_fallback: bool = False
+    faceted_patch_count: int = 0
+    faceted_face_count: int = 0
 
 
 class ReconstructionReport(BaseModel):
     id: str
     status: Literal["complete", "best_effort", "failed"]
+    engine: Literal["feature_tree", "surface_brep"] = "feature_tree"
     mesh: MeshReport
     plan: ReconstructionPlan | None
+    surface: SurfaceBRepReport | None = None
     score: ScoreReport | None
     warnings: list[str] = Field(default_factory=list)
     elapsed_seconds: float
