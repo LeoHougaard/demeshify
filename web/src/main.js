@@ -1,11 +1,13 @@
 import * as THREE from "three";
-import { ArcballControls } from "three/examples/jsm/controls/ArcballControls.js";
+import CameraControls from "camera-controls";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import {
   mergeVertices,
   toCreasedNormals,
 } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import "./styles.css";
+
+CameraControls.install({ THREE });
 
 const app = document.querySelector("#app");
 let selectedFile = null;
@@ -259,7 +261,7 @@ app.innerHTML = `
         <canvas id="inputCanvas"></canvas><canvas id="outputCanvas" class="hidden"></canvas>
         <div id="surfaceLegend" class="surface-legend hidden"><span><i class="fitted-edge"></i>Fitted surface boundary</span><span><i class="faceted-edge"></i>Fallback triangle edges</span><small id="surfaceLegendStatus"></small></div>
         <div id="inputTriangleLegend" class="surface-legend input-triangle-legend hidden"><span><i class="source-triangle-edge"></i>Every source STL triangle edge</span><small id="inputTriangleLegendStatus"></small></div>
-        <div class="navigation-hint">Right-drag rotate · Middle-drag pan · Wheel zoom · Double-click focus</div>
+        <div class="navigation-hint">Right-drag rotates around model center · Middle-drag pan · Wheel zoom</div>
         <div id="processing" class="processing hidden">
           <div class="processing-card">
             <div class="processing-heading"><div class="scan-object"><span></span></div><div><small>CONVERTING</small><strong id="processingStage">Starting reconstruction</strong></div></div>
@@ -342,23 +344,26 @@ class MeshViewer {
     if (this.cadStyle) this.scene.background = new THREE.Color(0x303234);
     this.perspectiveCamera = new THREE.PerspectiveCamera(38, 1, 0.01, 100000);
     this.orthographicCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 100000);
-    this.camera = this.perspectiveCamera;
-    this.canvas.dataset.projection = "perspective";
+    this.camera = projectionMode === "orthographic"
+      ? this.orthographicCamera
+      : this.perspectiveCamera;
+    this.canvas.dataset.projection = projectionMode;
     this.camera.position.set(4, 3, 4);
-    this.controls = new ArcballControls(this.camera, canvas, this.scene);
-    this.controls.setGizmosVisible(false);
-    this.controls.cursorZoom = true;
-    this.controls.enableAnimations = true;
-    this.controls.dampingFactor = 18;
-    // Match Onshape's desktop navigation instead of the Arcball defaults.
-    this.controls.unsetMouseAction(0);
-    this.controls.unsetMouseAction(0, "CTRL");
-    this.controls.unsetMouseAction(1);
-    this.controls.unsetMouseAction(2);
-    this.controls.setMouseAction("ROTATE", 2);
-    this.controls.setMouseAction("PAN", 1);
-    this.controls.setMouseAction("PAN", 2, "CTRL");
-    this.controls.setMouseAction("ZOOM", "WHEEL");
+    this.rotationPivot = new THREE.Vector3();
+    this.controlTarget = new THREE.Vector3();
+    this.createControls();
+    // OrcaSlicer resets the orbit point to the selected/model bounding-box
+    // center when a rotation starts. Panning therefore never makes the next
+    // rotation orbit around an arbitrary empty point.
+    canvas.addEventListener("pointerdown", (event) => {
+      if (event.button === 2 && !event.ctrlKey && this.rotationPivot) {
+        this.controls.setOrbitPoint(
+          this.rotationPivot.x,
+          this.rotationPivot.y,
+          this.rotationPivot.z,
+        );
+      }
+    }, true);
 
     // Camera-relative studio lighting removes any fixed world-space top,
     // bottom, floor, or shadow direction while preserving readable curvature.
@@ -369,9 +374,29 @@ class MeshViewer {
     this.keyLight.target = this.lightTarget;
     this.fillLight.target = this.lightTarget;
     this.scene.add(this.lightTarget, this.keyLight, this.fillLight);
-    this.controls.addEventListener("change", () => this.render());
     this.resizeObserver = new ResizeObserver(() => this.render());
     this.resizeObserver.observe(canvas.parentElement);
+    this.clock = new THREE.Clock();
+    this.animate();
+  }
+
+  createControls() {
+    this.controls = new CameraControls(this.camera, this.canvas);
+    this.controls.mouseButtons.left = CameraControls.ACTION.NONE;
+    this.controls.mouseButtons.right = CameraControls.ACTION.ROTATE;
+    this.controls.mouseButtons.middle = CameraControls.ACTION.SCREEN_PAN;
+    this.controls.mouseButtons.wheel = this.camera.isPerspectiveCamera
+      ? CameraControls.ACTION.DOLLY
+      : CameraControls.ACTION.ZOOM;
+    this.controls.touches.one = CameraControls.ACTION.TOUCH_ROTATE;
+    this.controls.touches.two = this.camera.isPerspectiveCamera
+      ? CameraControls.ACTION.TOUCH_DOLLY_SCREEN_PAN
+      : CameraControls.ACTION.TOUCH_ZOOM_SCREEN_PAN;
+    this.controls.dollyToCursor = false;
+    this.controls.smoothTime = 0.12;
+    this.controls.draggingSmoothTime = 0.055;
+    this.controls.minPolarAngle = 0.001;
+    this.controls.maxPolarAngle = Math.PI - 0.001;
   }
 
   updateCameraFrustums(width, height) {
@@ -394,7 +419,7 @@ class MeshViewer {
     ) return;
 
     const current = this.camera;
-    const target = this.controls.target.clone();
+    const target = this.controls.getTarget(new THREE.Vector3(), false);
     const direction = current.position.clone().sub(target).normalize();
     let next;
     if (nextMode === "orthographic") {
@@ -427,9 +452,23 @@ class MeshViewer {
       this.canvas.parentElement.clientWidth,
       this.canvas.parentElement.clientHeight,
     );
-    this.controls.target.copy(target);
-    this.controls.setCamera(next);
-    this.controls.update();
+    this.controls.dispose();
+    this.createControls();
+    this.controls.setLookAt(
+      next.position.x,
+      next.position.y,
+      next.position.z,
+      target.x,
+      target.y,
+      target.z,
+      false,
+    );
+    this.controls.setOrbitPoint(
+      this.rotationPivot.x,
+      this.rotationPivot.y,
+      this.rotationPivot.z,
+    );
+    this.controls.update(0);
     this.render();
   }
 
@@ -481,6 +520,7 @@ class MeshViewer {
     const box = geometry.boundingBox;
     const center = box.getCenter(new THREE.Vector3());
     this.modelCenter = center.clone();
+    this.rotationPivot.set(0, 0, 0);
     this.mesh.position.sub(center);
     this.scene.add(this.mesh);
     if (this.cadStyle) {
@@ -513,7 +553,11 @@ class MeshViewer {
     weldedGeometry.dispose();
     if (resetCamera || !hadMesh) {
       const size = box.getSize(new THREE.Vector3());
-      const radius = Math.max(size.length() * 0.65, 1);
+      const radius = Math.max(size.length() * 0.65, 1e-6);
+      const framingSphere = new THREE.Sphere(
+        this.rotationPivot.clone(),
+        Math.max(size.length() * 0.55, 1e-6),
+      );
       const cameraPosition = new THREE.Vector3(radius, radius * 0.72, radius);
       const distance = cameraPosition.length();
       this.orthoViewHeight =
@@ -525,17 +569,28 @@ class MeshViewer {
         camera.up.set(0, 1, 0);
         camera.zoom = 1;
       }
-      this.camera = projectionMode === "orthographic"
-        ? this.orthographicCamera
-        : this.perspectiveCamera;
-      this.canvas.dataset.projection = projectionMode;
       this.updateCameraFrustums(
         this.canvas.parentElement.clientWidth,
         this.canvas.parentElement.clientHeight,
       );
-      this.controls.target.set(0, 0, 0);
-      this.controls.setCamera(this.camera);
-      this.controls.update();
+      this.controls.setLookAt(
+        cameraPosition.x,
+        cameraPosition.y,
+        cameraPosition.z,
+        this.rotationPivot.x,
+        this.rotationPivot.y,
+        this.rotationPivot.z,
+        false,
+      );
+      this.controls.setOrbitPoint(
+        this.rotationPivot.x,
+        this.rotationPivot.y,
+        this.rotationPivot.z,
+      );
+      // Use the controller's perspective/orthographic-aware fitting math so
+      // every model starts fully visible with a small framing margin.
+      this.controls.fitToSphere(framingSphere, false);
+      this.controls.update(0);
     }
     this.render();
   }
@@ -661,13 +716,20 @@ class MeshViewer {
 
   render() {
     this.resize();
-    this.lightTarget.position.copy(this.controls.target);
+    this.controls.getTarget(this.controlTarget, false);
+    this.lightTarget.position.copy(this.controlTarget);
     this.keyLight.position.copy(this.camera.position);
     this.fillLight.position
-      .copy(this.controls.target)
+      .copy(this.controlTarget)
       .multiplyScalar(2)
       .sub(this.camera.position);
     this.renderer.render(this.scene, this.camera);
+  }
+
+  animate() {
+    requestAnimationFrame(() => this.animate());
+    const delta = Math.min(this.clock.getDelta(), 0.1);
+    if (this.controls.update(delta)) this.render();
   }
 }
 
