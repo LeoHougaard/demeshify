@@ -85,6 +85,7 @@ from OCP.TopoDS import (
     TopoDS_Vertex,
     TopoDS_Wire,
 )
+from OCP.TopTools import TopTools_HSequenceOfShape
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString
@@ -447,7 +448,26 @@ def _intersection_edge(
 
     reverse = False
     if mesh_closed and curve_closed:
-        maker = BRepBuilderAPI_MakeEdge(edge_curve)
+        if start is not None and end is not None and start.vertex.IsSame(end.vertex):
+            _, seam_parameters = _project_parameters(
+                np.asarray([start.point], dtype=float),
+                edge_curve,
+            )
+            seam_parameter = (
+                float(seam_parameters[0])
+                if len(seam_parameters)
+                else float(parameters[0])
+            )
+            period = float(curve.LastParameter() - curve.FirstParameter())
+            maker = BRepBuilderAPI_MakeEdge(
+                edge_curve,
+                start.vertex,
+                start.vertex,
+                seam_parameter,
+                seam_parameter + period,
+            )
+        else:
+            maker = BRepBuilderAPI_MakeEdge(edge_curve)
     else:
         unwrapped = parameters.copy()
         if curve_closed:
@@ -495,6 +515,138 @@ def _intersection_edge(
         end.tolerance if end is not None else 0.0,
     )
     return _TrimEdge(_set_edge_tolerance(edge, edge_tolerance), canonical_points)
+
+
+def _wrapped_intersection_trim_chain(
+    first: _SurfaceModel,
+    second: _SurfaceModel,
+    points: np.ndarray,
+    tolerance: float,
+    start: _CanonicalVertex | None,
+    end: _CanonicalVertex | None,
+) -> list[_TrimEdge]:
+    """Split a closed intersection curve when the requested arc crosses its seam."""
+
+    if start is None or end is None or len(points) < 3:
+        return []
+    try:
+        intersection = GeomAPI_IntSS(first.surface, second.surface, tolerance)
+    except Exception:
+        return []
+    if not intersection.IsDone() or intersection.NbLines() == 0:
+        return []
+    best: tuple[float, object, np.ndarray] | None = None
+    for index in range(1, intersection.NbLines() + 1):
+        curve = intersection.Line(index)
+        error, parameters = _project_parameters(points, curve)
+        if len(parameters) == 0 or not math.isfinite(error):
+            continue
+        if best is None or error < best[0]:
+            best = (error, curve, parameters)
+    if best is None or best[0] > tolerance:
+        return []
+    _, curve, parameters = best
+    first_parameter = float(curve.FirstParameter())
+    last_parameter = float(curve.LastParameter())
+    period = last_parameter - first_parameter
+    if (
+        not math.isfinite(first_parameter)
+        or not math.isfinite(last_parameter)
+        or period <= 0
+        or curve.Value(first_parameter).Distance(curve.Value(last_parameter))
+        > tolerance * 3
+    ):
+        return []
+    jumps = np.flatnonzero(np.abs(np.diff(parameters)) > period * 0.5)
+    if len(jumps) != 1:
+        return []
+    split = int(jumps[0])
+    jump = float(parameters[split + 1] - parameters[split])
+
+    low_point = curve.Value(first_parameter)
+    high_point = curve.Value(last_parameter)
+    seam_point = np.asarray(
+        [
+            (low_point.X() + high_point.X()) * 0.5,
+            (low_point.Y() + high_point.Y()) * 0.5,
+            (low_point.Z() + high_point.Z()) * 0.5,
+        ],
+        dtype=float,
+    )
+    seam_vertex = BRepBuilderAPI_MakeVertex(_point(seam_point)).Vertex()
+    builder = BRep_Builder()
+    builder.UpdateVertex(seam_vertex, tolerance * 5)
+    edge_tolerance = max(tolerance * 5, start.tolerance, end.tolerance)
+
+    def make_segment(
+        low: float,
+        high: float,
+        low_vertex: TopoDS_Vertex,
+        high_vertex: TopoDS_Vertex,
+        reverse: bool,
+        samples: np.ndarray,
+    ) -> _TrimEdge | None:
+        maker = BRepBuilderAPI_MakeEdge(curve, low_vertex, high_vertex, low, high)
+        if not maker.IsDone():
+            return None
+        edge = maker.Edge()
+        if reverse:
+            edge = _reverse_edge(edge)
+        return _TrimEdge(_set_edge_tolerance(edge, edge_tolerance), samples)
+
+    source = np.asarray(points, dtype=float).copy()
+    source[0] = start.point
+    source[-1] = end.point
+    if jump > 0:
+        first_samples = np.vstack((source[: split + 1], seam_point))
+        second_samples = np.vstack((seam_point, source[split + 1 :]))
+        segments = [
+            make_segment(
+                first_parameter,
+                float(parameters[0]),
+                seam_vertex,
+                start.vertex,
+                True,
+                first_samples,
+            ),
+            make_segment(
+                float(parameters[-1]),
+                last_parameter,
+                end.vertex,
+                seam_vertex,
+                True,
+                second_samples,
+            ),
+        ]
+    else:
+        first_samples = np.vstack((source[: split + 1], seam_point))
+        second_samples = np.vstack((seam_point, source[split + 1 :]))
+        segments = [
+            make_segment(
+                float(parameters[0]),
+                last_parameter,
+                start.vertex,
+                seam_vertex,
+                False,
+                first_samples,
+            ),
+            make_segment(
+                first_parameter,
+                float(parameters[-1]),
+                seam_vertex,
+                end.vertex,
+                False,
+                second_samples,
+            ),
+        ]
+    if any(segment is None for segment in segments):
+        return []
+    result = [segment for segment in segments if segment is not None]
+    mesh_length = float(np.sum(np.linalg.norm(np.diff(source, axis=0), axis=1)))
+    edge_length = sum(float(cq.Edge(segment.edge).Length()) for segment in result)
+    if abs(edge_length - mesh_length) > max(tolerance * 10, mesh_length * 0.05):
+        return []
+    return result
 
 
 def _fallback_curve_edge(
@@ -925,14 +1077,43 @@ def _shared_trim_edges(
         for adjacency in graph.adjacency
         for points in adjacency.boundary_curves
     ]
-    patches_by_id = {patch.patch_id: patch for patch in graph.patches}
     endpoints, canonical_vertices = _canonical_vertices(records, models, tolerance)
+    vertex_occurrences = Counter(id(vertex) for vertex in endpoints.values())
     canonical_edge_count = 0
     for record_index, (first_id, second_id, points) in enumerate(records):
         first = models.get(first_id)
         second = models.get(second_id)
         start = endpoints.get((record_index, 0))
         end = endpoints.get((record_index, 1))
+        if len(points) >= 3 and np.linalg.norm(points[0] - points[-1]) <= tolerance * 3:
+            segments_start = points[:-1]
+            segments_end = points[1:]
+            candidates: list[tuple[int, float, _CanonicalVertex]] = []
+            for vertex in canonical_vertices:
+                if vertex is start or vertex_occurrences[id(vertex)] < 2:
+                    continue
+                directions = segments_end - segments_start
+                lengths_squared = np.einsum("ij,ij->i", directions, directions)
+                fractions = np.clip(
+                    np.einsum("ij,ij->i", vertex.point - segments_start, directions)
+                    / np.maximum(lengths_squared, 1e-30),
+                    0.0,
+                    1.0,
+                )
+                projections = segments_start + fractions[:, None] * directions
+                distance = float(
+                    np.min(np.linalg.norm(projections - vertex.point, axis=1))
+                )
+                if distance <= tolerance * 0.5:
+                    candidates.append(
+                        (vertex_occurrences[id(vertex)], distance, vertex)
+                    )
+            if candidates:
+                _, _, junction = min(
+                    candidates,
+                    key=lambda item: (-item[0], item[1]),
+                )
+                start = end = junction
         try:
             # Mesh-repair tools make mismatched boundaries conform by splitting
             # the opposite border at every incoming vertex before welding it.
@@ -940,6 +1121,33 @@ def _shared_trim_edges(
             # project every source boundary node to the analytic support and
             # create one exact on-surface edge per source mesh edge.  The same
             # edge chain is then consumed by both regions.
+            one_analytic_support = (first is None) != (second is None)
+            coincident_cylinders = bool(
+                first is not None
+                and second is not None
+                and isinstance(first.patch, CylindricalPatch)
+                and isinstance(second.patch, CylindricalPatch)
+                and abs(first.patch.radius - second.patch.radius) <= tolerance
+                and math.acos(
+                    float(
+                        np.clip(
+                            abs(float(first.patch.axis @ second.patch.axis)),
+                            -1.0,
+                            1.0,
+                        )
+                    )
+                )
+                <= math.radians(0.25)
+                and np.linalg.norm(
+                    (second.patch.origin - first.patch.origin)
+                    - first.patch.axis
+                    * float(
+                        (second.patch.origin - first.patch.origin)
+                        @ first.patch.axis
+                    )
+                )
+                <= tolerance
+            )
             conforming = (
                 _surface_conforming_trim_chain(
                     first or second,
@@ -948,8 +1156,7 @@ def _shared_trim_edges(
                     start,
                     end,
                 )
-                if (first is not None and isinstance(patches_by_id.get(second_id), FreeformPatch))
-                or (second is not None and isinstance(patches_by_id.get(first_id), FreeformPatch))
+                if one_analytic_support or coincident_cylinders
                 else []
             )
             edge = (
@@ -962,17 +1169,47 @@ def _shared_trim_edges(
                     end,
                     maximum_error_factor=1.0,
                 )
-                if first is not None and second is not None
+                if first is not None and second is not None and not coincident_cylinders
                 else None
             )
-            fallback = (
-                _fallback_curve_edge(points, tolerance, start, end)
-                if edge is None and not conforming
-                else None
+            wrapped = (
+                _wrapped_intersection_trim_chain(
+                    first,
+                    second,
+                    points,
+                    tolerance,
+                    start,
+                    end,
+                )
+                if edge is None and first is not None and second is not None
+                else []
             )
-            record_edges = conforming or (
-                [edge or fallback] if edge is not None or fallback is not None else []
-            )
+            if (
+                edge is None
+                and not wrapped
+                and not conforming
+                and first is None
+                and second is None
+            ):
+                # Two residual/swept patches must retain their exact source
+                # interface. A single unconstrained B-spline approximation can
+                # shortcut a long boundary and change the enclosed area even
+                # when its total length looks plausible.
+                record_edges = _polyline_trim_edges(
+                    points,
+                    tolerance,
+                    start,
+                    end,
+                )
+            else:
+                fallback = (
+                    _fallback_curve_edge(points, tolerance, start, end)
+                    if edge is None and not wrapped and not conforming
+                    else None
+                )
+                record_edges = conforming or wrapped or (
+                    [edge or fallback] if edge is not None or fallback is not None else []
+                )
             if not record_edges and first is not None and second is not None:
                 fallback = _intersection_edge(
                     first,
@@ -1067,6 +1304,58 @@ def _split_edge_at_middle(edge: TopoDS_Edge) -> tuple[TopoDS_Edge, TopoDS_Edge] 
 
 
 def _wire_groups(edges: list[_TrimEdge], tolerance: float) -> list[tuple[TopoDS_Wire, np.ndarray]]:
+    # Let OCCT assemble the complete edge graph before falling back to the
+    # historical greedy walk. The greedy walk can take the wrong branch at a
+    # multi-surface corner, leaving a long conforming polyline as dozens of
+    # one-edge open wires. FreeBounds maximizes shared-TShape connectivity and
+    # correctly recovers each closed boundary component.
+    if edges:
+        try:
+            sequence = TopTools_HSequenceOfShape()
+            for trim in edges:
+                sequence.Append(trim.edge)
+            trims_by_hash: dict[int, list[_TrimEdge]] = {}
+            for trim in edges:
+                trims_by_hash.setdefault(hash(trim.edge), []).append(trim)
+            connected = TopTools_HSequenceOfShape()
+            ShapeAnalysis_FreeBounds.ConnectEdgesToWires_s(
+                sequence,
+                tolerance * 10,
+                True,
+                connected,
+            )
+            freebound_groups: list[tuple[TopoDS_Wire, np.ndarray]] = []
+            consumed_edges = 0
+            for wire_index in range(1, connected.Length() + 1):
+                wire = TopoDS.Wire_s(connected.Value(wire_index))
+                samples: list[np.ndarray] = []
+                explorer = BRepTools_WireExplorer(wire)
+                while explorer.More():
+                    oriented = TopoDS.Edge_s(explorer.Current())
+                    match = next(
+                        (
+                            trim
+                            for trim in trims_by_hash.get(hash(oriented), [])
+                            if oriented.IsSame(trim.edge)
+                        ),
+                        None,
+                    )
+                    if match is not None:
+                        points = (
+                            match.points
+                            if oriented.Orientation() == match.edge.Orientation()
+                            else match.points[::-1]
+                        )
+                        samples.append(points[:-1] if len(points) > 1 else points)
+                    consumed_edges += 1
+                    explorer.Next()
+                if samples:
+                    freebound_groups.append((wire, np.vstack(samples)))
+            if consumed_edges == len(edges) and freebound_groups:
+                return freebound_groups
+        except Exception:
+            pass
+
     groups: list[tuple[TopoDS_Wire, np.ndarray]] = []
     remaining = list(edges)
     while remaining:
@@ -1678,7 +1967,14 @@ def _analytic_face(
     mesh: object,
     tolerance: float,
 ) -> TopoDS_Face | None:
-    periodic = _bounded_periodic_face(model, mesh) if len(edges) <= 20 else None
+    # A UV-bounded cone band carries a generated periodic p-curve which can
+    # become self-intersecting when sewing substitutes its circular borders.
+    # Trim cones directly with their canonical shared intersection edges.
+    periodic = (
+        _bounded_periodic_face(model, mesh)
+        if len(edges) <= 20 and not isinstance(model.patch, ConicalPatch)
+        else None
+    )
     if periodic is not None:
         periodic = _split_periodic_face(model, periodic, edges, tolerance)
         periodic = _replace_periodic_boundary_edges(periodic, edges, tolerance)
@@ -1746,15 +2042,10 @@ def _analytic_face(
             except Exception:
                 return 0.0
 
-        edge_counts = [len(cq.Wire(wire).Edges()) for wire, _ in groups]
-        if len(groups) == 2 and edge_counts.count(1) == 1:
-            # Circular/closed spline outer boundaries are represented by one
-            # periodic edge. Their sampled seam points can make the projected
-            # shoelace area unreliable, so prefer the one-edge periodic loop
-            # over the multi-edge inner island for these thin annular faces.
-            groups.sort(key=lambda item: len(cq.Wire(item[0]).Edges()) != 1)
-        else:
-            groups.sort(key=planar_wire_area, reverse=True)
+        # Determine containment from the actual planar wire area. A one-edge
+        # circle can be either the outside of a thin annulus or an ordinary
+        # hole; edge count alone cannot distinguish those cases.
+        groups.sort(key=planar_wire_area, reverse=True)
         signed_areas = []
         for _, points in groups:
             projected = np.column_stack(
@@ -1814,7 +2105,25 @@ def _analytic_face(
         maker.Add(wire)
     if not maker.IsDone():
         return None
-    fixer = ShapeFix_Face(maker.Face())
+    raw_face = maker.Face()
+    if isinstance(model.patch, ConicalPatch):
+        if BRepCheck_Analyzer(raw_face).IsValid():
+            raw_area_ratio = float(cq.Face(raw_face).Area()) / max(
+                model.patch.area,
+                tolerance**2,
+            )
+            if 0.5 <= raw_area_ratio <= 1.5:
+                return _orient_face(raw_face, model.patch, mesh)
+        bounded = _bounded_periodic_face(model, mesh)
+        if bounded is not None and BRepCheck_Analyzer(bounded).IsValid():
+            bounded_area_ratio = float(cq.Face(bounded).Area()) / max(
+                model.patch.area,
+                tolerance**2,
+            )
+            if 0.5 <= bounded_area_ratio <= 1.5:
+                return _orient_face(bounded, model.patch, mesh)
+        return _uv_boundary_face(model, mesh, tolerance)
+    fixer = ShapeFix_Face(raw_face)
     fixer.SetPrecision(tolerance)
     fixer.SetMaxTolerance(tolerance * 5)
     fixer.FixOrientation()
@@ -2674,6 +2983,8 @@ def _sew_faces(
     faces: list[TopoDS_Face],
     tolerance: float,
     non_manifold: bool = False,
+    *,
+    make_solids: bool = True,
 ) -> tuple[BRepBuilderAPI_Sewing, list[object]]:
     sewing = BRepBuilderAPI_Sewing(
         tolerance,
@@ -2694,9 +3005,20 @@ def _sew_faces(
         explorer.Next()
     sewing.Perform()
     shells = _extract_shells(sewing.SewedShape())
-    solids = [
-        solid for shell in shells if (solid := _solid_from_shell(shell, tolerance)) is not None
-    ]
+    # An open sewn shell cannot become a valid solid. Running ShapeFix_Solid on
+    # every open retry is extremely expensive and, on dense trim networks, can
+    # consume minutes before returning the same open topology. Reconcile or
+    # fill the free boundaries first; invoke solid repair only once the sewn
+    # edge graph is closed.
+    solids = (
+        [
+            solid
+            for shell in shells
+            if (solid := _solid_from_shell(shell, tolerance)) is not None
+        ]
+        if make_solids and sewing.NbFreeEdges() == 0
+        else []
+    )
     # Do not call a partially repaired compound closed when only one of its
     # shells became a solid. A repaired solid is authoritative only when it
     # contains the complete fitted face set supplied to sewing.
@@ -3493,12 +3815,28 @@ def build_surface_brep(
                 area=patch.area,
                 boundary_loops=getattr(patch, "boundary_loops_3d", patch.boundary_loops),
             )
-            fitted = _point_fitted_face(
-                fallback,
-                trim_edges.get(patch.patch_id, []),
-                data.mesh,
-                tolerance,
-            ) or _point_fitted_face(fallback, [], data.mesh, tolerance)
+            longest_boundary = max(
+                (len(loop) for loop in fallback.boundary_loops),
+                default=0,
+            )
+            # GeomPlate is both expensive and capable of terminating OCCT in
+            # native code when a failed analytic patch contains thousands of
+            # constraints or a long multiply-connected boundary. Keep the
+            # recognized support in the graph, but use its conforming source
+            # facets instead of sending an unsafe problem to the plate solver.
+            if (
+                len(fallback.vertex_indices) > 500
+                or len(fallback.face_indices) > 300
+                or longest_boundary > 32
+            ):
+                fitted = None
+            else:
+                fitted = _point_fitted_face(
+                    fallback,
+                    trim_edges.get(patch.patch_id, []),
+                    data.mesh,
+                    tolerance,
+                ) or _point_fitted_face(fallback, [], data.mesh, tolerance)
             if fitted is not None:
                 faces.append(fitted)
                 point_fitted_face_count += 1
@@ -3521,11 +3859,21 @@ def build_surface_brep(
                     area=patch.area,
                     boundary_loops=patch.boundary_loops,
                 )
-                fitted = _point_fitted_face(
-                    fallback,
-                    trim_edges.get(patch.patch_id, []),
-                    data.mesh,
-                    tolerance,
+                longest_boundary = max(
+                    (len(loop) for loop in fallback.boundary_loops),
+                    default=0,
+                )
+                fitted = (
+                    _point_fitted_face(
+                        fallback,
+                        trim_edges.get(patch.patch_id, []),
+                        data.mesh,
+                        tolerance,
+                    )
+                    if len(fallback.vertex_indices) <= 500
+                    and len(fallback.face_indices) <= 300
+                    and longest_boundary <= 32
+                    else None
                 )
                 if fitted is not None:
                     faces.append(fitted)
@@ -3646,9 +3994,13 @@ def build_surface_brep(
         )
     if progress_callback is not None:
         progress_callback(f"trimmed_faces_done faces={len(faces)}")
-    sewing, solids = _sew_faces(faces, tolerance)
+    sewing, solids = (
+        _sew_faces(faces, tolerance, make_solids=False)
+        if unfitted_patches
+        else _sew_faces(faces, tolerance)
+    )
     effective_tolerance = tolerance
-    if not solids or sewing.NbFreeEdges() > 0:
+    if not unfitted_patches and (not solids or sewing.NbFreeEdges() > 0):
         # Independent least-squares surfaces can differ by a few fit
         # tolerances along a mathematically shared boundary. Retry sewing with
         # a tightly capped reconciliation tolerance and retain a retry only

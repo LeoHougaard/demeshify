@@ -53,22 +53,18 @@ def _reconstruct_surfaces_direct(
     )
     update("surface_detection_start")
     result = build_surface_brep(data, update)
-    update("surface_export_start")
-    export_surface_brep(result, stl_path.parent, data.source_path)
-    update("surface_verification_start preview=reconstruction.stl")
-    score = score_exported_shape(data, stl_path.parent, require_solid=False)
-
     threshold = _acceptance_threshold(data.diagonal)
-    passed = _passes_surface_gate(result, score, threshold)
-    if not passed and data.report.watertight:
+    if data.report.watertight and (not result.closed or result.free_edge_count):
+        # An open fitted quilt cannot pass the solid gate. Exporting and
+        # tessellating thousands of its independent diagnostic faces before
+        # constructing the verified carrier can consume the entire isolated
+        # worker budget, losing an otherwise useful recognized surface graph.
         update("faceted_fallback_start")
-        analytic_graph = result.graph
-        failure_reason = (
-            "the fitted surfaces were not watertight"
-            if not result.closed or result.free_edge_count
-            else "the fitted solid failed geometry or STEP round-trip validation"
+        faceted = build_faceted_brep(
+            data,
+            result.graph,
+            "the fitted surfaces were not watertight",
         )
-        faceted = build_faceted_brep(data, analytic_graph, failure_reason)
         export_surface_brep(
             faceted,
             stl_path.parent,
@@ -80,14 +76,46 @@ def _reconstruct_surfaces_direct(
             stl_path.parent,
             require_solid=False,
         )
-        if _passes_surface_gate(faceted, faceted_score, threshold):
-            result = faceted
-            score = faceted_score
-            passed = True
+        result = faceted
+        score = faceted_score
+        passed = _passes_surface_gate(faceted, faceted_score, threshold)
+        if passed:
             update(
                 f"faceted_fallback_done faces={faceted.faceted_face_count} "
                 "preview=reconstruction.stl"
             )
+    else:
+        update("surface_export_start")
+        export_surface_brep(result, stl_path.parent, data.source_path)
+        update("surface_verification_start preview=reconstruction.stl")
+        score = score_exported_shape(data, stl_path.parent, require_solid=False)
+        passed = _passes_surface_gate(result, score, threshold)
+        if not passed and data.report.watertight:
+            update("faceted_fallback_start")
+            faceted = build_faceted_brep(
+                data,
+                result.graph,
+                "the fitted solid failed geometry or STEP round-trip validation",
+            )
+            export_surface_brep(
+                faceted,
+                stl_path.parent,
+                data.source_path,
+                verify_roundtrip=False,
+            )
+            faceted_score = score_exported_shape(
+                data,
+                stl_path.parent,
+                require_solid=False,
+            )
+            if _passes_surface_gate(faceted, faceted_score, threshold):
+                result = faceted
+                score = faceted_score
+                passed = True
+                update(
+                    f"faceted_fallback_done faces={faceted.faceted_face_count} "
+                    "preview=reconstruction.stl"
+                )
 
     warnings = list(result.warnings)
     if result.point_fitted_face_count:
@@ -242,17 +270,18 @@ def reconstruct_surfaces(
         )
     if progress_callback is not None:
         progress_callback("surface_isolated_worker_start")
-    worker_timeout = 75
+    worker_timeout = 120
     try:
         file_size = stl_path.stat().st_size
         with stl_path.open("rb") as stream:
             stream.seek(80)
             triangle_count = struct.unpack("<I", stream.read(4))[0]
         if file_size == 84 + triangle_count * 50 and triangle_count > 50_000:
-            # Dense faceted STEP exchange needs most of the outer request
-            # budget. Give analytic fitting a short opportunity, then preserve
-            # enough time for the guaranteed source-topology carrier.
-            worker_timeout = 20
+            # Dense fitting gets a bounded but meaningful recognition window.
+            # A 20-second cap discarded graphs that completed shortly after it;
+            # sixty seconds still leaves the parent able to construct the
+            # guaranteed source-topology carrier if native fitting stalls.
+            worker_timeout = 60
     except (OSError, struct.error):
         pass
     command = [

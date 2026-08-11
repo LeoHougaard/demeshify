@@ -93,8 +93,10 @@ the complete STL topology directly:
 Native analytic fitting runs in a bounded child process. A kernel access
 violation or timeout therefore cannot terminate the conversion request; the
 parent process still owns the untouched source mesh and can build the exact
-faceted carrier. The 60-model Fusion holdout currently passes 60/60, with 38
-analytic/hybrid outputs and 22 full faceted recoveries.
+faceted carrier. The curated 60-model Fusion holdout currently passes 60/60,
+with 44 analytic/hybrid outputs and 16 full faceted recoveries. Open or
+inconsistent source meshes still require a separate topology-repair carrier if
+analytic reconstruction fails; they cannot honestly use the closed carrier.
 
 ## STEP output
 
