@@ -1,7 +1,10 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
-import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js";
+import {
+  mergeVertices,
+  toCreasedNormals,
+} from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import "./styles.css";
 
 const app = document.querySelector("#app");
@@ -232,19 +235,26 @@ class MeshViewer {
   constructor(canvas, color) {
     this.canvas = canvas;
     this.color = color;
+    this.cadStyle = canvas.id === "outputCanvas";
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.scene = new THREE.Scene();
+    if (this.cadStyle) this.scene.background = new THREE.Color(0x303234);
     this.camera = new THREE.PerspectiveCamera(38, 1, 0.01, 100000);
     this.camera.position.set(4, 3, 4);
     this.controls = new OrbitControls(this.camera, canvas);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.07;
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x243044, 2.2));
-    const key = new THREE.DirectionalLight(0xffffff, 3.2);
+    this.scene.add(
+      new THREE.HemisphereLight(0xffffff, 0x243044, this.cadStyle ? 1.65 : 2.2),
+    );
+    const key = new THREE.DirectionalLight(0xffffff, this.cadStyle ? 2.3 : 3.2);
     key.position.set(3, 5, 4);
     this.scene.add(key);
-    const rim = new THREE.DirectionalLight(0x4db7ff, 2);
+    const rim = new THREE.DirectionalLight(
+      this.cadStyle ? 0xaad8eb : 0x4db7ff,
+      this.cadStyle ? 0.85 : 2,
+    );
     rim.position.set(-4, 1, -3);
     this.scene.add(rim);
     this.animate();
@@ -252,6 +262,15 @@ class MeshViewer {
 
   async load(buffer, { resetCamera = true } = {}) {
     const rawGeometry = new STLLoader().parse(buffer);
+    rawGeometry.computeBoundingBox();
+    const rawBox = rawGeometry.boundingBox;
+    const rawSize = rawBox.getSize(new THREE.Vector3());
+    const topologyGeometry = rawGeometry.clone();
+    topologyGeometry.deleteAttribute("normal");
+    const weldedGeometry = mergeVertices(
+      topologyGeometry,
+      Math.max(rawSize.length() * 1e-7, 1e-8),
+    );
     // STL stores independent triangle normals, so computeVertexNormals alone
     // still makes exact CAD cylinders look polygonal. Average only across
     // shallow tessellation edges; real mechanical creases remain sharp.
@@ -263,10 +282,16 @@ class MeshViewer {
       this.mesh.geometry.dispose();
       this.mesh.material.dispose();
     }
+    if (this.cadEdges) {
+      this.scene.remove(this.cadEdges);
+      this.cadEdges.geometry.dispose();
+      this.cadEdges.material.dispose();
+      this.cadEdges = null;
+    }
     const material = new THREE.MeshStandardMaterial({
       color: this.color,
-      metalness: 0.18,
-      roughness: 0.34,
+      metalness: this.cadStyle ? 0.04 : 0.18,
+      roughness: this.cadStyle ? 0.56 : 0.34,
       polygonOffset: true,
       polygonOffsetFactor: 1,
       polygonOffsetUnits: 1,
@@ -278,6 +303,17 @@ class MeshViewer {
     this.modelCenter = center.clone();
     this.mesh.position.sub(center);
     this.scene.add(this.mesh);
+    if (this.cadStyle) {
+      this.cadEdges = new THREE.LineSegments(
+        new THREE.EdgesGeometry(weldedGeometry, 1),
+        new THREE.LineBasicMaterial({ color: 0x17242c, depthTest: true }),
+      );
+      this.cadEdges.position.sub(center);
+      this.cadEdges.renderOrder = 2;
+      this.scene.add(this.cadEdges);
+    }
+    topologyGeometry.dispose();
+    weldedGeometry.dispose();
     if (resetCamera || !hadMesh) {
       const size = box.getSize(new THREE.Vector3());
       const radius = Math.max(size.length() * 0.65, 1);
@@ -331,7 +367,7 @@ class MeshViewer {
         group.add(
           new THREE.LineSegments(
             geometry,
-            new THREE.LineBasicMaterial({ color: 0x76d5ff, depthTest: true }),
+            new THREE.LineBasicMaterial({ color: 0x17242c, depthTest: true }),
           ),
         );
       }
@@ -344,7 +380,7 @@ class MeshViewer {
       const wireframe = new THREE.Mesh(
         this.mesh.geometry,
         new THREE.MeshBasicMaterial({
-          color: 0xff9a55,
+          color: 0x111a20,
           wireframe: true,
           transparent: true,
           opacity: 0.92,
@@ -384,7 +420,7 @@ class MeshViewer {
         group.add(
           new THREE.LineSegments(
             geometry,
-            new THREE.LineBasicMaterial({ color: 0xff9a55, depthTest: true }),
+            new THREE.LineBasicMaterial({ color: 0x111a20, depthTest: true }),
           ),
         );
       }
@@ -985,7 +1021,7 @@ async function updateLivePreview(progress) {
     if (!response.ok) return;
     const buffer = await response.arrayBuffer();
     if (revision <= livePreviewRevision) return;
-    outputViewer ||= new MeshViewer(outputCanvas, 0x45b8ff);
+    outputViewer ||= new MeshViewer(outputCanvas, 0x8ebbd2);
     await outputViewer.load(buffer, { resetCamera: livePreviewRevision === 0 });
     livePreviewRevision = revision;
     viewerEmpty.classList.add("hidden");
@@ -1288,7 +1324,7 @@ async function renderResult(report, options = {}) {
     });
     if (!response.ok) throw new Error("The reconstructed preview could not be loaded.");
     const outputBuffer = await response.arrayBuffer();
-    outputViewer ||= new MeshViewer(outputCanvas, 0x45b8ff);
+    outputViewer ||= new MeshViewer(outputCanvas, 0x8ebbd2);
     await outputViewer.load(outputBuffer);
     if (surfaceMode) {
       try {

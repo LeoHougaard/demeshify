@@ -60,10 +60,14 @@ def _reconstruct_surfaces_direct(
         # constructing the verified carrier can consume the entire isolated
         # worker budget, losing an otherwise useful recognized surface graph.
         update("faceted_fallback_start")
+        visualization_faceted_patch_ids = sorted(
+            set(result.faceted_patch_ids + result.unfitted_patch_ids)
+        )
         faceted = build_faceted_brep(
             data,
             result.graph,
             "the fitted surfaces were not watertight",
+            visualization_faceted_patch_ids,
         )
         export_surface_brep(
             faceted,
@@ -92,10 +96,14 @@ def _reconstruct_surfaces_direct(
         passed = _passes_surface_gate(result, score, threshold)
         if not passed and data.report.watertight:
             update("faceted_fallback_start")
+            visualization_faceted_patch_ids = sorted(
+                set(result.faceted_patch_ids + result.unfitted_patch_ids)
+            )
             faceted = build_faceted_brep(
                 data,
                 result.graph,
                 "the fitted solid failed geometry or STEP round-trip validation",
+                visualization_faceted_patch_ids,
             )
             export_surface_brep(
                 faceted,

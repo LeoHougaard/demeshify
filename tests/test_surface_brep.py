@@ -15,6 +15,7 @@ from app.surface_brep import (
     build_faceted_brep,
     build_surface_brep,
     export_surface_brep,
+    surface_graph_json,
 )
 from app.surface_graph import (
     CylindricalPatch,
@@ -346,6 +347,14 @@ def test_faceted_residual_deforms_boundary_triangles_onto_analytic_trim(
         for surface in graph_payload["surfaces"]
         if surface["id"] == "organic"
     )["representation"] == "faceted"
+    carrier_visualization = surface_graph_json(
+        graph,
+        faceted_patch_ids=["organic"],
+        source_mesh_fallback=True,
+    )["visualization"]
+    assert carrier_visualization["source_mesh_carrier"]
+    assert not carrier_visualization["global_faceted_fallback"]
+    assert carrier_visualization["faceted_source_face_indices"] == top_indices.tolist()
     roundtrip = cq.importers.importStep(str(tmp_path / "reconstruction.step")).val()
     assert roundtrip.isValid()
     assert len(roundtrip.Solids()) == 1

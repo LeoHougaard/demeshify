@@ -165,6 +165,7 @@ class SurfaceBRepResult:
     faceted_patch_count: int = 0
     faceted_face_count: int = 0
     faceted_patch_ids: list[str] = field(default_factory=list)
+    unfitted_patch_ids: list[str] = field(default_factory=list)
     source_mesh_fallback: bool = False
 
 
@@ -3032,6 +3033,7 @@ def build_faceted_brep(
     data: MeshData,
     graph: SurfaceGraph | None = None,
     reason: str = "analytic reconstruction did not pass validation",
+    visualization_faceted_patch_ids: list[str] | None = None,
 ) -> SurfaceBRepResult:
     """Build an exact manifold B-rep carrier from a watertight source mesh.
 
@@ -3136,6 +3138,7 @@ def build_faceted_brep(
         ],
         faceted_patch_count=1,
         faceted_face_count=len(faces),
+        faceted_patch_ids=list(visualization_faceted_patch_ids or []),
         source_mesh_fallback=True,
     )
 
@@ -3596,7 +3599,7 @@ def surface_graph_json(
     faceted_ids = set(faceted_patch_ids or [])
     faceted_face_indices = (
         []
-        if source_mesh_fallback
+        if source_mesh_fallback and not faceted_ids
         else sorted(
             {
                 int(face_index)
@@ -3610,9 +3613,7 @@ def surface_graph_json(
     for patch in graph.patches:
         serialized = _serialize_patch(patch)
         serialized["representation"] = (
-            "faceted"
-            if source_mesh_fallback or patch.patch_id in faceted_ids
-            else "fitted"
+            "faceted" if patch.patch_id in faceted_ids else "fitted"
         )
         surfaces.append(serialized)
     return {
@@ -3644,7 +3645,8 @@ def surface_graph_json(
             for item in graph.adjacency
         ],
         "visualization": {
-            "global_faceted_fallback": source_mesh_fallback,
+            "source_mesh_carrier": source_mesh_fallback,
+            "global_faceted_fallback": source_mesh_fallback and not faceted_ids,
             "faceted_patch_ids": sorted(faceted_ids),
             "faceted_source_face_indices": faceted_face_indices,
             "surface_boundaries": [
@@ -4216,6 +4218,7 @@ def build_surface_brep(
         faceted_patch_count=faceted_patch_count,
         faceted_face_count=faceted_face_count,
         faceted_patch_ids=faceted_patch_ids,
+        unfitted_patch_ids=unfitted_patches,
     )
 
 
