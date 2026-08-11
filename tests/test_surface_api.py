@@ -31,12 +31,19 @@ def test_surface_engine_runs_through_api_and_exposes_downloads(
 
         run_id = report["id"]
         assert client.get(f"/api/runs/{run_id}").status_code == 200
-        assert client.get(
-            f"/api/runs/{run_id}/files/reconstruction.step"
-        ).status_code == 200
-        assert client.get(
+        step_response = client.get(f"/api/runs/{run_id}/files/reconstruction.step")
+        assert step_response.status_code == 200
+        assert 'filename="box_reconstructed.step"' in step_response.headers[
+            "content-disposition"
+        ]
+        graph_response = client.get(
             f"/api/runs/{run_id}/files/surface_graph.json"
-        ).status_code == 200
+        )
+        assert graph_response.status_code == 200
+        visualization = graph_response.json()["visualization"]
+        assert not visualization["global_faceted_fallback"]
+        assert not visualization["faceted_source_face_indices"]
+        assert visualization["surface_boundaries"]
         assert client.get(f"/api/runs/{run_id}/live-preview").status_code == 200
 
 

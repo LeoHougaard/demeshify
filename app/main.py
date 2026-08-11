@@ -37,6 +37,21 @@ RUN_PROGRESS_LOCK = Lock()
 RUN_TASKS: set[asyncio.Task[None]] = set()
 
 
+def _download_name(run_id: str, file_name: str) -> str:
+    """Give exported CAD files a recognizable source-derived name."""
+
+    if file_name not in {"reconstruction.step", "joined_surfaces.step"}:
+        return file_name
+    try:
+        source_name = load_report(run_id).mesh.file_name
+    except (FileNotFoundError, ValueError):
+        return file_name
+    stem = Path(source_name).stem.strip() or "model"
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "model"
+    suffix = "reconstructed" if file_name == "reconstruction.step" else "joined_surfaces"
+    return f"{safe_stem}_{suffix}.step"
+
+
 @app.get("/api/health")
 def health() -> dict[str, object]:
     return {
@@ -297,7 +312,7 @@ def download_endpoint(run_id: str, file_name: str) -> FileResponse:
     path = run_dir(run_id) / file_name
     if not path.is_file():
         raise HTTPException(404, "File not found")
-    return FileResponse(path, filename=file_name)
+    return FileResponse(path, filename=_download_name(run_id, file_name))
 
 
 DIST = ROOT / "web" / "dist"

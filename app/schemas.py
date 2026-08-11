@@ -565,6 +565,7 @@ class SurfaceBRepReport(BaseModel):
     faceted_fallback: bool = False
     faceted_patch_count: int = 0
     faceted_face_count: int = 0
+    source_mesh_fallback: bool = False
 
 
 class ReconstructionReport(BaseModel):

@@ -104,6 +104,11 @@ app.innerHTML = `
           </div>
           <canvas id="inputCanvas"></canvas>
           <canvas id="outputCanvas" class="hidden"></canvas>
+          <div id="surfaceLegend" class="surface-legend hidden">
+            <span><i class="fitted-edge"></i>Fitted surface boundary</span>
+            <span><i class="faceted-edge"></i>Fallback triangle edges</span>
+            <small id="surfaceLegendStatus"></small>
+          </div>
           <div id="processing" class="processing hidden">
             <div class="processing-card">
               <div class="processing-heading">
@@ -252,6 +257,7 @@ class MeshViewer {
     // shallow tessellation edges; real mechanical creases remain sharp.
     const geometry = toCreasedNormals(rawGeometry, THREE.MathUtils.degToRad(30));
     const hadMesh = Boolean(this.mesh);
+    this.clearSurfaceOverlay();
     if (this.mesh) {
       this.scene.remove(this.mesh);
       this.mesh.geometry.dispose();
@@ -261,11 +267,15 @@ class MeshViewer {
       color: this.color,
       metalness: 0.18,
       roughness: 0.34,
+      polygonOffset: true,
+      polygonOffsetFactor: 1,
+      polygonOffsetUnits: 1,
     });
     this.mesh = new THREE.Mesh(geometry, material);
     geometry.computeBoundingBox();
     const box = geometry.boundingBox;
     const center = box.getCenter(new THREE.Vector3());
+    this.modelCenter = center.clone();
     this.mesh.position.sub(center);
     this.scene.add(this.mesh);
     if (resetCamera || !hadMesh) {
@@ -278,6 +288,112 @@ class MeshViewer {
       this.controls.target.set(0, 0, 0);
       this.controls.update();
     }
+  }
+
+  clearSurfaceOverlay() {
+    if (!this.surfaceOverlay) return;
+    this.scene.remove(this.surfaceOverlay);
+    this.surfaceOverlay.traverse((item) => {
+      if (!item.userData.sharedGeometry) item.geometry?.dispose();
+      item.material?.dispose();
+    });
+    this.surfaceOverlay = null;
+  }
+
+  showSurfaceOverlay(surfaceGraph, sourceBuffer, unitScale = 1) {
+    this.clearSurfaceOverlay();
+    if (!this.mesh || !this.modelCenter) return { boundaryCount: 0, triangleCount: 0 };
+
+    const visualization = surfaceGraph?.visualization || {};
+    const group = new THREE.Group();
+    group.position.copy(this.modelCenter).multiplyScalar(-1);
+    let boundaryCount = 0;
+    let triangleCount = 0;
+
+    if (!visualization.global_faceted_fallback) {
+      const boundaryPositions = [];
+      for (const curve of visualization.surface_boundaries || []) {
+        if (!Array.isArray(curve) || curve.length < 2) continue;
+        for (let index = 0; index < curve.length - 1; index += 1) {
+          const first = curve[index];
+          const second = curve[index + 1];
+          if (first?.length !== 3 || second?.length !== 3) continue;
+          boundaryPositions.push(...first, ...second);
+        }
+        boundaryCount += 1;
+      }
+      if (boundaryPositions.length) {
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute(
+          "position",
+          new THREE.Float32BufferAttribute(boundaryPositions, 3),
+        );
+        group.add(
+          new THREE.LineSegments(
+            geometry,
+            new THREE.LineBasicMaterial({ color: 0x76d5ff, depthTest: true }),
+          ),
+        );
+      }
+    }
+
+    const sourceGeometry = new STLLoader().parse(sourceBuffer);
+    const sourcePositions = sourceGeometry.getAttribute("position");
+    const sourceFaceCount = Math.floor(sourcePositions.count / 3);
+    if (visualization.global_faceted_fallback) {
+      const wireframe = new THREE.Mesh(
+        this.mesh.geometry,
+        new THREE.MeshBasicMaterial({
+          color: 0xff9a55,
+          wireframe: true,
+          transparent: true,
+          opacity: 0.92,
+          depthTest: true,
+        }),
+      );
+      wireframe.userData.sharedGeometry = true;
+      group.add(wireframe);
+      triangleCount = sourceFaceCount;
+    } else {
+      const requestedFaces = visualization.faceted_source_face_indices || [];
+      const trianglePositions = [];
+      for (const rawFaceIndex of requestedFaces) {
+        const faceIndex = Number(rawFaceIndex);
+        if (!Number.isInteger(faceIndex) || faceIndex < 0 || faceIndex >= sourceFaceCount) continue;
+        const points = [0, 1, 2].map((offset) => {
+          const vertexIndex = faceIndex * 3 + offset;
+          return [
+            sourcePositions.getX(vertexIndex) * unitScale,
+            sourcePositions.getY(vertexIndex) * unitScale,
+            sourcePositions.getZ(vertexIndex) * unitScale,
+          ];
+        });
+        trianglePositions.push(
+          ...points[0], ...points[1],
+          ...points[1], ...points[2],
+          ...points[2], ...points[0],
+        );
+        triangleCount += 1;
+      }
+      if (trianglePositions.length) {
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute(
+          "position",
+          new THREE.Float32BufferAttribute(trianglePositions, 3),
+        );
+        group.add(
+          new THREE.LineSegments(
+            geometry,
+            new THREE.LineBasicMaterial({ color: 0xff9a55, depthTest: true }),
+          ),
+        );
+      }
+    }
+    sourceGeometry.dispose();
+
+    this.surfaceOverlay = group;
+    this.scene.add(group);
+    return { boundaryCount, triangleCount };
   }
 
   resize() {
@@ -311,6 +427,8 @@ const inputCanvas = document.querySelector("#inputCanvas");
 const outputCanvas = document.querySelector("#outputCanvas");
 const errorBox = document.querySelector("#errorBox");
 const viewTabs = document.querySelector("#viewTabs");
+const surfaceLegend = document.querySelector("#surfaceLegend");
+const surfaceLegendStatus = document.querySelector("#surfaceLegendStatus");
 const featureEditor = document.querySelector("#featureEditor");
 const featureTree = document.querySelector("#featureTree");
 const parameterHeader = document.querySelector("#parameterHeader");
@@ -766,6 +884,7 @@ async function chooseFile(file) {
     return;
   }
   selectedFile = file;
+  surfaceLegend.classList.add("hidden");
   errorBox.classList.add("hidden");
   fileChip.classList.remove("hidden");
   fileChip.innerHTML = `
@@ -794,6 +913,7 @@ function clearFile(event) {
   inputCanvas.classList.add("hidden");
   outputCanvas.classList.add("hidden");
   viewTabs.classList.add("hidden");
+  surfaceLegend.classList.add("hidden");
   button.disabled = true;
 }
 
@@ -942,6 +1062,7 @@ button.addEventListener("click", async () => {
 });
 
 async function renderResult(report, options = {}) {
+  surfaceLegend.classList.add("hidden");
   const complete = report.status === "complete";
   const surfaceMode = report.engine === "surface_brep" && report.surface;
   const semantic = report.plan?.representation !== "sampled_approximation";
@@ -1098,7 +1219,9 @@ async function renderResult(report, options = {}) {
         "STEP representation",
         report.surface.closed
           ? report.surface.faceted_fallback
-            ? "Closed hybrid analytic/conforming-facet solid"
+            ? report.surface.source_mesh_fallback
+              ? "Closed exact source-mesh faceted solid"
+              : "Closed hybrid analytic/conforming-facet solid"
             : "Closed analytic/B-spline solid"
           : report.surface.faceted_fallback
             ? "Hybrid analytic/conforming-facet face set"
@@ -1125,9 +1248,14 @@ async function renderResult(report, options = {}) {
   }
 
   const fileBase = `/api/runs/${report.id}/files`;
+  const sourceStem = (report.mesh.file_name || "model.stl")
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/^[._]+|[._]+$/g, "") || "model";
+  const reconstructedStepName = `${sourceStem}_reconstructed.step`;
   document.querySelector("#downloads").innerHTML = surfaceMode
     ? `
-    <a class="download-primary" href="${fileBase}/reconstruction.step" download>
+    <a class="download-primary" href="${fileBase}/reconstruction.step" download="${escapeHtml(reconstructedStepName)}">
       <span><strong>STEP surface model</strong><small>${report.surface.closed ? "Watertight fitted OpenCascade B-rep" : "Valid fitted surface-recognition model"}</small></span><b>↓</b>
     </a>
     <a href="${fileBase}/surface_graph.json" download>Surface graph JSON <b>↓</b></a>
@@ -1135,7 +1263,7 @@ async function renderResult(report, options = {}) {
     <a href="${fileBase}/report.json" download>Verification report <b>↓</b></a>
   `
     : `
-    <a class="download-primary" href="${fileBase}/reconstruction.step" download>
+    <a class="download-primary" href="${fileBase}/reconstruction.step" download="${escapeHtml(reconstructedStepName)}">
       <span><strong>STEP model</strong><small>Neutral editable CAD solid</small></span><b>↓</b>
     </a>
     <a href="${fileBase}/reconstruction.py" download>CadQuery source <b>↓</b></a>
@@ -1155,13 +1283,35 @@ async function renderResult(report, options = {}) {
       editablePlan = null;
       featureEditor.classList.add("hidden");
     }
-    const response = await fetch(
-      `${fileBase}/reconstruction.stl?revision=${report.plan?.revision || 0}`,
-      { cache: "no-store" },
-    );
+    const response = await fetch(`${fileBase}/reconstruction.stl?revision=${report.plan?.revision || 0}`, {
+      cache: "no-store",
+    });
     if (!response.ok) throw new Error("The reconstructed preview could not be loaded.");
+    const outputBuffer = await response.arrayBuffer();
     outputViewer ||= new MeshViewer(outputCanvas, 0x45b8ff);
-    await outputViewer.load(await response.arrayBuffer());
+    await outputViewer.load(outputBuffer);
+    if (surfaceMode) {
+      try {
+        const [graphResponse, sourceResponse] = await Promise.all([
+          fetch(`${fileBase}/surface_graph.json`, { cache: "no-store" }),
+          fetch(`${fileBase}/input.stl`, { cache: "no-store" }),
+        ]);
+        if (graphResponse.ok && sourceResponse.ok) {
+          const surfaceGraph = await graphResponse.json();
+          const overlay = outputViewer.showSurfaceOverlay(
+            surfaceGraph,
+            await sourceResponse.arrayBuffer(),
+            Number(report.mesh.unit_scale) || 1,
+          );
+          surfaceLegendStatus.textContent = overlay.triangleCount
+            ? `${overlay.triangleCount.toLocaleString()} fallback triangles shown`
+            : "No triangle fallback used";
+          surfaceLegend.classList.remove("hidden");
+        }
+      } catch {
+        surfaceLegend.classList.add("hidden");
+      }
+    }
     inputCanvas.classList.add("hidden");
     outputCanvas.classList.remove("hidden");
     viewTabs.classList.remove("hidden");

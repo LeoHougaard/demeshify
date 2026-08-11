@@ -336,6 +336,16 @@ def test_faceted_residual_deforms_boundary_triangles_onto_analytic_trim(
         "CYLINDER",
         "BSPLINE",
     }
+    graph_payload = json.loads((tmp_path / "surface_graph.json").read_text())
+    visualization = graph_payload["visualization"]
+    assert visualization["faceted_patch_ids"] == ["organic"]
+    assert visualization["faceted_source_face_indices"] == top_indices.tolist()
+    assert len(visualization["surface_boundaries"]) == 2
+    assert next(
+        surface
+        for surface in graph_payload["surfaces"]
+        if surface["id"] == "organic"
+    )["representation"] == "faceted"
     roundtrip = cq.importers.importStep(str(tmp_path / "reconstruction.step")).val()
     assert roundtrip.isValid()
     assert len(roundtrip.Solids()) == 1
@@ -353,6 +363,9 @@ def test_source_topology_faceted_fallback_is_a_valid_step_solid(tmp_path) -> Non
     assert result.free_edge_count == 0
     assert result.face_count == len(mesh.faces)
     assert result.topology_vertex_count == len(mesh.vertices)
+    graph_payload = json.loads((tmp_path / "surface_graph.json").read_text())
+    assert graph_payload["visualization"]["global_faceted_fallback"]
+    assert not graph_payload["visualization"]["faceted_source_face_indices"]
     roundtrip = cq.importers.importStep(str(tmp_path / "reconstruction.step")).val()
     assert roundtrip.isValid()
     assert len(roundtrip.Solids()) == 1

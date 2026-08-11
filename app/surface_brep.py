@@ -164,6 +164,7 @@ class SurfaceBRepResult:
     warnings: list[str] = field(default_factory=list)
     faceted_patch_count: int = 0
     faceted_face_count: int = 0
+    faceted_patch_ids: list[str] = field(default_factory=list)
     source_mesh_fallback: bool = False
 
 
@@ -3586,7 +3587,34 @@ def _serialize_patch(patch: SurfacePatch) -> dict[str, object]:
     return result
 
 
-def surface_graph_json(graph: SurfaceGraph) -> dict[str, object]:
+def surface_graph_json(
+    graph: SurfaceGraph,
+    *,
+    faceted_patch_ids: list[str] | None = None,
+    source_mesh_fallback: bool = False,
+) -> dict[str, object]:
+    faceted_ids = set(faceted_patch_ids or [])
+    faceted_face_indices = (
+        []
+        if source_mesh_fallback
+        else sorted(
+            {
+                int(face_index)
+                for patch in graph.patches
+                if patch.patch_id in faceted_ids
+                for face_index in patch.face_indices
+            }
+        )
+    )
+    surfaces: list[dict[str, object]] = []
+    for patch in graph.patches:
+        serialized = _serialize_patch(patch)
+        serialized["representation"] = (
+            "faceted"
+            if source_mesh_fallback or patch.patch_id in faceted_ids
+            else "fitted"
+        )
+        surfaces.append(serialized)
     return {
         "surface_taxonomy": {
             "elementary_recognized": [
@@ -3606,7 +3634,7 @@ def surface_graph_json(graph: SurfaceGraph) -> dict[str, object]:
             ],
             "residual_representation": "node_fitted_bspline_surface",
         },
-        "surfaces": [_serialize_patch(patch) for patch in graph.patches],
+        "surfaces": surfaces,
         "adjacency": [
             {
                 "first": item.first_patch_id,
@@ -3615,6 +3643,17 @@ def surface_graph_json(graph: SurfaceGraph) -> dict[str, object]:
             }
             for item in graph.adjacency
         ],
+        "visualization": {
+            "global_faceted_fallback": source_mesh_fallback,
+            "faceted_patch_ids": sorted(faceted_ids),
+            "faceted_source_face_indices": faceted_face_indices,
+            "surface_boundaries": [
+                np.asarray(curve, dtype=float).tolist()
+                for item in graph.adjacency
+                for curve in item.boundary_curves
+                if len(curve) >= 2
+            ],
+        },
     }
 
 
@@ -3661,6 +3700,7 @@ def build_surface_brep(
     point_fitted_face_count = 0
     faceted_face_count = 0
     faceted_patch_count = 0
+    faceted_patch_ids: list[str] = []
     unfitted_patches: list[str] = []
 
     def mark_unfitted(patch: SurfacePatch) -> None:
@@ -3700,6 +3740,7 @@ def build_surface_brep(
         faces.extend(faceted)
         faceted_face_count += len(faceted)
         faceted_patch_count += 1
+        faceted_patch_ids.append(patch.patch_id)
         if progress_callback is not None:
             progress_callback(
                 f"surface_face_faceted patch={patch.patch_id} kind={patch.kind} "
@@ -4174,6 +4215,7 @@ def build_surface_brep(
         warnings=warnings,
         faceted_patch_count=faceted_patch_count,
         faceted_face_count=faceted_face_count,
+        faceted_patch_ids=faceted_patch_ids,
     )
 
 
@@ -4220,6 +4262,13 @@ def export_surface_brep(
             angularTolerance=0.04,
         )
     (directory / "surface_graph.json").write_text(
-        json.dumps(surface_graph_json(result.graph), indent=2),
+        json.dumps(
+            surface_graph_json(
+                result.graph,
+                faceted_patch_ids=result.faceted_patch_ids,
+                source_mesh_fallback=result.source_mesh_fallback,
+            ),
+            indent=2,
+        ),
         encoding="utf-8",
     )

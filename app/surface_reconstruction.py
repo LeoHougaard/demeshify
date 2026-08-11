@@ -149,6 +149,7 @@ def _reconstruct_surfaces_direct(
         faceted_fallback=result.faceted_fallback,
         faceted_patch_count=result.faceted_patch_count,
         faceted_face_count=result.faceted_face_count,
+        source_mesh_fallback=result.source_mesh_fallback,
     )
     report = ReconstructionReport(
         id=run_id,
@@ -217,6 +218,7 @@ def _reconstruct_faceted_only(
         faceted_fallback=True,
         faceted_patch_count=1,
         faceted_face_count=result.faceted_face_count,
+        source_mesh_fallback=True,
     )
     report = ReconstructionReport(
         id=run_id,
