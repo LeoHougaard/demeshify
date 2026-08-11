@@ -217,6 +217,17 @@ main.converter-shell {
   box-shadow: inset 0 -2px 0 rgba(18, 38, 48, .2); font-size: 11px;
 }
 .convert-button:hover:not(:disabled) { background: #add3e3; transform: none; box-shadow: inset 0 -2px 0 rgba(18, 38, 48, .18); }
+.converter-sidebar .error-box {
+  flex: 0 1 auto; max-height: 132px; margin: 0; padding: 10px 11px; overflow-y: auto;
+  color: #ffc0c0; background: #412d2f; border-color: #71464a; border-radius: 7px; font-size: 9px;
+}
+.base-warnings {
+  flex: 0 1 auto; max-height: 132px; overflow-y: auto; border: 1px solid #6b5b3c;
+  border-radius: 7px; background: #373328;
+}
+.base-warning { display: flex; align-items: flex-start; gap: 8px; padding: 8px 9px; color: #e4cf9e; font-size: 8.5px; line-height: 1.4; }
+.base-warning + .base-warning { border-top: 1px solid #514a37; }
+.base-warning b { flex: 0 0 16px; width: 16px; height: 16px; display: grid; place-items: center; border-radius: 50%; background: #50472f; font-size: 9px; }
 
 .compact-results {
   min-height: 0; margin: 0; padding: 14px 0 0; display: flex; flex-direction: column; gap: 11px;
@@ -261,6 +272,9 @@ main.converter-shell {
   box-shadow: 0 12px 25px rgba(0,0,0,.15);
 }
 .surface-legend { left: 14px; bottom: 14px; border-color: #596268; background: rgba(37, 41, 43, .92); }
+.input-triangle-legend .source-triangle-edge {
+  height: 6px; background: repeating-linear-gradient(135deg, #293940 0 2px, #9db9c5 2px 3px);
+}
 .processing { padding: 16px; background: linear-gradient(0deg, rgba(30,32,34,.45), transparent 58%); }
 .processing-card { border-color: #59656b; background: rgba(38,42,44,.94); }
 

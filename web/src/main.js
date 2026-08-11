@@ -226,6 +226,7 @@ app.innerHTML = `
         <span>Convert to STEP</span><svg viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></svg>
       </button>
       <div id="errorBox" class="error-box hidden"></div>
+      <div id="baseWarnings" class="base-warnings hidden"></div>
 
       <section id="results" class="compact-results hidden">
         <div class="compact-result-heading">
@@ -238,7 +239,7 @@ app.innerHTML = `
           <article><span>Time</span><strong id="elapsed">—</strong><small>seconds</small></article>
         </div>
         <div id="downloads" class="downloads primary-download"></div>
-        <button id="openResultDetails" class="text-button" type="button">View conversion details</button>
+        <button id="openResultDetails" class="text-button" type="button">Advanced</button>
       </section>
     </aside>
 
@@ -251,6 +252,7 @@ app.innerHTML = `
         <div id="viewerEmpty" class="viewer-empty"><div class="empty-file">STL</div><strong>Import a model to inspect it</strong><p>Drag to orbit · scroll to zoom</p></div>
         <canvas id="inputCanvas"></canvas><canvas id="outputCanvas" class="hidden"></canvas>
         <div id="surfaceLegend" class="surface-legend hidden"><span><i class="fitted-edge"></i>Fitted surface boundary</span><span><i class="faceted-edge"></i>Fallback triangle edges</span><small id="surfaceLegendStatus"></small></div>
+        <div id="inputTriangleLegend" class="surface-legend input-triangle-legend hidden"><span><i class="source-triangle-edge"></i>Every source STL triangle edge</span><small id="inputTriangleLegendStatus"></small></div>
         <div id="processing" class="processing hidden">
           <div class="processing-card">
             <div class="processing-heading"><div class="scan-object"><span></span></div><div><small>CONVERTING</small><strong id="processingStage">Starting reconstruction</strong></div></div>
@@ -326,6 +328,7 @@ class MeshViewer {
     this.canvas = canvas;
     this.color = color;
     this.cadStyle = true;
+    this.showAllTriangles = canvas.id === "inputCanvas";
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.scene = new THREE.Scene();
@@ -352,6 +355,7 @@ class MeshViewer {
 
   async load(buffer, { resetCamera = true } = {}) {
     const rawGeometry = new STLLoader().parse(buffer);
+    const sourceTriangleCount = rawGeometry.getAttribute("position").count / 3;
     rawGeometry.computeBoundingBox();
     const rawBox = rawGeometry.boundingBox;
     const rawSize = rawBox.getSize(new THREE.Vector3());
@@ -378,6 +382,12 @@ class MeshViewer {
       this.cadEdges.material.dispose();
       this.cadEdges = null;
     }
+    if (this.triangleEdges) {
+      this.scene.remove(this.triangleEdges);
+      this.triangleEdges.geometry.dispose();
+      this.triangleEdges.material.dispose();
+      this.triangleEdges = null;
+    }
     const material = new THREE.MeshStandardMaterial({
       color: this.color,
       metalness: this.cadStyle ? 0.04 : 0.18,
@@ -401,6 +411,23 @@ class MeshViewer {
       this.cadEdges.position.sub(center);
       this.cadEdges.renderOrder = 2;
       this.scene.add(this.cadEdges);
+    }
+    if (this.showAllTriangles) {
+      this.triangleEdges = new THREE.LineSegments(
+        new THREE.WireframeGeometry(rawGeometry),
+        new THREE.LineBasicMaterial({
+          color: 0x34454d,
+          transparent: true,
+          opacity: 0.72,
+          depthTest: true,
+        }),
+      );
+      this.triangleEdges.position.sub(center);
+      this.triangleEdges.renderOrder = 3;
+      this.scene.add(this.triangleEdges);
+      this.canvas.dataset.triangleCount = String(sourceTriangleCount);
+      document.querySelector("#inputTriangleLegendStatus").textContent =
+        `${sourceTriangleCount.toLocaleString()} triangles`;
     }
     topologyGeometry.dispose();
     weldedGeometry.dispose();
@@ -552,9 +579,11 @@ const processing = document.querySelector("#processing");
 const inputCanvas = document.querySelector("#inputCanvas");
 const outputCanvas = document.querySelector("#outputCanvas");
 const errorBox = document.querySelector("#errorBox");
+const baseWarnings = document.querySelector("#baseWarnings");
 const viewTabs = document.querySelector("#viewTabs");
 const surfaceLegend = document.querySelector("#surfaceLegend");
 const surfaceLegendStatus = document.querySelector("#surfaceLegendStatus");
+const inputTriangleLegend = document.querySelector("#inputTriangleLegend");
 const featureEditor = document.querySelector("#featureEditor");
 const featureTree = document.querySelector("#featureTree");
 const parameterHeader = document.querySelector("#parameterHeader");
@@ -1027,7 +1056,10 @@ async function chooseFile(file) {
   }
   selectedFile = file;
   surfaceLegend.classList.add("hidden");
+  surfaceLegendStatus.textContent = "";
+  inputTriangleLegend.classList.remove("hidden");
   errorBox.classList.add("hidden");
+  baseWarnings.classList.add("hidden");
   fileChip.classList.remove("hidden");
   fileChip.innerHTML = `
     <span class="file-type">STL</span>
@@ -1056,6 +1088,8 @@ function clearFile(event) {
   outputCanvas.classList.add("hidden");
   viewTabs.classList.add("hidden");
   surfaceLegend.classList.add("hidden");
+  surfaceLegendStatus.textContent = "";
+  inputTriangleLegend.classList.add("hidden");
   button.disabled = true;
 }
 
@@ -1080,6 +1114,8 @@ viewTabs.addEventListener("click", (event) => {
   const output = tab.dataset.view === "output";
   inputCanvas.classList.toggle("hidden", output);
   outputCanvas.classList.toggle("hidden", !output);
+  inputTriangleLegend.classList.toggle("hidden", output);
+  surfaceLegend.classList.toggle("hidden", !output || !surfaceLegendStatus.textContent);
   [...viewTabs.children].forEach((item) => item.classList.toggle("active", item === tab));
 });
 
@@ -1133,6 +1169,7 @@ async function updateLivePreview(progress) {
     viewerEmpty.classList.add("hidden");
     inputCanvas.classList.add("hidden");
     outputCanvas.classList.remove("hidden");
+    inputTriangleLegend.classList.add("hidden");
     document.querySelector("#previewSubtitle").textContent =
       `Live provisional CAD · revision ${revision}`;
   } catch {
@@ -1168,6 +1205,7 @@ button.addEventListener("click", async () => {
   if (!selectedFile) return;
   button.disabled = true;
   errorBox.classList.add("hidden");
+  baseWarnings.classList.add("hidden");
   processing.classList.remove("hidden");
   livePreviewRevision = 0;
   livePreviewLoading = false;
@@ -1412,9 +1450,14 @@ async function renderResult(report, options = {}) {
       <a href="${fileBase}/report.json" download>Verification report <b>↓</b></a>
     `;
   const warnings = document.querySelector("#warnings");
-  warnings.innerHTML = (report.warnings || [])
+  const reportWarnings = report.warnings || [];
+  warnings.innerHTML = reportWarnings
     .map((warning) => `<div class="warning"><b>!</b><span>${escapeHtml(warning)}</span></div>`)
     .join("");
+  baseWarnings.innerHTML = reportWarnings
+    .map((warning) => `<div class="base-warning"><b>!</b><span>${escapeHtml(warning)}</span></div>`)
+    .join("");
+  baseWarnings.classList.toggle("hidden", reportWarnings.length === 0);
 
   if (report.status !== "failed") {
     if (report.plan) {
