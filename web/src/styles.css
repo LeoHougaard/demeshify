@@ -259,9 +259,11 @@ main.converter-shell {
 .viewer-panel .visual-toolbar { height: 52px; padding: 0 18px; border-color: #484d50; background: #2b2e30; }
 .viewer-panel .visual-title { color: #edf2f3; font-size: 11px; }
 .viewer-panel .visual-subtitle { color: #8e999e; font-size: 9px; }
+.viewer-actions { display: flex; align-items: center; gap: 8px; }
 .viewer-panel .view-tabs { background: #242729; border-color: #4a5154; }
 .viewer-panel .view-tabs button { color: #9aa5aa; }
 .viewer-panel .view-tabs button.active { color: #e8eef0; background: #41474a; }
+.projection-tabs button { min-width: 78px; }
 .viewer { min-height: 0; height: 100%; background: #303234; background-image: none; }
 .viewer-empty { color: #899399; text-align: center; }
 .viewer-empty strong { margin: 14px 0 5px; color: #c8d0d3; font-size: 11px; }
@@ -274,6 +276,11 @@ main.converter-shell {
 .surface-legend { left: 14px; bottom: 14px; border-color: #596268; background: rgba(37, 41, 43, .92); }
 .input-triangle-legend .source-triangle-edge {
   height: 6px; background: repeating-linear-gradient(135deg, #293940 0 2px, #9db9c5 2px 3px);
+}
+.navigation-hint {
+  position: absolute; right: 14px; bottom: 14px; z-index: 4; padding: 7px 9px;
+  color: #a1aaae; background: rgba(37, 41, 43, .82); border: 1px solid #535b5f;
+  border-radius: 6px; font: 500 8px "DM Mono"; pointer-events: none;
 }
 .processing { padding: 16px; background: linear-gradient(0deg, rgba(30,32,34,.45), transparent 58%); }
 .processing-card { border-color: #59656b; background: rgba(38,42,44,.94); }
@@ -318,4 +325,6 @@ main.converter-shell {
   .quick-metrics strong { margin: 0; }
   .quick-metrics small { display: none; }
   .advanced-settings-grid { grid-template-columns: 1fr; }
+  .projection-tabs button { min-width: 0; padding-inline: 7px; }
+  .navigation-hint { display: none; }
 }

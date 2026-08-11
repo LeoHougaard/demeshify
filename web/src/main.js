@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { ArcballControls } from "three/examples/jsm/controls/ArcballControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import {
   mergeVertices,
@@ -19,6 +19,7 @@ let selectedFeatureId = null;
 let undoStack = [];
 let redoStack = [];
 let editorBusy = false;
+let projectionMode = "perspective";
 
 const escapeHtml = (value) =>
   String(value ?? "")
@@ -246,13 +247,19 @@ app.innerHTML = `
     <section class="viewer-panel">
       <div class="visual-toolbar">
         <div><span class="visual-title">Model viewer</span><span id="previewSubtitle" class="visual-subtitle">Import an STL to begin</span></div>
-        <div id="viewTabs" class="view-tabs hidden"><button data-view="input">Input mesh</button><button class="active" data-view="output">STEP result</button></div>
+        <div class="viewer-actions">
+          <div id="projectionTabs" class="view-tabs projection-tabs" aria-label="Camera projection">
+            <button class="active" data-projection="perspective">Perspective</button><button data-projection="orthographic">Orthographic</button>
+          </div>
+          <div id="viewTabs" class="view-tabs hidden"><button data-view="input">Input mesh</button><button class="active" data-view="output">STEP result</button></div>
+        </div>
       </div>
       <div id="viewer" class="viewer">
         <div id="viewerEmpty" class="viewer-empty"><div class="empty-file">STL</div><strong>Import a model to inspect it</strong><p>Drag to orbit · scroll to zoom</p></div>
         <canvas id="inputCanvas"></canvas><canvas id="outputCanvas" class="hidden"></canvas>
         <div id="surfaceLegend" class="surface-legend hidden"><span><i class="fitted-edge"></i>Fitted surface boundary</span><span><i class="faceted-edge"></i>Fallback triangle edges</span><small id="surfaceLegendStatus"></small></div>
         <div id="inputTriangleLegend" class="surface-legend input-triangle-legend hidden"><span><i class="source-triangle-edge"></i>Every source STL triangle edge</span><small id="inputTriangleLegendStatus"></small></div>
+        <div class="navigation-hint">Right-drag rotate · Middle-drag pan · Wheel zoom · Double-click focus</div>
         <div id="processing" class="processing hidden">
           <div class="processing-card">
             <div class="processing-heading"><div class="scan-object"><span></span></div><div><small>CONVERTING</small><strong id="processingStage">Starting reconstruction</strong></div></div>
@@ -333,24 +340,97 @@ class MeshViewer {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.scene = new THREE.Scene();
     if (this.cadStyle) this.scene.background = new THREE.Color(0x303234);
-    this.camera = new THREE.PerspectiveCamera(38, 1, 0.01, 100000);
+    this.perspectiveCamera = new THREE.PerspectiveCamera(38, 1, 0.01, 100000);
+    this.orthographicCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 100000);
+    this.camera = this.perspectiveCamera;
+    this.canvas.dataset.projection = "perspective";
     this.camera.position.set(4, 3, 4);
-    this.controls = new OrbitControls(this.camera, canvas);
-    this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.07;
-    this.scene.add(
-      new THREE.HemisphereLight(0xffffff, 0x243044, this.cadStyle ? 1.65 : 2.2),
+    this.controls = new ArcballControls(this.camera, canvas, this.scene);
+    this.controls.setGizmosVisible(false);
+    this.controls.cursorZoom = true;
+    this.controls.enableAnimations = true;
+    this.controls.dampingFactor = 18;
+    // Match Onshape's desktop navigation instead of the Arcball defaults.
+    this.controls.unsetMouseAction(0);
+    this.controls.unsetMouseAction(0, "CTRL");
+    this.controls.unsetMouseAction(1);
+    this.controls.unsetMouseAction(2);
+    this.controls.setMouseAction("ROTATE", 2);
+    this.controls.setMouseAction("PAN", 1);
+    this.controls.setMouseAction("PAN", 2, "CTRL");
+    this.controls.setMouseAction("ZOOM", "WHEEL");
+
+    // Camera-relative studio lighting removes any fixed world-space top,
+    // bottom, floor, or shadow direction while preserving readable curvature.
+    this.scene.add(new THREE.AmbientLight(0xffffff, 1.45));
+    this.lightTarget = new THREE.Object3D();
+    this.keyLight = new THREE.DirectionalLight(0xffffff, 1.35);
+    this.fillLight = new THREE.DirectionalLight(0xaed6e7, 0.42);
+    this.keyLight.target = this.lightTarget;
+    this.fillLight.target = this.lightTarget;
+    this.scene.add(this.lightTarget, this.keyLight, this.fillLight);
+    this.controls.addEventListener("change", () => this.render());
+    this.resizeObserver = new ResizeObserver(() => this.render());
+    this.resizeObserver.observe(canvas.parentElement);
+  }
+
+  updateCameraFrustums(width, height) {
+    const aspect = width / Math.max(height, 1);
+    this.perspectiveCamera.aspect = aspect;
+    this.perspectiveCamera.updateProjectionMatrix();
+    const viewHeight = this.orthoViewHeight || 2;
+    this.orthographicCamera.left = -(viewHeight * aspect) / 2;
+    this.orthographicCamera.right = (viewHeight * aspect) / 2;
+    this.orthographicCamera.top = viewHeight / 2;
+    this.orthographicCamera.bottom = -viewHeight / 2;
+    this.orthographicCamera.updateProjectionMatrix();
+  }
+
+  setProjection(mode) {
+    const nextMode = mode === "orthographic" ? "orthographic" : "perspective";
+    if (
+      (nextMode === "orthographic" && this.camera === this.orthographicCamera) ||
+      (nextMode === "perspective" && this.camera === this.perspectiveCamera)
+    ) return;
+
+    const current = this.camera;
+    const target = this.controls.target.clone();
+    const direction = current.position.clone().sub(target).normalize();
+    let next;
+    if (nextMode === "orthographic") {
+      const distance = current.position.distanceTo(target);
+      this.orthoViewHeight =
+        (2 * distance * Math.tan(THREE.MathUtils.degToRad(current.fov / 2))) /
+        Math.max(current.zoom, 1e-6);
+      next = this.orthographicCamera;
+      next.position.copy(current.position);
+      next.up.copy(current.up);
+      next.near = current.near;
+      next.far = current.far;
+      next.zoom = 1;
+    } else {
+      const visibleHeight =
+        (current.top - current.bottom) / Math.max(current.zoom, 1e-6);
+      const distance =
+        visibleHeight /
+        (2 * Math.tan(THREE.MathUtils.degToRad(this.perspectiveCamera.fov / 2)));
+      next = this.perspectiveCamera;
+      next.position.copy(target).add(direction.multiplyScalar(distance));
+      next.up.copy(current.up);
+      next.near = current.near;
+      next.far = current.far;
+      next.zoom = 1;
+    }
+    this.camera = next;
+    this.canvas.dataset.projection = nextMode;
+    this.updateCameraFrustums(
+      this.canvas.parentElement.clientWidth,
+      this.canvas.parentElement.clientHeight,
     );
-    const key = new THREE.DirectionalLight(0xffffff, this.cadStyle ? 2.3 : 3.2);
-    key.position.set(3, 5, 4);
-    this.scene.add(key);
-    const rim = new THREE.DirectionalLight(
-      this.cadStyle ? 0xaad8eb : 0x4db7ff,
-      this.cadStyle ? 0.85 : 2,
-    );
-    rim.position.set(-4, 1, -3);
-    this.scene.add(rim);
-    this.animate();
+    this.controls.target.copy(target);
+    this.controls.setCamera(next);
+    this.controls.update();
+    this.render();
   }
 
   async load(buffer, { resetCamera = true } = {}) {
@@ -434,13 +514,30 @@ class MeshViewer {
     if (resetCamera || !hadMesh) {
       const size = box.getSize(new THREE.Vector3());
       const radius = Math.max(size.length() * 0.65, 1);
-      this.camera.near = radius / 1000;
-      this.camera.far = radius * 100;
-      this.camera.position.set(radius, radius * 0.72, radius);
-      this.camera.updateProjectionMatrix();
+      const cameraPosition = new THREE.Vector3(radius, radius * 0.72, radius);
+      const distance = cameraPosition.length();
+      this.orthoViewHeight =
+        2 * distance * Math.tan(THREE.MathUtils.degToRad(this.perspectiveCamera.fov / 2));
+      for (const camera of [this.perspectiveCamera, this.orthographicCamera]) {
+        camera.near = radius / 1000;
+        camera.far = radius * 100;
+        camera.position.copy(cameraPosition);
+        camera.up.set(0, 1, 0);
+        camera.zoom = 1;
+      }
+      this.camera = projectionMode === "orthographic"
+        ? this.orthographicCamera
+        : this.perspectiveCamera;
+      this.canvas.dataset.projection = projectionMode;
+      this.updateCameraFrustums(
+        this.canvas.parentElement.clientWidth,
+        this.canvas.parentElement.clientHeight,
+      );
       this.controls.target.set(0, 0, 0);
+      this.controls.setCamera(this.camera);
       this.controls.update();
     }
+    this.render();
   }
 
   clearSurfaceOverlay() {
@@ -546,6 +643,7 @@ class MeshViewer {
 
     this.surfaceOverlay = group;
     this.scene.add(group);
+    this.render();
     return { boundaryCount, triangleCount };
   }
 
@@ -553,20 +651,23 @@ class MeshViewer {
     const parent = this.canvas.parentElement;
     const width = parent.clientWidth;
     const height = parent.clientHeight;
-    if (this.canvas.width !== width || this.canvas.height !== height) {
+    if (this.viewportWidth !== width || this.viewportHeight !== height) {
+      this.viewportWidth = width;
+      this.viewportHeight = height;
       this.renderer.setSize(width, height, false);
-      this.camera.aspect = width / Math.max(height, 1);
-      this.camera.updateProjectionMatrix();
+      this.updateCameraFrustums(width, height);
     }
   }
 
-  animate() {
-    requestAnimationFrame(() => this.animate());
-    if (!this.canvas.classList.contains("hidden")) {
-      this.resize();
-      this.controls.update();
-      this.renderer.render(this.scene, this.camera);
-    }
+  render() {
+    this.resize();
+    this.lightTarget.position.copy(this.controls.target);
+    this.keyLight.position.copy(this.camera.position);
+    this.fillLight.position
+      .copy(this.controls.target)
+      .multiplyScalar(2)
+      .sub(this.camera.position);
+    this.renderer.render(this.scene, this.camera);
   }
 }
 
@@ -581,6 +682,7 @@ const outputCanvas = document.querySelector("#outputCanvas");
 const errorBox = document.querySelector("#errorBox");
 const baseWarnings = document.querySelector("#baseWarnings");
 const viewTabs = document.querySelector("#viewTabs");
+const projectionTabs = document.querySelector("#projectionTabs");
 const surfaceLegend = document.querySelector("#surfaceLegend");
 const surfaceLegendStatus = document.querySelector("#surfaceLegendStatus");
 const inputTriangleLegend = document.querySelector("#inputTriangleLegend");
@@ -1107,6 +1209,17 @@ fileInput.addEventListener("change", (event) => chooseFile(event.target.files[0]
   }),
 );
 dropzone.addEventListener("drop", (event) => chooseFile(event.dataTransfer.files[0]));
+
+projectionTabs.addEventListener("click", (event) => {
+  const tab = event.target.closest("button[data-projection]");
+  if (!tab) return;
+  projectionMode = tab.dataset.projection;
+  inputViewer?.setProjection(projectionMode);
+  outputViewer?.setProjection(projectionMode);
+  [...projectionTabs.children].forEach((item) =>
+    item.classList.toggle("active", item === tab),
+  );
+});
 
 viewTabs.addEventListener("click", (event) => {
   const tab = event.target.closest("button");
