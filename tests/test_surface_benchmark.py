@@ -124,6 +124,27 @@ def test_analytic_gate_allows_bspline_when_source_is_nonanalytic() -> None:
     assert metrics["unexpected_nonanalytic_surface_types"] == []
 
 
+def test_analytic_gate_allows_exact_swept_output_surfaces() -> None:
+    metrics = analytic_quality_metrics(
+        {
+            "face_counts": {"PLANE": 2, "CONE": 1},
+            "face_areas_mm2": {"PLANE": 20.0, "CONE": 10.0},
+            "edge_lengths_mm": {},
+        },
+        {
+            "face_counts": {"PLANE": 2, "CONE": 1, "EXTRUSION": 1},
+            "face_areas_mm2": {
+                "PLANE": 20.0,
+                "CONE": 10.0,
+                "EXTRUSION": 2.0,
+            },
+            "edge_lengths_mm": {},
+        },
+    )
+
+    assert metrics["unexpected_nonanalytic_surface_types"] == []
+
+
 def test_clean_analytic_gate_rejects_c0_and_faceted_fallbacks() -> None:
     metrics = {
         "minimum_analytic_area_recall": 1.0,

@@ -105,15 +105,24 @@ def analytic_quality_metrics(
     assert isinstance(output_edge_lengths, dict)
     source_circle_length = float(source_edge_lengths.get("CIRCLE", 0.0) or 0.0)
     output_circle_length = float(output_edge_lengths.get("CIRCLE", 0.0) or 0.0)
-    elementary_types = {"PLANE", *ANALYTIC_CURVED_TYPES}
+    # Exact swept surfaces are analytic CAD geometry too. OCCT may preserve a
+    # source profile sweep as EXTRUSION/REVOLUTION even when another STEP
+    # writer encoded the same support as a B-spline. Only generic residual
+    # surfaces should fail the representation-quality gate.
+    analytic_types = {
+        "PLANE",
+        "EXTRUSION",
+        "REVOLUTION",
+        *ANALYTIC_CURVED_TYPES,
+    }
     source_nonanalytic = {
         kind for kind, count in source_counts.items()
-        if kind not in elementary_types and int(count or 0) > 0
+        if kind not in analytic_types and int(count or 0) > 0
     }
     unexpected_nonanalytic = sorted(
         kind
         for kind, count in output_counts.items()
-        if kind not in elementary_types
+        if kind not in analytic_types
         and kind not in source_nonanalytic
         and int(count or 0) > 0
     )

@@ -112,6 +112,31 @@ def test_surface_graph_recognizes_conical_surface() -> None:
     _assert_complete_partition(graph, len(mesh.faces))
 
 
+def test_narrow_cone_sectors_do_not_collapse_to_cylinders(tmp_path: Path) -> None:
+    source = cq.Workplane(obj=cq.Solid.makeCone(10.0, 9.3, 2.0)).intersect(
+        cq.Workplane("XY").box(3.0, 24.0, 4.0, centered=(False, True, True))
+    )
+    stl_path = tmp_path / "narrow-cone-sectors.stl"
+    cq.exporters.export(
+        source,
+        str(stl_path),
+        tolerance=0.02,
+        angularTolerance=0.06,
+    )
+    data = load_mesh(stl_path, stl_path.name, "mm")
+
+    graph = detect_surface_graph(data)
+
+    expected_angle = math.atan2(0.7, 2.0)
+    assert len(graph.conical_patches) == 2
+    assert not graph.cylindrical_patches
+    assert all(
+        patch.semi_angle == pytest.approx(expected_angle, abs=math.radians(0.1))
+        for patch in graph.conical_patches
+    )
+    _assert_complete_partition(graph, len(data.mesh.faces))
+
+
 def test_surface_graph_recognizes_spherical_surface() -> None:
     mesh = trimesh.creation.icosphere(subdivisions=3, radius=5.0)
     mesh.apply_translation([2.5, -3.0, 7.0])

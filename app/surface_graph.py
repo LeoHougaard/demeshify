@@ -1266,6 +1266,208 @@ def _fit_sphere(
     )
 
 
+def _fit_partial_cone(
+    points: np.ndarray,
+    face_centers: np.ndarray,
+    normals: np.ndarray,
+    axis: np.ndarray,
+    distance_tolerance: float,
+    normal_tolerance_degrees: float,
+    diagonal: float,
+) -> _AnalyticFit | None:
+    """Fit a narrow cone sector without letting it collapse to a cylinder.
+
+    On a conical face, every surface normal has the same axial component:
+    ``abs(dot(normal, axis)) == sin(semi_angle)``.  A narrow angular sector
+    makes the normal covariance ill-conditioned, so an unconstrained point fit
+    can move the apex far away and converge to a near-cylinder.  Deriving the
+    angle from the normal field removes that ambiguity; the final all-node and
+    normal checks remain the acceptance gate.
+    """
+
+    initial_axial_normal = abs(float(np.mean(normals @ axis)))
+    maximum_axial_normal = math.sin(math.radians(87.0))
+    if not 0.01 <= initial_axial_normal < maximum_axial_normal:
+        return None
+    initial_tangent = initial_axial_normal / math.sqrt(
+        max(1.0 - initial_axial_normal**2, 1e-15)
+    )
+    first, second = _plane_basis(axis)
+    u = points @ first
+    v = points @ second
+    z = points @ axis
+    center_u, center_v = float(np.mean(u)), float(np.mean(v))
+    radii = np.hypot(u - center_u, v - center_v)
+    slope, intercept = np.polyfit(z, radii, 1)
+    initial_apex_z = float(
+        -intercept / slope
+        if abs(float(slope)) >= 1e-3
+        else np.mean(z) - np.mean(radii) / initial_tangent
+    )
+    sample_indices = np.linspace(
+        0,
+        len(points) - 1,
+        min(len(points), 2000),
+        dtype=int,
+    )
+    sample_u = u[sample_indices]
+    sample_v = v[sample_indices]
+    sample_z = z[sample_indices]
+    sample_points = points[sample_indices]
+    margin = max(diagonal, distance_tolerance * 20)
+
+    def fit_with_bounds(
+        radial_scale: float,
+        axial_scale: float,
+    ) -> _AnalyticFit | None:
+        def fixed_axis_residual(parameters: np.ndarray) -> np.ndarray:
+            candidate_u, candidate_v, apex_z = parameters
+            radial = np.hypot(sample_u - candidate_u, sample_v - candidate_v)
+            return radial - np.abs(sample_z - apex_z) * initial_tangent
+
+        lower = np.asarray(
+            [
+                float(np.min(u) - radial_scale * margin),
+                float(np.min(v) - radial_scale * margin),
+                float(np.min(z) - axial_scale * margin),
+            ]
+        )
+        upper = np.asarray(
+            [
+                float(np.max(u) + radial_scale * margin),
+                float(np.max(v) + radial_scale * margin),
+                float(np.max(z) + axial_scale * margin),
+            ]
+        )
+        seeded = least_squares(
+            fixed_axis_residual,
+            np.clip(
+                np.asarray([center_u, center_v, initial_apex_z]),
+                lower + 1e-12,
+                upper - 1e-12,
+            ),
+            bounds=(lower, upper),
+            loss="soft_l1",
+            f_scale=distance_tolerance,
+            max_nfev=180,
+        )
+        if not seeded.success:
+            return None
+        fitted_u, fitted_v, fitted_apex_z = seeded.x
+        seeded_apex = fitted_u * first + fitted_v * second + fitted_apex_z * axis
+        world_margin = 5 * margin
+        world_lower = np.r_[
+            np.min(points, axis=0) - world_margin,
+            [-1.0, -1.0, -1.0],
+        ]
+        world_upper = np.r_[
+            np.max(points, axis=0) + world_margin,
+            [1.0, 1.0, 1.0],
+        ]
+
+        def joint_residual(parameters: np.ndarray) -> np.ndarray:
+            candidate_apex = parameters[:3]
+            raw_axis = parameters[3:6]
+            axis_length = max(float(np.linalg.norm(raw_axis)), 1e-15)
+            candidate_axis = raw_axis / axis_length
+            candidate_axial_normal = min(
+                abs(float(np.mean(normals @ candidate_axis))),
+                maximum_axial_normal,
+            )
+            candidate_tangent = candidate_axial_normal / math.sqrt(
+                max(1.0 - candidate_axial_normal**2, 1e-15)
+            )
+            relative = sample_points - candidate_apex
+            axial = relative @ candidate_axis
+            radial = relative - np.outer(axial, candidate_axis)
+            surface_error = (
+                np.linalg.norm(radial, axis=1)
+                - np.abs(axial) * candidate_tangent
+            )
+            axial_variation = normals @ candidate_axis
+            axial_variation -= np.mean(axial_variation)
+            return np.r_[
+                surface_error,
+                axial_variation * distance_tolerance * 2.0,
+                (axis_length - 1.0) * distance_tolerance,
+            ]
+
+        joint = least_squares(
+            joint_residual,
+            np.clip(
+                np.r_[seeded_apex, axis],
+                world_lower + 1e-12,
+                world_upper - 1e-12,
+            ),
+            bounds=(world_lower, world_upper),
+            loss="soft_l1",
+            f_scale=distance_tolerance,
+            max_nfev=300,
+        )
+        if not joint.success:
+            return None
+        apex = np.asarray(joint.x[:3], dtype=float)
+        fitted_axis = _canonical_direction(joint.x[3:6])
+        axial_normal = min(
+            abs(float(np.mean(normals @ fitted_axis))),
+            maximum_axial_normal,
+        )
+        tangent = axial_normal / math.sqrt(
+            max(1.0 - axial_normal**2, 1e-15)
+        )
+        semi_angle = math.atan(tangent)
+        if not math.radians(0.5) <= semi_angle <= math.radians(87.0):
+            return None
+        relative = points - apex
+        axial = relative @ fitted_axis
+        radial = relative - np.outer(axial, fitted_axis)
+        errors = np.linalg.norm(radial, axis=1) - np.abs(axial) * tangent
+        rms_error, max_error = _fit_statistics(errors)
+        center_relative = face_centers - apex
+        center_axial = center_relative @ fitted_axis
+        center_radial = center_relative - np.outer(center_axial, fitted_axis)
+        radial_unit = center_radial / np.maximum(
+            np.linalg.norm(center_radial, axis=1)[:, None],
+            1e-15,
+        )
+        side = np.sign(center_axial)
+        expected = radial_unit - side[:, None] * tangent * fitted_axis
+        expected /= np.maximum(
+            np.linalg.norm(expected, axis=1)[:, None],
+            1e-15,
+        )
+        normal_error = _normal_error_degrees(normals, expected)
+        if (
+            rms_error > distance_tolerance
+            or max_error > distance_tolerance * 3
+            or normal_error > normal_tolerance_degrees
+        ):
+            return None
+        return _AnalyticFit(
+            kind="cone",
+            parameters={
+                "apex": apex,
+                "axis": fitted_axis,
+                "semi_angle": semi_angle,
+                "start": float(np.min(axial)),
+                "end": float(np.max(axial)),
+            },
+            rms_error=rms_error,
+            max_error=max_error,
+            normal_error_degrees=normal_error,
+            score=_fit_score(
+                rms_error,
+                max_error,
+                normal_error,
+                distance_tolerance,
+                normal_tolerance_degrees,
+                0.04,
+            ),
+        )
+
+    return fit_with_bounds(1.0, 5.0) or fit_with_bounds(5.0, 20.0)
+
+
 def _fit_cone(
     points: np.ndarray,
     face_centers: np.ndarray,
@@ -1282,13 +1484,19 @@ def _fit_cone(
     if (
         singular_values[0] <= 1e-12
         or singular_values[1] / singular_values[0] < 0.04
-        # Partial cones and chamfer sectors need not expose a perfectly
-        # one-dimensional normal nullspace. The subsequent all-node distance
-        # and face-normal checks are the authoritative acceptance gate.
-        or singular_values[2] / max(singular_values[1], 1e-12) > 0.30
     ):
         return None
     axis = _canonical_direction(vectors[-1])
+    if singular_values[2] / max(singular_values[1], 1e-12) > 0.30:
+        return _fit_partial_cone(
+            points,
+            face_centers,
+            normals,
+            axis,
+            distance_tolerance,
+            normal_tolerance_degrees,
+            diagonal,
+        )
     axial_normals = normals @ axis
     if abs(float(np.mean(axial_normals))) < 0.01:
         return None
@@ -5057,6 +5265,129 @@ def detect_surface_graph(
             extrusion_patches = [
                 patch for patch in extrusion_patches if patch.patch_id not in replaced_ids
             ]
+
+    # Planar slots can split one conical support into disconnected sectors, so
+    # the smooth-adjacency pass above never sees their combined normal span.
+    # Cluster only independently validated partial-cone alternatives, refit
+    # each cluster as a whole, then keep one trimmed face per original sector.
+    # The strict union fit prevents unrelated bores or bosses from merging.
+    partial_cone_candidates: list[
+        tuple[CylindricalPatch | ConicalPatch, _AnalyticFit]
+    ] = []
+    for patch in [*base_cylinders, *recognized["cone"]]:
+        if not isinstance(patch, (CylindricalPatch, ConicalPatch)):
+            continue
+        indices = np.asarray(patch.face_indices, dtype=np.int64)
+        if len(indices) < 8:
+            continue
+        normals = np.asarray(mesh.face_normals[indices], dtype=float)
+        centered = normals - np.mean(normals, axis=0)
+        _, singular_values, vectors = np.linalg.svd(
+            centered,
+            full_matrices=False,
+        )
+        if (
+            singular_values[1] <= 1e-12
+            or singular_values[2] / singular_values[1] <= 0.30
+        ):
+            continue
+        vertex_indices = np.unique(mesh.faces[indices])
+        alternative = _fit_partial_cone(
+            np.asarray(mesh.vertices[vertex_indices], dtype=float),
+            np.asarray(mesh.triangles_center[indices], dtype=float),
+            normals,
+            _canonical_direction(vectors[-1]),
+            tolerance,
+            normal_tolerance_degrees,
+            data.diagonal,
+        )
+        if alternative is not None:
+            partial_cone_candidates.append((patch, alternative))
+
+    if len(partial_cone_candidates) >= 2:
+        parent = list(range(len(partial_cone_candidates)))
+
+        def partial_root(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def partial_join(first: int, second: int) -> None:
+            first_root, second_root = partial_root(first), partial_root(second)
+            if first_root != second_root:
+                parent[second_root] = first_root
+
+        axis_limit = math.cos(math.radians(12.0))
+        apex_limit = data.diagonal * 0.22
+        for first in range(len(partial_cone_candidates)):
+            first_fit = partial_cone_candidates[first][1]
+            first_axis = np.asarray(first_fit.parameters["axis"], dtype=float)
+            first_apex = np.asarray(first_fit.parameters["apex"], dtype=float)
+            first_angle = float(first_fit.parameters["semi_angle"])
+            for second in range(first + 1, len(partial_cone_candidates)):
+                second_fit = partial_cone_candidates[second][1]
+                second_axis = np.asarray(second_fit.parameters["axis"], dtype=float)
+                second_apex = np.asarray(second_fit.parameters["apex"], dtype=float)
+                second_angle = float(second_fit.parameters["semi_angle"])
+                if abs(float(first_axis @ second_axis)) < axis_limit:
+                    continue
+                if abs(first_angle - second_angle) > math.radians(10.0):
+                    continue
+                if float(np.linalg.norm(first_apex - second_apex)) > apex_limit:
+                    continue
+                partial_join(first, second)
+
+        candidate_groups: dict[int, list[CylindricalPatch | ConicalPatch]] = {}
+        for index, (patch, _) in enumerate(partial_cone_candidates):
+            candidate_groups.setdefault(partial_root(index), []).append(patch)
+        replaced_partial_ids: set[str] = set()
+        replacement_cones: list[ConicalPatch] = []
+        next_cone_index = len(recognized["cone"]) + 1
+        for group in candidate_groups.values():
+            if len(group) < 2:
+                continue
+            combined_faces = np.unique(
+                np.concatenate([patch.face_indices for patch in group])
+            ).astype(np.int64)
+            fit = _fit_component(
+                data,
+                combined_faces,
+                tolerance,
+                normal_tolerance_degrees,
+                allowed_kinds=("cone",),
+            )
+            if (
+                fit is None
+                or fit.rms_error > tolerance * 0.25
+                or fit.max_error > tolerance * 0.5
+            ):
+                continue
+            for original in group:
+                cone = _make_analytic_patch(
+                    mesh,
+                    fit,
+                    original.face_indices,
+                    next_cone_index,
+                )
+                if not isinstance(cone, ConicalPatch):
+                    continue
+                replacement_cones.append(cone)
+                face_patch_ids[cone.face_indices] = cone.patch_id
+                replaced_partial_ids.add(original.patch_id)
+                next_cone_index += 1
+        if replaced_partial_ids:
+            base_cylinders = [
+                patch
+                for patch in base_cylinders
+                if patch.patch_id not in replaced_partial_ids
+            ]
+            recognized["cone"] = [
+                patch
+                for patch in recognized["cone"]
+                if patch.patch_id not in replaced_partial_ids
+            ]
+            recognized["cone"].extend(replacement_cones)
 
     _rebalance_tangent_cylinder_torus_boundaries(
         mesh,
