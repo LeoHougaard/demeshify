@@ -12,6 +12,7 @@ import trimesh
 from app.mesh import load_mesh
 from app.surface_graph import (
     PlanarPatch,
+    _edge_chains,
     _regularize_plane_relations,
     detect_surface_graph,
 )
@@ -29,6 +30,29 @@ def _assert_complete_partition(graph: object, face_count: int) -> None:
     assert len(assigned) == face_count
     assert np.array_equal(np.sort(assigned), np.arange(face_count))
     assert len(set(graph.face_patch_ids)) == len(graph.patches)
+
+
+def test_edge_chains_split_self_touching_cycles_at_repeated_vertices() -> None:
+    edges = np.asarray(
+        [
+            (0, 1),
+            (1, 2),
+            (2, 0),
+            (0, 3),
+            (3, 4),
+            (4, 0),
+        ],
+        dtype=np.int64,
+    )
+
+    chains = _edge_chains(edges)
+
+    assert len(chains) == 2
+    assert {frozenset(chain[:-1]) for chain in chains} == {
+        frozenset((0, 1, 2)),
+        frozenset((0, 3, 4)),
+    }
+    assert all(chain[0] == chain[-1] for chain in chains)
 
 
 def test_surface_graph_recognizes_box_planes_and_shared_boundaries() -> None:

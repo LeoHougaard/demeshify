@@ -26,6 +26,31 @@ def test_classify_topology_and_deviation_failure() -> None:
     assert "analytic_trim_failure" in categories
 
 
+def test_classify_faceted_fallback_as_representation_failure() -> None:
+    categories = classify_failure(
+        {
+            "status": "complete",
+            "closed": True,
+            "free_edge_count": 0,
+            "valid_brep": True,
+            "valid_solid": True,
+            "step_roundtrip_valid": True,
+            "faceted_fallback": True,
+            "source_mesh_fallback": True,
+            "clean_analytic": False,
+            "minimum_analytic_area_recall": 0.2,
+            "minimum_analytic_area_precision": 0.4,
+            "missing_analytic_surface_types": ["CYLINDER"],
+        }
+    )
+
+    assert "faceted_surface_fallback" in categories
+    assert "global_source_mesh_fallback" in categories
+    assert "unclean_analytic_representation" in categories
+    assert "missing_analytic_surface_types" in categories
+    assert "analytic_area_recall" in categories
+
+
 def test_analyzer_records_each_failed_case(tmp_path) -> None:
     source = tmp_path / "benchmark.json"
     source.write_text(

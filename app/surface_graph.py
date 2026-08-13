@@ -328,7 +328,32 @@ def _edge_chains(edges: np.ndarray) -> list[np.ndarray]:
                 break
         if len(chain) >= 2:
             chains.append(np.asarray(chain, dtype=np.int64))
-    return chains
+    simple_chains: list[np.ndarray] = []
+    pending = chains
+    while pending:
+        chain = pending.pop()
+        positions: dict[int, int] = {}
+        split: tuple[int, int] | None = None
+        for index, raw_vertex in enumerate(chain):
+            vertex = int(raw_vertex)
+            previous = positions.get(vertex)
+            if previous is not None and not (
+                previous == 0 and index == len(chain) - 1
+            ):
+                split = (previous, index)
+                break
+            positions[vertex] = index
+        if split is None:
+            simple_chains.append(chain)
+            continue
+        first, second = split
+        cycle = chain[first : second + 1]
+        remainder = np.r_[chain[: first + 1], chain[second + 1 :]]
+        if len(cycle) >= 3:
+            pending.append(cycle)
+        if len(remainder) >= 2:
+            pending.append(remainder)
+    return simple_chains
 
 
 def _boundary_loops(mesh: object, face_indices: np.ndarray) -> list[np.ndarray]:
@@ -488,7 +513,10 @@ def _fit_linear_extrusion_patch(
     """Recognize a general profile translated along a constant direction."""
 
     normals = np.asarray(mesh.face_normals[face_indices], dtype=float)
-    if len(normals) < 8:
+    # Three quadrilateral strips (six triangles) are the smallest profile run
+    # that supplies two consistent local circumcircles. Shorter runs remain
+    # underdetermined and are left in their original representation.
+    if len(normals) < 6:
         return None
     _, singular_values, directions = np.linalg.svd(normals, full_matrices=False)
     if singular_values[1] <= 1e-12:
@@ -713,6 +741,107 @@ def _circular_extrusion_axis(
         return None
     origin = center_x * first + center_y * second
     return _canonical_direction(patch.direction), origin, radius
+
+
+def _validated_seeded_cylinder_fit(
+    mesh: object,
+    face_indices: np.ndarray,
+    axis: np.ndarray,
+    origin: np.ndarray,
+    radius: float,
+    distance_tolerance: float,
+    normal_tolerance_degrees: float,
+) -> _AnalyticFit | None:
+    """Validate a known circular profile without requiring broad angular support.
+
+    A short CAD arc may contain too little normal variation for the generic
+    cylinder least-squares seed. Its profile still determines an exact circle.
+    Accept that stronger seed only when every mesh node and face normal agrees
+    with the resulting cylinder.
+    """
+
+    indices = np.asarray(face_indices, dtype=np.int64)
+    if len(indices) < 6:
+        return None
+    axis = _canonical_direction(np.asarray(axis, dtype=float))
+    origin = np.asarray(origin, dtype=float)
+    vertex_indices = np.unique(mesh.faces[indices])
+    if len(vertex_indices) < 8 or radius <= distance_tolerance:
+        return None
+    points = np.asarray(mesh.vertices[vertex_indices], dtype=float)
+    relative = points - origin
+    axial = relative @ axis
+    radial = relative - np.outer(axial, axis)
+    errors = np.abs(np.linalg.norm(radial, axis=1) - radius)
+    rms_error, max_error = _fit_statistics(errors)
+    if rms_error > distance_tolerance or max_error > distance_tolerance * 3:
+        return None
+
+    centers = np.asarray(mesh.triangles_center[indices], dtype=float)
+    center_relative = centers - origin
+    center_axial = center_relative @ axis
+    expected = center_relative - np.outer(center_axial, axis)
+    lengths = np.linalg.norm(expected, axis=1)
+    if np.any(lengths <= 1e-12):
+        return None
+    expected /= lengths[:, None]
+    normals = np.asarray(mesh.face_normals[indices], dtype=float)
+    normal_error = _normal_error_degrees(normals, expected)
+    if normal_error > normal_tolerance_degrees:
+        return None
+    start, end = float(np.min(axial)), float(np.max(axial))
+    if end - start <= distance_tolerance * 2:
+        return None
+    axis_origin = origin + start * axis
+    return _AnalyticFit(
+        kind="cylinder",
+        parameters={
+            "origin": axis_origin,
+            "axis": axis,
+            "radius": float(radius),
+            "start": 0.0,
+            "end": end - start,
+        },
+        rms_error=rms_error,
+        max_error=max_error,
+        normal_error_degrees=normal_error,
+        score=_fit_score(
+            rms_error,
+            max_error,
+            normal_error,
+            distance_tolerance,
+            normal_tolerance_degrees,
+            0.02,
+        ),
+    )
+
+
+def _circular_extrusion_cylinder(
+    patch: LinearExtrusionPatch,
+    mesh: object,
+    distance_tolerance: float,
+    normal_tolerance_degrees: float,
+    index: int,
+) -> CylindricalPatch | None:
+    """Promote an entirely circular linear extrusion to an elementary cylinder."""
+
+    candidate = _circular_extrusion_axis(patch, distance_tolerance)
+    if candidate is None:
+        return None
+    axis, origin, radius = candidate
+    fit = _validated_seeded_cylinder_fit(
+        mesh,
+        patch.face_indices,
+        axis,
+        origin,
+        radius,
+        distance_tolerance,
+        normal_tolerance_degrees,
+    )
+    if fit is None:
+        return None
+    cylinder = _make_analytic_patch(mesh, fit, patch.face_indices, index)
+    return cylinder if isinstance(cylinder, CylindricalPatch) else None
 
 
 def _constant_radius_revolution_cylinder(
@@ -2322,7 +2451,14 @@ def _extrusion_profile_cylinder_regions(
     """Recover circular profile runs hidden inside a general extrusion."""
 
     profile = np.asarray(patch.profile_points, dtype=float)
-    if len(profile) < 10:
+    if len(profile) > 1:
+        keep = np.r_[
+            True,
+            np.linalg.norm(np.diff(profile, axis=0), axis=1)
+            > max(distance_tolerance * 0.01, 1e-10),
+        ]
+        profile = profile[keep]
+    if len(profile) < 4:
         return []
     first, second = _plane_basis(patch.direction)
     coordinates = np.column_stack((profile @ first, profile @ second))
@@ -2370,7 +2506,11 @@ def _extrusion_profile_cylinder_regions(
     mesh = data.mesh
     candidates: list[tuple[float, _AnalyticFit, np.ndarray]] = []
     for run in runs:
-        if len(run) < 6:
+        # Three adjacent profile chords provide four distinct circular nodes.
+        # Two consistent local circumcircles are therefore sufficient to seed
+        # a short CAD arc; the all-node and all-normal validation below is the
+        # actual acceptance gate.
+        if len(run) < 2:
             continue
         centers = np.asarray([item[1] for item in run], dtype=float)
         radii = np.asarray([item[2] for item in run], dtype=float)
@@ -2412,7 +2552,7 @@ def _extrusion_profile_cylinder_regions(
         available = np.zeros(len(mesh.faces), dtype=bool)
         available[inliers] = True
         for component in _smooth_components(mesh, available, 30.0):
-            if len(component) < 8:
+            if len(component) < 6:
                 continue
             refined = _fit_component(
                 data,
@@ -2421,6 +2561,16 @@ def _extrusion_profile_cylinder_regions(
                 normal_tolerance_degrees,
                 allowed_kinds=("cylinder",),
             )
+            if refined is None:
+                refined = _validated_seeded_cylinder_fit(
+                    mesh,
+                    component,
+                    patch.direction,
+                    origin,
+                    radius,
+                    distance_tolerance,
+                    normal_tolerance_degrees,
+                )
             if refined is None:
                 continue
             area = float(np.sum(mesh.area_faces[component]))
@@ -3279,6 +3429,378 @@ def _absorb_cylindrical_chord_fragments(
     planar_patches[:] = retained
 
 
+def _absorb_tangent_planar_slivers(
+    mesh: object,
+    planar_patches: list[PlanarPatch],
+    freeform_patches: list[FreeformPatch],
+    face_patch_ids: np.ndarray,
+    distance_tolerance: float,
+    normal_tolerance_degrees: float,
+) -> None:
+    """Return microscopic tangent triangles to a smooth residual chart.
+
+    A triangle is mathematically planar in isolation, so the primitive pass
+    can peel a single tessellation cell out of an otherwise smooth transition.
+    Absorb only source-scale slivers whose shared-edge normals are tangent and
+    whose union remains a single-valued graph. Real chamfers, caps, folds, and
+    small planar features therefore keep their own support.
+    """
+
+    if not planar_patches or not freeform_patches:
+        return
+    freeforms_by_id = {patch.patch_id: patch for patch in freeform_patches}
+    adjacency: dict[str, dict[str, list[float]]] = {}
+    normals = np.asarray(mesh.face_normals, dtype=float)
+    for raw_first, raw_second in np.asarray(mesh.face_adjacency, dtype=np.int64):
+        first, second = int(raw_first), int(raw_second)
+        first_id = str(face_patch_ids[first])
+        second_id = str(face_patch_ids[second])
+        if first_id == second_id:
+            continue
+        angle = math.degrees(
+            math.acos(
+                float(
+                    np.clip(
+                        abs(float(normals[first] @ normals[second])),
+                        -1.0,
+                        1.0,
+                    )
+                )
+            )
+        )
+        adjacency.setdefault(first_id, {}).setdefault(second_id, []).append(angle)
+        adjacency.setdefault(second_id, {}).setdefault(first_id, []).append(angle)
+
+    area_limit = max((distance_tolerance * 10) ** 2, 1e-14)
+    angle_limit = min(normal_tolerance_degrees, 5.0)
+    retained: list[PlanarPatch] = []
+    for plane in planar_patches:
+        if len(plane.face_indices) > 2 or plane.area > area_limit:
+            retained.append(plane)
+            continue
+        candidates = [
+            (max(angles), freeforms_by_id[patch_id])
+            for patch_id, angles in adjacency.get(plane.patch_id, {}).items()
+            if patch_id in freeforms_by_id and angles and max(angles) <= angle_limit
+        ]
+        if not candidates:
+            retained.append(plane)
+            continue
+        # When both sides are smooth enough, perturb the larger chart. This
+        # keeps a microscopic connector from materially changing the PCA frame
+        # and parameter boundary of a small transition sheet.
+        _, target = min(candidates, key=lambda item: (-item[1].area, item[0]))
+        combined = np.unique(
+            np.r_[target.face_indices, plane.face_indices]
+        ).astype(np.int64)
+        vertices = np.unique(mesh.faces[combined])
+        points = np.asarray(mesh.vertices[vertices], dtype=float)
+        try:
+            _, _, basis = np.linalg.svd(
+                points - np.mean(points, axis=0),
+                full_matrices=False,
+            )
+        except np.linalg.LinAlgError:
+            retained.append(plane)
+            continue
+        coordinates = (points - np.mean(points, axis=0)) @ basis[:2].T
+        local = np.full(len(mesh.vertices), -1, dtype=np.int64)
+        local[vertices] = np.arange(len(vertices), dtype=np.int64)
+        triangles = coordinates[local[np.asarray(mesh.faces[combined], dtype=np.int64)]]
+        signed_area = (
+            (triangles[:, 1, 0] - triangles[:, 0, 0])
+            * (triangles[:, 2, 1] - triangles[:, 0, 1])
+            - (triangles[:, 1, 1] - triangles[:, 0, 1])
+            * (triangles[:, 2, 0] - triangles[:, 0, 0])
+        )
+        area_floor = max(float(np.prod(np.ptp(coordinates, axis=0))) * 1e-14, 1e-14)
+        if not (
+            np.all(signed_area > area_floor)
+            or np.all(signed_area < -area_floor)
+        ):
+            retained.append(plane)
+            continue
+        target.face_indices = combined
+        target.vertex_indices = vertices
+        target.area = float(np.sum(mesh.area_faces[combined]))
+        target.boundary_loops = _boundary_loops(mesh, combined)
+        face_patch_ids[plane.face_indices] = target.patch_id
+    planar_patches[:] = retained
+
+
+def _recover_cylinders_from_planar_strips(
+    data: MeshData,
+    planar_patches: list[PlanarPatch],
+    face_patch_ids: np.ndarray,
+    distance_tolerance: float,
+    normal_tolerance_degrees: float,
+    first_index: int,
+) -> list[CylindricalPatch]:
+    """Recover short circular arcs split into narrow planar STL strips.
+
+    Planarity is evaluated before sweep semantics, so a coarsely tessellated
+    extrusion can arrive here as a chain of exact quadrilateral planes. Group
+    only adjacent tiny planes, infer their common translation, then recover
+    circular profile runs. Straight and arbitrary polygonal runs remain planes;
+    a cylinder is emitted only after exact node and normal validation.
+    """
+
+    tiny = {
+        patch.patch_id: patch
+        for patch in planar_patches
+        if len(patch.face_indices) <= 4
+    }
+    if len(tiny) < 3:
+        return []
+    parent = {patch_id: patch_id for patch_id in tiny}
+
+    def root(patch_id: str) -> str:
+        while parent[patch_id] != patch_id:
+            parent[patch_id] = parent[parent[patch_id]]
+            patch_id = parent[patch_id]
+        return patch_id
+
+    def join(first: str, second: str) -> None:
+        first_root, second_root = root(first), root(second)
+        if first_root != second_root:
+            parent[second_root] = first_root
+
+    mesh = data.mesh
+    for first_face, second_face in np.asarray(mesh.face_adjacency, dtype=np.int64):
+        first_id = str(face_patch_ids[int(first_face)])
+        second_id = str(face_patch_ids[int(second_face)])
+        if first_id in tiny and second_id in tiny:
+            join(first_id, second_id)
+
+    groups: dict[str, list[PlanarPatch]] = {}
+    for patch_id, patch in tiny.items():
+        groups.setdefault(root(patch_id), []).append(patch)
+
+    detected: list[tuple[_AnalyticFit, np.ndarray]] = []
+    for group in groups.values():
+        if len(group) < 3:
+            continue
+        faces = np.unique(
+            np.concatenate([patch.face_indices for patch in group])
+        ).astype(np.int64)
+        extrusion = _fit_linear_extrusion_patch(
+            mesh,
+            faces,
+            distance_tolerance,
+            normal_tolerance_degrees,
+            0,
+        )
+        if extrusion is None:
+            continue
+        detected.extend(
+            _extrusion_profile_cylinder_regions(
+                data,
+                extrusion,
+                distance_tolerance,
+                normal_tolerance_degrees,
+            )
+        )
+    if not detected:
+        return []
+
+    claimed: set[int] = set()
+    cylinders: list[CylindricalPatch] = []
+    for fit, component in sorted(
+        detected,
+        key=lambda item: -float(np.sum(mesh.area_faces[item[1]])),
+    ):
+        if any(int(face) in claimed for face in component):
+            continue
+        cylinder = _make_analytic_patch(
+            mesh,
+            fit,
+            component,
+            first_index + len(cylinders),
+        )
+        if not isinstance(cylinder, CylindricalPatch):
+            continue
+        cylinders.append(cylinder)
+        claimed.update(int(face) for face in component)
+        face_patch_ids[component] = cylinder.patch_id
+
+    if not claimed:
+        return []
+    retained: list[PlanarPatch] = []
+    for plane in planar_patches:
+        remaining = np.asarray(
+            [face for face in plane.face_indices if int(face) not in claimed],
+            dtype=np.int64,
+        )
+        if len(remaining) == 0:
+            continue
+        if len(remaining) != len(plane.face_indices):
+            plane.face_indices = remaining
+            plane.vertex_indices = np.unique(mesh.faces[remaining])
+            plane.area = float(np.sum(mesh.area_faces[remaining]))
+            _refresh_planar_patch_geometry(mesh, plane)
+        retained.append(plane)
+    planar_patches[:] = retained
+    return cylinders
+
+
+def _rebalance_tangent_cylinder_torus_boundaries(
+    mesh: object,
+    cylindrical_patches: list[CylindricalPatch],
+    toroidal_patches: list[ToroidalPatch],
+    face_patch_ids: np.ndarray,
+    distance_tolerance: float,
+    normal_tolerance_degrees: float,
+) -> None:
+    """Give ambiguous tangent rows to the analytic support they fit best."""
+
+    if not cylindrical_patches or not toroidal_patches:
+        return
+    adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    neighbors: list[list[int]] = [[] for _ in range(len(mesh.faces))]
+    adjacent_ids: set[tuple[str, str]] = set()
+    for raw_first, raw_second in adjacency:
+        first, second = int(raw_first), int(raw_second)
+        neighbors[first].append(second)
+        neighbors[second].append(first)
+        first_id, second_id = str(face_patch_ids[first]), str(face_patch_ids[second])
+        if first_id != second_id:
+            adjacent_ids.add((first_id, second_id))
+            adjacent_ids.add((second_id, first_id))
+
+    strict_error = max(distance_tolerance * 0.1, 1e-8)
+    for cylinder in cylindrical_patches:
+        for torus in toroidal_patches:
+            if (cylinder.patch_id, torus.patch_id) not in adjacent_ids:
+                continue
+            if abs(float(cylinder.axis @ torus.axis)) < math.cos(math.radians(0.5)):
+                continue
+            center_relative = torus.center - cylinder.origin
+            center_radial = center_relative - cylinder.axis * float(
+                center_relative @ cylinder.axis
+            )
+            tangent_radii = (
+                torus.major_radius - torus.minor_radius,
+                torus.major_radius + torus.minor_radius,
+            )
+            if (
+                float(np.linalg.norm(center_radial)) > distance_tolerance * 2
+                or min(abs(cylinder.radius - value) for value in tangent_radii)
+                > distance_tolerance * 2
+            ):
+                continue
+
+            faces = np.asarray(cylinder.face_indices, dtype=np.int64)
+            points = np.asarray(mesh.vertices[mesh.faces[faces]], dtype=float)
+            cylinder_relative = points - cylinder.origin
+            cylinder_axial = np.einsum(
+                "fvi,i->fv",
+                cylinder_relative,
+                cylinder.axis,
+            )
+            cylinder_radial = (
+                cylinder_relative
+                - cylinder_axial[:, :, None] * cylinder.axis
+            )
+            cylinder_error = np.max(
+                np.abs(np.linalg.norm(cylinder_radial, axis=2) - cylinder.radius),
+                axis=1,
+            )
+            torus_relative = points - torus.center
+            torus_axial = np.einsum("fvi,i->fv", torus_relative, torus.axis)
+            torus_radial = (
+                torus_relative - torus_axial[:, :, None] * torus.axis
+            )
+            torus_error = np.max(
+                np.abs(
+                    np.hypot(
+                        np.linalg.norm(torus_radial, axis=2) - torus.major_radius,
+                        torus_axial,
+                    )
+                    - torus.minor_radius
+                ),
+                axis=1,
+            )
+            candidate_faces = set(
+                int(face)
+                for face, cylinder_value, torus_value in zip(
+                    faces,
+                    cylinder_error,
+                    torus_error,
+                    strict=True,
+                )
+                if torus_value <= strict_error
+                and torus_value * 4 < max(cylinder_value, 1e-12)
+            )
+            if not candidate_faces:
+                continue
+
+            torus_faces = set(int(face) for face in torus.face_indices)
+            frontier = [
+                face
+                for face in candidate_faces
+                if any(neighbor in torus_faces for neighbor in neighbors[face])
+            ]
+            moved: set[int] = set(frontier)
+            while frontier:
+                face = frontier.pop()
+                for neighbor in neighbors[face]:
+                    if neighbor in candidate_faces and neighbor not in moved:
+                        moved.add(neighbor)
+                        frontier.append(neighbor)
+            if not moved:
+                continue
+            moved_indices = np.asarray(sorted(moved), dtype=np.int64)
+            # The residual gate uses nodes; independently require the face
+            # normals to agree with the torus before changing ownership.
+            torus_fit = _AnalyticFit(
+                kind="torus",
+                parameters={
+                    "center": torus.center,
+                    "axis": torus.axis,
+                    "major_radius": torus.major_radius,
+                    "minor_radius": torus.minor_radius,
+                },
+                rms_error=torus.rms_error,
+                max_error=torus.max_error,
+                normal_error_degrees=torus.normal_error_degrees,
+                score=0.0,
+            )
+            confirmed = set(
+                int(face)
+                for face in _analytic_inlier_faces(
+                    torus_fit,
+                    mesh,
+                    moved_indices,
+                    distance_tolerance,
+                    normal_tolerance_degrees,
+                )
+            )
+            moved = {face for face in moved if face in confirmed}
+            if not moved:
+                continue
+            moved_indices = np.asarray(sorted(moved), dtype=np.int64)
+            cylinder.face_indices = np.asarray(
+                [face for face in cylinder.face_indices if int(face) not in moved],
+                dtype=np.int64,
+            )
+            cylinder.vertex_indices = np.unique(mesh.faces[cylinder.face_indices])
+            cylinder.area = float(np.sum(mesh.area_faces[cylinder.face_indices]))
+            cylinder.boundary_loops = _boundary_loops(mesh, cylinder.face_indices)
+            cylinder_points = np.asarray(
+                mesh.vertices[cylinder.vertex_indices],
+                dtype=float,
+            )
+            axial = (cylinder_points - cylinder.origin) @ cylinder.axis
+            cylinder.start, cylinder.end = float(np.min(axial)), float(np.max(axial))
+            torus.face_indices = np.unique(
+                np.r_[torus.face_indices, moved_indices]
+            ).astype(np.int64)
+            torus.vertex_indices = np.unique(mesh.faces[torus.face_indices])
+            torus.area = float(np.sum(mesh.area_faces[torus.face_indices]))
+            torus.boundary_loops = _boundary_loops(mesh, torus.face_indices)
+            face_patch_ids[moved_indices] = torus.patch_id
+
+
 def _build_adjacency(
     mesh: object,
     face_patch_ids: np.ndarray,
@@ -3399,7 +3921,7 @@ def detect_surface_graph(
     )
     cache = getattr(data, "section_cache", None)
     cache_key = (
-        "surface-graph-v43:"
+        "surface-graph-v47:"
         f"{tolerance:.12g}:"
         f"{normal_tolerance_degrees:.8g}:"
         f"{smooth_angle_degrees:.8g}:"
@@ -4339,6 +4861,109 @@ def detect_surface_graph(
         freeform_patches.append(patch)
         face_patch_ids[face_indices] = patch.patch_id
 
+    # Earlier primitive growth and tangent-chain splitting can leave a
+    # residual that becomes a clean linear extrusion only after its final face
+    # ownership is known. Refit those final connected regions before freezing
+    # them as freeform; the fit itself verifies normal alignment and every
+    # reduced node against the recovered profile.
+    if freeform_patches:
+        retained_freeforms: list[FreeformPatch] = []
+        next_extrusion_index = (
+            max(
+                (
+                    int(patch.patch_id.rsplit("-", 1)[-1])
+                    for patch in extrusion_patches
+                    if patch.patch_id.rsplit("-", 1)[-1].isdigit()
+                ),
+                default=0,
+            )
+            + 1
+        )
+        for residual in freeform_patches:
+            extrusion = _fit_linear_extrusion_patch(
+                mesh,
+                residual.face_indices,
+                tolerance,
+                normal_tolerance_degrees,
+                next_extrusion_index,
+            )
+            if extrusion is None:
+                retained_freeforms.append(residual)
+                continue
+            extrusion_patches.append(extrusion)
+            face_patch_ids[extrusion.face_indices] = extrusion.patch_id
+            next_extrusion_index += 1
+        freeform_patches = retained_freeforms
+        for index, patch in enumerate(freeform_patches, start=1):
+            patch.patch_id = f"freeform-{index:03d}"
+            face_patch_ids[patch.face_indices] = patch.patch_id
+
+    # A very small torus major radius is a common numerical degeneracy when a
+    # short conical band is fit from local revolution samples. Prefer the
+    # simpler cone only when a full independent cone refit validates the same
+    # nodes and normals; genuine ring and spindle tori are otherwise retained.
+    retained_tori: list[SurfacePatch] = []
+    for patch in recognized["torus"]:
+        if not isinstance(patch, ToroidalPatch) or (
+            patch.major_radius >= patch.minor_radius * 0.1
+        ):
+            retained_tori.append(patch)
+            continue
+        cone_fit = _fit_component(
+            data,
+            patch.face_indices,
+            tolerance,
+            normal_tolerance_degrees,
+            allowed_kinds=("cone",),
+        )
+        if cone_fit is None:
+            retained_tori.append(patch)
+            continue
+        cone = _make_analytic_patch(
+            mesh,
+            cone_fit,
+            patch.face_indices,
+            len(recognized["cone"]) + 1,
+        )
+        recognized["cone"].append(cone)
+        face_patch_ids[cone.face_indices] = cone.patch_id
+    recognized["torus"] = retained_tori
+
+    # Circular profiles are elementary cylinders, even when they were found
+    # only by the late extrusion recovery above. Promote them before the final
+    # chord pass so neighboring planar tessellation strips can join the same
+    # analytic support.
+    if extrusion_patches:
+        retained_extrusions: list[LinearExtrusionPatch] = []
+        for extrusion in extrusion_patches:
+            cylinder = _circular_extrusion_cylinder(
+                extrusion,
+                mesh,
+                tolerance,
+                normal_tolerance_degrees,
+                len(base_cylinders) + 1,
+            )
+            if cylinder is None:
+                retained_extrusions.append(extrusion)
+                continue
+            base_cylinders.append(cylinder)
+            face_patch_ids[cylinder.face_indices] = cylinder.patch_id
+        extrusion_patches = retained_extrusions
+
+    # Some short circular profile arcs are tessellated as only three planar
+    # strips and never create an extrusion candidate on their own. Recover them
+    # from connected strip networks with the same circular-profile validator.
+    base_cylinders.extend(
+        _recover_cylinders_from_planar_strips(
+            data,
+            planar_patches,
+            face_patch_ids,
+            tolerance,
+            normal_tolerance_degrees,
+            len(base_cylinders) + 1,
+        )
+    )
+
     # A partial cone can be split by local consensus into several oblique
     # cylinders and short general extrusions. Recombine a smooth connected
     # group when its union passes a stricter cone fit than the ordinary
@@ -4433,6 +5058,18 @@ def detect_surface_graph(
                 patch for patch in extrusion_patches if patch.patch_id not in replaced_ids
             ]
 
+    _rebalance_tangent_cylinder_torus_boundaries(
+        mesh,
+        base_cylinders,
+        [
+            patch
+            for patch in recognized["torus"]
+            if isinstance(patch, ToroidalPatch)
+        ],
+        face_patch_ids,
+        tolerance,
+        normal_tolerance_degrees,
+    )
     _absorb_cylindrical_chord_fragments(
         mesh,
         planar_patches,
@@ -4441,6 +5078,20 @@ def detect_surface_graph(
         tolerance,
         normal_tolerance_degrees,
     )
+    _absorb_tangent_planar_slivers(
+        mesh,
+        planar_patches,
+        freeform_patches,
+        face_patch_ids,
+        tolerance,
+        normal_tolerance_degrees,
+    )
+    # Late primitive promotion changes the ownership on both sides of every
+    # new interface. Refresh residual boundaries after all such moves so an
+    # embedded planar island becomes an explicit hole instead of disappearing
+    # from the surrounding smooth chart's trim topology.
+    for patch in freeform_patches:
+        patch.boundary_loops = _boundary_loops(mesh, patch.face_indices)
     analytic_patches: list[SurfacePatch] = [
         *planar_patches,
         *base_cylinders,

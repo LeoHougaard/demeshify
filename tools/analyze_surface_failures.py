@@ -42,6 +42,20 @@ def classify_failure(result: dict[str, Any]) -> list[str]:
         categories.append("residual_bspline")
     if "p-curve" in warnings or "pcurve" in warnings:
         categories.append("pcurve_failure")
+    if result.get("faceted_fallback"):
+        categories.append("faceted_surface_fallback")
+    if result.get("source_mesh_fallback"):
+        categories.append("global_source_mesh_fallback")
+    if result.get("clean_analytic") is False:
+        categories.append("unclean_analytic_representation")
+    if result.get("missing_analytic_surface_types"):
+        categories.append("missing_analytic_surface_types")
+    recall = result.get("minimum_analytic_area_recall")
+    if isinstance(recall, (int, float)) and recall < 0.95:
+        categories.append("analytic_area_recall")
+    precision = result.get("minimum_analytic_area_precision")
+    if isinstance(precision, (int, float)) and precision < 0.95:
+        categories.append("analytic_area_precision")
     return list(dict.fromkeys(categories or ["acceptance_gate_only"]))
 
 
@@ -69,6 +83,10 @@ def analyze_results(
                 "free_edge_count": result.get("free_edge_count"),
                 "p95_mm": result.get("p95_mm"),
                 "p95_limit_mm": result.get("p95_limit_mm"),
+                "faceted_face_count": result.get("faceted_face_count"),
+                "minimum_analytic_area_recall": result.get(
+                    "minimum_analytic_area_recall"
+                ),
                 "error": result.get("error"),
                 "warnings": result.get("warnings", []),
             }
@@ -118,19 +136,21 @@ def markdown_report(analysis: dict[str, Any]) -> str:
             "",
             "## Individual failures",
             "",
-            "| Benchmark | Case | Family | Categories | Free edges | P95 / limit (mm) |",
-            "| --- | --- | --- | --- | ---: | ---: |",
+            "| Benchmark | Case | Family | Categories | Facets | Analytic recall | Error/warning |",
+            "| --- | --- | --- | --- | ---: | ---: | --- |",
         ]
     )
     for failure in analysis["failures"]:
-        p95 = failure["p95_mm"]
-        limit = failure["p95_limit_mm"]
-        deviation = "—" if p95 is None else f"{p95:.6g} / {limit:.6g}"
+        recall = failure["minimum_analytic_area_recall"]
+        recall_text = f"{recall:.3f}" if isinstance(recall, (int, float)) else "—"
+        message = failure["error"] or next(iter(failure["warnings"]), "—")
+        message = str(message).replace("|", "\\|")
+        facets = failure["faceted_face_count"]
         lines.append(
             f"| {failure['benchmark']} | `{failure['id']}` | "
             f"{failure['family']} | {', '.join(failure['categories'])} | "
-            f"{failure['free_edge_count'] if failure['free_edge_count'] is not None else '—'} | "
-            f"{deviation} |"
+            f"{facets if facets is not None else '—'} | "
+            f"{recall_text} | {message} |"
         )
     return "\n".join(lines) + "\n"
 

@@ -21,6 +21,8 @@ def _passes_surface_gate(result: object, score: object, threshold: float) -> boo
     return bool(
         result.valid
         and result.closed
+        and not result.faceted_fallback
+        and not result.source_mesh_fallback
         and score.valid_brep
         and score.valid_solid
         and result.free_edge_count == 0
@@ -54,76 +56,16 @@ def _reconstruct_surfaces_direct(
     update("surface_detection_start")
     result = build_surface_brep(data, update)
     threshold = _acceptance_threshold(data.diagonal)
-    if data.report.watertight and (not result.closed or result.free_edge_count):
-        # An open fitted quilt cannot pass the solid gate. Exporting and
-        # tessellating thousands of its independent diagnostic faces before
-        # constructing the verified carrier can consume the entire isolated
-        # worker budget, losing an otherwise useful recognized surface graph.
-        update("faceted_fallback_start")
-        visualization_faceted_patch_ids = sorted(
-            set(result.faceted_patch_ids + result.unfitted_patch_ids)
-        )
-        faceted = build_faceted_brep(
-            data,
-            result.graph,
-            "the fitted surfaces were not watertight",
-            visualization_faceted_patch_ids,
-        )
-        export_surface_brep(
-            faceted,
-            stl_path.parent,
-            data.source_path,
-            verify_roundtrip=False,
-        )
-        faceted_score = score_exported_shape(
-            data,
-            stl_path.parent,
-            require_solid=False,
-        )
-        result = faceted
-        score = faceted_score
-        passed = _passes_surface_gate(faceted, faceted_score, threshold)
-        if passed:
-            update(
-                f"faceted_fallback_done faces={faceted.faceted_face_count} "
-                "preview=reconstruction.stl"
-            )
-    else:
-        update("surface_export_start")
-        export_surface_brep(result, stl_path.parent, data.source_path)
-        update("surface_verification_start preview=reconstruction.stl")
-        score = score_exported_shape(data, stl_path.parent, require_solid=False)
-        passed = _passes_surface_gate(result, score, threshold)
-        if not passed and data.report.watertight:
-            update("faceted_fallback_start")
-            visualization_faceted_patch_ids = sorted(
-                set(result.faceted_patch_ids + result.unfitted_patch_ids)
-            )
-            faceted = build_faceted_brep(
-                data,
-                result.graph,
-                "the fitted solid failed geometry or STEP round-trip validation",
-                visualization_faceted_patch_ids,
-            )
-            export_surface_brep(
-                faceted,
-                stl_path.parent,
-                data.source_path,
-                verify_roundtrip=False,
-            )
-            faceted_score = score_exported_shape(
-                data,
-                stl_path.parent,
-                require_solid=False,
-            )
-            if _passes_surface_gate(faceted, faceted_score, threshold):
-                result = faceted
-                score = faceted_score
-                passed = True
-                update(
-                    f"faceted_fallback_done faces={faceted.faceted_face_count} "
-                    "preview=reconstruction.stl"
-                )
+    # Preserve the fitted artifact even when it misses a downstream topology
+    # or geometry gate. Replacing it in-place with the source triangle carrier
+    # hid the actual reconstruction failure and made a faceted model appear to
+    # be a successful analytic result. Process-level crash/timeout recovery is
+    # still isolated below, but it is explicitly reported as best effort.
+    update("surface_export_start")
+    export_surface_brep(result, stl_path.parent, data.source_path)
+    update("surface_verification_start preview=reconstruction.stl")
+    score = score_exported_shape(data, stl_path.parent, require_solid=False)
+    passed = _passes_surface_gate(result, score, threshold)
 
     warnings = list(result.warnings)
     if result.point_fitted_face_count:
@@ -287,11 +229,12 @@ def reconstruct_surfaces(
             stream.seek(80)
             triangle_count = struct.unpack("<I", stream.read(4))[0]
         if file_size == 84 + triangle_count * 50 and triangle_count > 50_000:
-            # Dense fitting gets a bounded but meaningful recognition window.
-            # A 20-second cap discarded graphs that completed shortly after it;
-            # sixty seconds still leaves the parent able to construct the
-            # guaranteed source-topology carrier if native fitting stalls.
-            worker_timeout = 60
+            # Near-threshold dense cases finish their analytic pass in roughly
+            # 54 seconds before process startup/export overhead, so a 60-second
+            # cap discarded completed graphs. Larger meshes retain the shorter
+            # budget because constructing their recovery carrier also consumes
+            # a substantial share of the corpus-level 240-second safety bound.
+            worker_timeout = 90 if triangle_count <= 60_000 else 60
     except (OSError, struct.error):
         pass
     command = [

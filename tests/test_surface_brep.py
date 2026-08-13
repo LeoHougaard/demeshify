@@ -171,6 +171,48 @@ def test_freeform_region_is_one_node_fitted_bspline_not_triangle_faces() -> None
     assert len(triangles) == 50
 
 
+def test_large_graph_residual_is_one_trimmed_bspline_face() -> None:
+    rows, columns = 9, 13
+    x, y = np.meshgrid(
+        np.linspace(-4.0, 4.0, columns),
+        np.linspace(-2.5, 2.5, rows),
+    )
+    z = 0.4 * np.sin(x * 0.6) * np.cos(y * 0.7) + 0.03 * x * y
+    vertices = np.column_stack((x.ravel(), y.ravel(), z.ravel()))
+    triangles: list[tuple[int, int, int]] = []
+    for row in range(rows - 1):
+        for column in range(columns - 1):
+            first = row * columns + column
+            triangles.extend(
+                (
+                    (first, first + 1, first + columns + 1),
+                    (first, first + columns + 1, first + columns),
+                )
+            )
+    mesh = trimesh.Trimesh(vertices=vertices, faces=triangles, process=False)
+    boundary_indices = (
+        list(range(columns))
+        + [row * columns + columns - 1 for row in range(1, rows)]
+        + list(range(rows * columns - 2, (rows - 1) * columns - 1, -1))
+        + [row * columns for row in range(rows - 2, 0, -1)]
+        + [0]
+    )
+    patch = FreeformPatch(
+        patch_id="graph-freeform-test",
+        face_indices=np.arange(len(triangles), dtype=np.int64),
+        vertex_indices=np.arange(len(vertices), dtype=np.int64),
+        area=float(mesh.area),
+        boundary_loops=[vertices[boundary_indices]],
+    )
+
+    face = surface_brep._graph_bspline_face(patch, [], mesh, 0.08)
+
+    assert face is not None
+    assert cq.Face(face).isValid()
+    assert cq.Face(face).geomType() == "BSPLINE"
+    assert cq.Face(face).Area() == pytest.approx(mesh.area, rel=0.08)
+
+
 def test_tiny_mesh_uses_scale_aware_kernel_tolerances() -> None:
     mesh = trimesh.creation.cylinder(radius=0.003, height=0.008, sections=96)
 
@@ -360,6 +402,59 @@ def test_faceted_residual_deforms_boundary_triangles_onto_analytic_trim(
     assert len(roundtrip.Solids()) == 1
 
 
+def test_tiny_residual_facets_use_local_topology_tolerance() -> None:
+    vertices = np.asarray(
+        [
+            (0.0, 0.0, 0.0),
+            (0.04, 0.0, 0.0),
+            (0.04, 0.04, 0.0),
+            (0.0, 0.04, 0.0),
+        ]
+    )
+    faces = np.asarray([(0, 1, 2), (0, 2, 3)], dtype=np.int64)
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    patch = FreeformPatch(
+        "tiny-transition",
+        np.arange(len(faces), dtype=np.int64),
+        np.arange(len(vertices), dtype=np.int64),
+        float(mesh.area),
+        [np.vstack((vertices, vertices[0]))],
+    )
+
+    rebuilt = surface_brep._faceted_residual_faces(patch, [], mesh, 0.02)
+
+    assert len(rebuilt) == 2
+    assert all(cq.Face(face).isValid() for face in rebuilt)
+
+
+def test_microscopic_closed_sewing_gap_is_capped_below_global_tolerance() -> None:
+    points = [
+        cq.Vector(0.0, 0.0, 0.0),
+        cq.Vector(0.001, 0.0, 0.0),
+        cq.Vector(0.0, 0.001, 0.0),
+    ]
+    wire = cq.Wire.makePolygon(points, close=True)
+    edges = [edge.wrapped for edge in wire.Edges()]
+
+    class MicroscopicGap:
+        @staticmethod
+        def NbFreeEdges() -> int:
+            return 3
+
+        @staticmethod
+        def FreeEdge(index: int):
+            return edges[index - 1]
+
+        @staticmethod
+        def SewedShape():
+            return cq.Workplane("XY").box(10, 10, 10).val().wrapped
+
+    gap_faces = surface_brep._free_boundary_fill_faces(MicroscopicGap(), 0.01)
+
+    assert len(gap_faces) == 1
+    assert cq.Face(gap_faces[0]).Area() == pytest.approx(5e-7)
+
+
 def test_source_topology_faceted_fallback_is_a_valid_step_solid(tmp_path) -> None:
     mesh = trimesh.creation.icosphere(subdivisions=2, radius=4)
     data = _mesh_data(mesh)
@@ -380,7 +475,7 @@ def test_source_topology_faceted_fallback_is_a_valid_step_solid(tmp_path) -> Non
     assert len(roundtrip.Solids()) == 1
 
 
-def test_native_worker_failure_recovers_as_faceted_solid(
+def test_native_worker_failure_is_reported_as_faceted_best_effort(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -399,7 +494,7 @@ def test_native_worker_failure_recovers_as_faceted_solid(
         "input.stl",
     )
 
-    assert report.status == "complete"
+    assert report.status == "best_effort"
     assert report.surface is not None
     assert report.surface.faceted_fallback
     assert report.surface.faceted_face_count == len(mesh.faces)

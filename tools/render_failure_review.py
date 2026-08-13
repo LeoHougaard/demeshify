@@ -41,6 +41,7 @@ def render_view(
     peer: trimesh.Trimesh | None,
     axes: tuple[int, int, int, str],
     size: tuple[int, int] = (220, 150),
+    highlighted_faces: set[int] | None = None,
 ) -> Image.Image:
     width, height = size
     image = Image.new("RGB", size, "#f5f6f8")
@@ -65,8 +66,11 @@ def render_view(
     for face_index in np.argsort(depths):
         face = mesh.faces[face_index]
         points = [tuple(projected[vertex]) for vertex in face]
-        shade = int(155 + 80 * abs(float(normals[face_index])))
-        fill = (shade - 20, shade - 8, shade)
+        if highlighted_faces is not None and int(face_index) in highlighted_faces:
+            fill = (218, 72, 55)
+        else:
+            shade = int(155 + 80 * abs(float(normals[face_index])))
+            fill = (shade - 20, shade - 8, shade)
         draw.polygon(points, fill=fill)
     return image
 
@@ -75,6 +79,7 @@ def case_panel(
     result: dict[str, object],
     source: trimesh.Trimesh | None,
     output: trimesh.Trimesh | None,
+    highlighted_faces: set[int] | None = None,
 ) -> Image.Image:
     panel = Image.new("RGB", (700, 350), "white")
     draw = ImageDraw.Draw(panel)
@@ -83,14 +88,18 @@ def case_panel(
     caption = (
         f"{result['id']}  {result.get('family')}/{result.get('complexity')}  "
         f"{result.get('status')}  P95={result.get('p95_mm')}  "
-        f"vol={result.get('volume_error_percent')}  missing={missing}"
+        f"facets={result.get('faceted_face_count', 0)}  "
+        f"recall={result.get('minimum_analytic_area_recall')}  missing={missing}"
     )
     draw.text((8, 6), caption[:112], fill="#111", font=font)
     draw.text((8, 28), "SOURCE", fill="#134b76", font=font)
     draw.text((8, 186), "OUTPUT", fill="#8a341d", font=font)
     for column, axes in enumerate(VIEW_AXES):
         x = 24 + column * 224
-        panel.paste(render_view(source, output, axes), (x, 25))
+        panel.paste(
+            render_view(source, output, axes, highlighted_faces=highlighted_faces),
+            (x, 25),
+        )
         panel.paste(render_view(output, source, axes), (x, 183))
     return panel
 
@@ -104,23 +113,62 @@ def main() -> None:
     parser.add_argument("artifacts", type=Path)
     parser.add_argument("--output", type=Path, default=Path("benchmarks/review/sheets"))
     parser.add_argument("--rows-per-sheet", type=int, default=6)
+    parser.add_argument("--limit", type=int, default=0)
     arguments = parser.parse_args()
 
     benchmark = json.loads(arguments.benchmark.read_text(encoding="utf-8"))
     manifest = json.loads(arguments.manifest.read_text(encoding="utf-8"))
     cases = {case["id"]: case for case in manifest["cases"]}
-    failures = [
-        result
-        for result in benchmark["results"]
-        if result.get("scope_status") == "in_scope" and not result.get("strict_complete")
-    ]
+    failures = []
+    for result in benchmark["results"]:
+        if "scope_status" in result:
+            failed = result.get("scope_status") == "in_scope" and not result.get(
+                "strict_complete"
+            )
+        else:
+            failed = not result.get("accepted")
+        if failed:
+            failures.append(result)
+    failures.sort(
+        key=lambda result: (
+            int(result.get("faceted_face_count", 0) or 0),
+            -float(result.get("minimum_analytic_area_recall", 1.0) or 0.0),
+        ),
+        reverse=True,
+    )
+    if arguments.limit > 0:
+        failures = failures[: arguments.limit]
     groups: dict[str, list[Image.Image]] = defaultdict(list)
     arguments.output.mkdir(parents=True, exist_ok=True)
     for result in failures:
         identifier = str(result["id"])
         source_path = arguments.manifest.parent / cases[identifier]["stl"]
         output_path = arguments.artifacts / identifier / "reconstruction.stl"
-        panel = case_panel(result, _mesh(source_path), _mesh(output_path))
+        graph_path = arguments.artifacts / identifier / "surface_graph.json"
+        highlighted_faces: set[int] = set()
+        if graph_path.is_file():
+            graph = json.loads(graph_path.read_text(encoding="utf-8"))
+            visualization = graph.get("visualization", {})
+            highlighted_faces.update(
+                int(index)
+                for index in visualization.get("faceted_source_face_indices", [])
+            )
+            if result.get("source_mesh_fallback") or visualization.get(
+                "global_faceted_fallback"
+            ):
+                source_mesh = _mesh(source_path)
+                if source_mesh is not None:
+                    highlighted_faces.update(range(len(source_mesh.faces)))
+            else:
+                source_mesh = _mesh(source_path)
+        else:
+            source_mesh = _mesh(source_path)
+        panel = case_panel(
+            result,
+            source_mesh,
+            _mesh(output_path),
+            highlighted_faces or None,
+        )
         panel.save(arguments.output / f"{identifier}.png")
         groups[str(result.get("family", "unknown"))].append(panel)
 

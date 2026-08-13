@@ -525,7 +525,11 @@ class MeshViewer {
     this.scene.add(this.mesh);
     if (this.cadStyle) {
       this.cadEdges = new THREE.LineSegments(
-        new THREE.EdgesGeometry(weldedGeometry, 1),
+        // STEP previews arrive as tessellated STL, so a one-degree threshold
+        // redraws the tessellator's internal edges across cylinders and
+        // B-spline sheets. Real fitted-surface boundaries are rendered by the
+        // explicit overlay below; keep this pass for mechanical creases only.
+        new THREE.EdgesGeometry(weldedGeometry, 30),
         new THREE.LineBasicMaterial({ color: 0x17242c, depthTest: true }),
       );
       this.cadEdges.position.sub(center);
@@ -1420,6 +1424,7 @@ async function renderResult(report, options = {}) {
   surfaceLegend.classList.add("hidden");
   const complete = report.status === "complete";
   const surfaceMode = report.engine === "surface_brep" && report.surface;
+  const surfaceFallback = Boolean(surfaceMode && report.surface.faceted_fallback);
   const semantic = report.plan?.representation !== "sampled_approximation";
   document.querySelector("#resultTitle").textContent = complete
     ? surfaceMode
@@ -1427,7 +1432,9 @@ async function renderResult(report, options = {}) {
       : "Editable model ready"
     : report.status === "best_effort"
       ? surfaceMode
-        ? report.surface.closed
+        ? surfaceFallback
+          ? "Analytic fit incomplete"
+          : report.surface.closed
           ? "Best fitted surface solid produced"
           : "Surface recognition result ready"
         : semantic
@@ -1441,7 +1448,9 @@ async function renderResult(report, options = {}) {
       ? "Watertight verified solid"
       : "High-confidence match"
     : surfaceMode
-      ? report.surface.closed
+      ? surfaceFallback
+        ? "Rejected: fallback geometry"
+        : report.surface.closed
         ? "Best effort"
         : "Valid fitted surface set"
       : semantic
@@ -1471,7 +1480,9 @@ async function renderResult(report, options = {}) {
       ? `${featureCount} features`
       : baseLabels[report.plan?.base?.kind] || "Parametric solid";
   document.querySelector("#constructionUnit").textContent = surfaceMode
-    ? `${report.surface.brep_face_count} fitted B-rep faces`
+    ? surfaceFallback
+      ? `${report.surface.brep_face_count} B-rep faces · ${report.surface.faceted_face_count} fallback`
+      : `${report.surface.brep_face_count} fitted B-rep faces`
     : "parametric feature construction";
   document.querySelector("#constructionHeading").textContent = surfaceMode
     ? "Recognized surface model"
@@ -1608,9 +1619,18 @@ async function renderResult(report, options = {}) {
     .replace(/[^A-Za-z0-9._-]+/g, "_")
     .replace(/^[._]+|[._]+$/g, "") || "model";
   const reconstructedStepName = `${sourceStem}_reconstructed.step`;
+  const diagnosticStep = surfaceMode && (!complete || surfaceFallback);
+  const downloadTitle = diagnosticStep ? "Download diagnostic STEP" : "Export STEP file";
+  const downloadDetail = diagnosticStep
+    ? surfaceFallback
+      ? `Rejected analytic fit · ${report.surface.faceted_face_count} fallback faces`
+      : "Not accepted · inspect verification report"
+    : surfaceMode && report.surface.closed
+      ? "Verified watertight analytic B-rep"
+      : "Reconstructed CAD model";
   document.querySelector("#downloads").innerHTML = `
     <a class="download-primary" href="${fileBase}/reconstruction.step" download="${escapeHtml(reconstructedStepName)}">
-      <span><strong>Export STEP file</strong><small>${surfaceMode && report.surface.closed ? "Watertight reconstructed B-rep" : "Reconstructed CAD model"}</small></span><b>↓</b>
+      <span><strong>${downloadTitle}</strong><small>${downloadDetail}</small></span><b>↓</b>
     </a>
   `;
   document.querySelector("#advancedDownloads").innerHTML = surfaceMode

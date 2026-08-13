@@ -44,9 +44,11 @@ from OCP.GeomAPI import (
     GeomAPI_Interpolate,
     GeomAPI_IntSS,
     GeomAPI_PointsToBSpline,
+    GeomAPI_PointsToBSplineSurface,
     GeomAPI_ProjectPointOnCurve,
     GeomAPI_ProjectPointOnSurf,
 )
+from OCP.GeomProjLib import GeomProjLib
 from OCP.gp import (
     gp_Ax1,
     gp_Ax2,
@@ -72,20 +74,24 @@ from OCP.ShapeFix import (
 )
 from OCP.TColgp import (
     TColgp_Array1OfPnt,
+    TColgp_Array2OfPnt,
     TColgp_HArray1OfPnt,
     TColgp_HArray1OfPnt2d,
 )
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID, TopAbs_WIRE
 from OCP.TopExp import TopExp, TopExp_Explorer
+from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import (
     TopoDS,
     TopoDS_Edge,
     TopoDS_Face,
     TopoDS_Shell,
+    TopoDS_Solid,
     TopoDS_Vertex,
     TopoDS_Wire,
 )
 from OCP.TopTools import TopTools_HSequenceOfShape
+from scipy.interpolate import RBFInterpolator
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString
@@ -179,9 +185,7 @@ def _direction(value: np.ndarray) -> gp_Dir:
     return gp_Dir(*(float(component) for component in normalized))
 
 
-def _usable_face(face: TopoDS_Face, tolerance: float = 0.0) -> bool:
-    """Apply both kernel and CadQuery validity checks before a face is sewn."""
-
+def _valid_face_with_minimum_area(face: TopoDS_Face, minimum_area: float) -> bool:
     try:
         wrapped = cq.Face(face)
         area = float(wrapped.Area())
@@ -189,10 +193,16 @@ def _usable_face(face: TopoDS_Face, tolerance: float = 0.0) -> bool:
             BRepCheck_Analyzer(face).IsValid()
             and wrapped.isValid()
             and math.isfinite(area)
-            and area > tolerance**2
+            and area > minimum_area
         )
     except Exception:
         return False
+
+
+def _usable_face(face: TopoDS_Face, tolerance: float = 0.0) -> bool:
+    """Apply both kernel and CadQuery validity checks before a face is sewn."""
+
+    return _valid_face_with_minimum_area(face, tolerance**2)
 
 
 def _surface_model(patch: SurfacePatch, mesh: object) -> _SurfaceModel | None:
@@ -1008,7 +1018,7 @@ def _surface_conforming_trim_chain(
             canonical = start
         elif not closed and index == len(projected_array) - 1:
             canonical = end
-        if canonical is not None and np.linalg.norm(canonical.point - point) <= tolerance * 10:
+        if canonical is not None and np.linalg.norm(canonical.point - point) <= tolerance * 2:
             vertex = canonical.vertex
             builder.UpdateVertex(
                 vertex,
@@ -1749,7 +1759,8 @@ def _rectangular_torus_face(
         unwrapped = np.mod(values - start, 2 * math.pi) + start
         return start, float(np.max(unwrapped)), unwrapped
 
-    u_min, u_max, _ = unwrap(u)
+    full_u = _angular_coverage(points, patch.center, patch.axis) >= math.radians(330)
+    u_min, u_max = (0.0, 2 * math.pi) if full_u else unwrap(u)[:2]
     v_min, v_max, _ = unwrap(v)
     boundary = np.vstack(patch.boundary_loops)
     boundary_relative = boundary - location
@@ -1985,7 +1996,7 @@ def _analytic_face(
             model.patch.area,
             tolerance**2,
         )
-        if 0.5 <= area_ratio <= 1.5:
+        if 0.8 <= area_ratio <= 1.2:
             return periodic
     try:
         support = BRepBuilderAPI_MakeFace(model.surface, tolerance).Face()
@@ -2035,6 +2046,68 @@ def _analytic_face(
                     wire.Closed(True)
         repaired_groups.append((wire, points))
     groups = repaired_groups
+    if isinstance(model.patch, CylindricalPatch):
+        patch_points = np.asarray(
+            mesh.vertices[model.patch.vertex_indices],
+            dtype=float,
+        )
+        if _angular_coverage(
+            patch_points,
+            model.patch.origin,
+            model.patch.axis,
+        ) >= math.radians(330):
+            interior_wires = [
+                wire
+                for wire, points in groups
+                if float(
+                    np.ptp((points - model.patch.origin) @ model.patch.axis)
+                )
+                > tolerance * 10
+                and _angular_coverage(
+                    points,
+                    model.patch.origin,
+                    model.patch.axis,
+                )
+                < math.radians(330)
+            ]
+            if interior_wires and len(interior_wires) <= 4:
+                axial = (patch_points - model.patch.origin) @ model.patch.axis
+                periodic_candidates: list[TopoDS_Face] = []
+                for orientation_mask in range(1 << len(interior_wires)):
+                    try:
+                        trial = BRepBuilderAPI_MakeFace(
+                            model.elementary,
+                            0.0,
+                            2 * math.pi,
+                            float(np.min(axial)),
+                            float(np.max(axial)),
+                        )
+                        for index, wire in enumerate(interior_wires):
+                            trial.Add(
+                                TopoDS.Wire_s(wire.Reversed())
+                                if orientation_mask & (1 << index)
+                                else wire
+                            )
+                        if not trial.IsDone():
+                            continue
+                        candidate = trial.Face()
+                        if _usable_face(candidate, tolerance):
+                            periodic_candidates.append(candidate)
+                    except Exception:
+                        continue
+                if periodic_candidates:
+                    face = min(
+                        periodic_candidates,
+                        key=lambda item: abs(
+                            float(cq.Face(item).Area()) - model.patch.area
+                        ),
+                    )
+                    area_ratio = float(cq.Face(face).Area()) / max(
+                        model.patch.area,
+                        tolerance**2,
+                    )
+                    if 0.5 <= area_ratio <= 1.5:
+                        return _orient_face(face, model.patch, mesh)
     if isinstance(model.patch, PlanarPatch) and len(groups) > 1:
 
         def planar_wire_area(item: tuple[TopoDS_Wire, np.ndarray]) -> float:
@@ -2264,6 +2337,8 @@ def _fill_surface_from_nodes(
     boundary_edges: list[_TrimEdge],
     nodes: np.ndarray,
     tolerance: float,
+    *,
+    minimum_area: float | None = None,
 ) -> TopoDS_Face | None:
     if not boundary_edges:
         return None
@@ -2290,7 +2365,8 @@ def _fill_surface_from_nodes(
         face = filling.Face()
     except Exception:
         return None
-    return face if _usable_face(face, tolerance) else None
+    required_area = tolerance**2 if minimum_area is None else minimum_area
+    return face if _valid_face_with_minimum_area(face, required_area) else None
 
 
 def _point_fitted_face(
@@ -2374,6 +2450,336 @@ def _point_fitted_face(
     return face if _usable_face(face, fit_tolerance) else None
 
 
+def _graph_bspline_face_impl(
+    patch: FreeformPatch,
+    edges: list[_TrimEdge],
+    mesh: object,
+    tolerance: float,
+    *,
+    shared_topology: bool = True,
+) -> TopoDS_Face | None:
+    """Fit a bounded C2 surface when a residual is a graph over one plane.
+
+    Many CAD transition sheets are too large for OCCT's dense plate solver but
+    are still single-valued in a stable principal frame. Verify that every
+    projected triangle has one orientation, fit only the scalar height field,
+    and trim the resulting tensor-product B-spline in its known UV frame. This
+    bounded path avoids both unconstrained plate bowing and per-triangle output.
+    """
+
+    vertex_indices = np.asarray(patch.vertex_indices, dtype=np.int64)
+    if len(vertex_indices) < 8 or len(vertex_indices) > 1500:
+        return None
+    points = np.asarray(mesh.vertices[vertex_indices], dtype=float)
+    center = np.mean(points, axis=0)
+    try:
+        _, _, basis = np.linalg.svd(points - center, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    coordinates = (points - center) @ basis[:2].T
+    heights = (points - center) @ basis[2]
+    constrained_heights = heights.copy()
+    constraint_tree = cKDTree(points)
+    analytic_constraint_points: list[np.ndarray] = []
+    for edge in edges:
+        if edge.source_points is None or len(edge.source_points) != len(edge.points):
+            continue
+        distances, indices = constraint_tree.query(edge.source_points, k=1)
+        for distance, vertex_index, exact_point in zip(
+            np.atleast_1d(distances),
+            np.atleast_1d(indices),
+            edge.points,
+            strict=True,
+        ):
+            if float(distance) <= tolerance * 2:
+                constrained_heights[int(vertex_index)] = float(
+                    (np.asarray(exact_point, dtype=float) - center) @ basis[2]
+                )
+        try:
+            midpoint = cq.Edge(edge.edge).positionAt(0.5)
+            analytic_constraint_points.append(
+                np.asarray(midpoint.toTuple(), dtype=float)
+            )
+        except Exception:
+            pass
+    fit_coordinates = coordinates
+    fit_heights = constrained_heights
+    if analytic_constraint_points:
+        constraint_points = np.asarray(analytic_constraint_points, dtype=float)
+        fit_coordinates = np.vstack(
+            (fit_coordinates, (constraint_points - center) @ basis[:2].T)
+        )
+        fit_heights = np.r_[
+            fit_heights,
+            (constraint_points - center) @ basis[2],
+        ]
+        validation_points = np.vstack((points, constraint_points))
+    else:
+        validation_points = points
+    spans = np.ptp(coordinates, axis=0)
+    if np.min(spans) <= max(tolerance, 1e-10):
+        return None
+
+    local_index = np.full(len(mesh.vertices), -1, dtype=np.int64)
+    local_index[vertex_indices] = np.arange(len(vertex_indices), dtype=np.int64)
+    triangles = local_index[np.asarray(mesh.faces[patch.face_indices], dtype=np.int64)]
+    if np.any(triangles < 0):
+        return None
+    projected = coordinates[triangles]
+    signed_area = (
+        (projected[:, 1, 0] - projected[:, 0, 0])
+        * (projected[:, 2, 1] - projected[:, 0, 1])
+        - (projected[:, 1, 1] - projected[:, 0, 1])
+        * (projected[:, 2, 0] - projected[:, 0, 0])
+    )
+    area_floor = max(float(np.prod(spans)) * 1e-14, 1e-14)
+    if not (np.all(signed_area > area_floor) or np.all(signed_area < -area_floor)):
+        return None
+
+    lower = np.min(coordinates, axis=0)
+    upper = np.max(coordinates, axis=0)
+    try:
+        height_field = RBFInterpolator(
+            fit_coordinates,
+            fit_heights,
+            kernel="thin_plate_spline",
+            smoothing=max((tolerance * 1e-4) ** 2, 1e-14),
+        )
+        surface_candidates: list[tuple[float, float, Geom_Surface]] = []
+        for u_count, minimum_v_count in ((36, 14), (52, 22)):
+            v_count = max(
+                minimum_v_count,
+                int(round(u_count * spans[1] / spans[0])),
+            )
+            u_values = np.linspace(lower[0], upper[0], u_count)
+            v_values = np.linspace(lower[1], upper[1], v_count)
+            grid_u, grid_v = np.meshgrid(u_values, v_values, indexing="ij")
+            grid_parameters = np.column_stack((grid_u.ravel(), grid_v.ravel()))
+            grid_heights = height_field(grid_parameters)
+            grid_points = (
+                center
+                + grid_parameters[:, :1] * basis[0]
+                + grid_parameters[:, 1:] * basis[1]
+                + grid_heights[:, None] * basis[2]
+            )
+            array = TColgp_Array2OfPnt(1, u_count, 1, v_count)
+            for u_index in range(u_count):
+                for v_index in range(v_count):
+                    array.SetValue(
+                        u_index + 1,
+                        v_index + 1,
+                        _point(grid_points[u_index * v_count + v_index]),
+                    )
+            fitted = GeomAPI_PointsToBSplineSurface(
+                array,
+                3,
+                8,
+                GeomAbs_C2,
+                max(tolerance * 0.01, 1e-8),
+            )
+            if not fitted.IsDone():
+                continue
+            candidate = fitted.Surface()
+            candidate_deviations: list[float] = []
+            for point in validation_points:
+                projection = GeomAPI_ProjectPointOnSurf(_point(point), candidate)
+                if projection.NbPoints() == 0:
+                    candidate_deviations = []
+                    break
+                candidate_deviations.append(float(projection.LowerDistance()))
+            if not candidate_deviations:
+                continue
+            percentile = float(np.percentile(candidate_deviations, 95))
+            maximum = max(candidate_deviations)
+            surface_candidates.append((percentile, maximum, candidate))
+        if not surface_candidates:
+            return None
+        percentile, maximum, surface = min(
+            surface_candidates,
+            key=lambda item: (item[0], item[1]),
+        )
+    except Exception:
+        return None
+    if percentile > tolerance or maximum > tolerance * 3:
+        return None
+
+    wires: list[TopoDS_Wire] = []
+    try:
+        support = BRepBuilderAPI_MakeFace(surface, tolerance).Face()
+        remaining_edges = list(edges) if shared_topology else []
+        for raw_loop in patch.boundary_loops:
+            loop = np.asarray(raw_loop, dtype=float)
+            if len(loop) < 4 or np.linalg.norm(loop[0] - loop[-1]) > tolerance * 3:
+                return None
+            loop = loop[:-1]
+            parameters: list[tuple[float, float]] = []
+            for boundary_point in loop:
+                projection = GeomAPI_ProjectPointOnSurf(
+                    _point(boundary_point),
+                    surface,
+                )
+                if not projection.IsDone() or projection.NbPoints() == 0:
+                    return None
+                u_value, v_value = projection.LowerDistanceParameters()
+                parameters.append((float(u_value), float(v_value)))
+            parameter_array = np.asarray(parameters, dtype=float)
+            parameter_vertices: list[TopoDS_Vertex] = []
+            vertex_builder = BRep_Builder()
+            for u_value, v_value in parameter_array:
+                vertex = BRepBuilderAPI_MakeVertex(
+                    surface.Value(float(u_value), float(v_value))
+                ).Vertex()
+                vertex_builder.UpdateVertex(vertex, tolerance)
+                parameter_vertices.append(vertex)
+            ordered_edges: list[TopoDS_Edge] = []
+            pcurve_builder = BRep_Builder()
+            for index, start in enumerate(parameter_array):
+                end = parameter_array[(index + 1) % len(parameter_array)]
+                if np.linalg.norm(end - start) <= 1e-12:
+                    return None
+                source_start = loop[index]
+                source_end = loop[(index + 1) % len(loop)]
+                best: tuple[float, int, bool] | None = None
+                for edge_index, candidate in enumerate(remaining_edges):
+                    if len(candidate.points) < 2:
+                        continue
+                    candidate_first = TopExp.FirstVertex_s(candidate.edge, True)
+                    candidate_last = TopExp.LastVertex_s(candidate.edge, True)
+                    if candidate_first.IsNull() or candidate_last.IsNull():
+                        continue
+                    candidate_start = np.asarray(
+                        cq.Vertex(candidate_first).toTuple(),
+                        dtype=float,
+                    )
+                    candidate_end = np.asarray(
+                        cq.Vertex(candidate_last).toTuple(),
+                        dtype=float,
+                    )
+                    direct = max(
+                        float(np.linalg.norm(source_start - candidate_start)),
+                        float(np.linalg.norm(source_end - candidate_end)),
+                    )
+                    reverse = max(
+                        float(np.linalg.norm(source_start - candidate_end)),
+                        float(np.linalg.norm(source_end - candidate_start)),
+                    )
+                    score = min(direct, reverse)
+                    if best is None or score < best[0]:
+                        best = (score, edge_index, reverse < direct)
+                edge: TopoDS_Edge | None = None
+                if best is not None and best[0] <= tolerance * 2:
+                    _, edge_index, reverse = best
+                    candidate = remaining_edges.pop(edge_index)
+                    try:
+                        adaptor = BRepAdaptor_Curve(candidate.edge)
+                        pcurve = GeomProjLib.Curve2d_s(
+                            adaptor.Curve().Curve(),
+                            float(adaptor.FirstParameter()),
+                            float(adaptor.LastParameter()),
+                            surface,
+                            tolerance,
+                        )
+                        pcurve_builder.UpdateEdge(
+                            candidate.edge,
+                            pcurve,
+                            surface,
+                            TopLoc_Location(),
+                            tolerance,
+                        )
+                        edge = (
+                            _reverse_edge(candidate.edge)
+                            if reverse
+                            else candidate.edge
+                        )
+                    except Exception:
+                        edge = None
+                if edge is None:
+                    segment = GCE2d_MakeSegment(
+                        gp_Pnt2d(float(start[0]), float(start[1])),
+                        gp_Pnt2d(float(end[0]), float(end[1])),
+                    )
+                    edge_maker = BRepBuilderAPI_MakeEdge(
+                        segment.Value(),
+                        surface,
+                        parameter_vertices[index],
+                        parameter_vertices[(index + 1) % len(parameter_vertices)],
+                    )
+                    if not edge_maker.IsDone():
+                        return None
+                    edge = edge_maker.Edge()
+                ordered_edges.append(edge)
+            wire = TopoDS_Wire()
+            wire_builder = BRep_Builder()
+            wire_builder.MakeWire(wire)
+            for edge in ordered_edges:
+                wire_builder.Add(wire, edge)
+            # A wire can report Closed() while its constituent edge
+            # orientations are inconsistent. Normalize every canonical wire,
+            # not only geometrically open ones, before it trims the surface.
+            wire_fixer = ShapeFix_Wire(wire, support, tolerance)
+            wire_fixer.SetPrecision(tolerance)
+            wire_fixer.SetMaxTolerance(tolerance * 10)
+            wire_fixer.FixReorder()
+            wire_fixer.FixConnected(tolerance * 10)
+            wire_fixer.FixClosed(tolerance * 10)
+            wire = wire_fixer.Wire()
+            if not wire.Closed():
+                return None
+            wires.append(wire)
+        if not wires:
+            return None
+        face_maker = BRepBuilderAPI_MakeFace(surface, wires[0], True)
+        for wire in wires[1:]:
+            face_maker.Add(wire)
+        if not face_maker.IsDone():
+            return None
+        face = face_maker.Face()
+        BRepLib.BuildCurves3d_s(face, tolerance, GeomAbs_C2, 12, 30)
+        if not _usable_face(face, tolerance):
+            fixer = ShapeFix_Face(face)
+            fixer.SetPrecision(tolerance)
+            fixer.SetMaxTolerance(tolerance * 10)
+            fixer.FixOrientation()
+            fixer.FixWireTool().FixSelfIntersection()
+            fixer.Perform()
+            shape_fixer = ShapeFix_Shape(fixer.Face())
+            shape_fixer.SetPrecision(tolerance)
+            shape_fixer.SetMaxTolerance(tolerance * 10)
+            shape_fixer.Perform()
+            repaired = shape_fixer.Shape()
+            if repaired.ShapeType() != TopAbs_FACE:
+                return None
+            face = TopoDS.Face_s(repaired)
+    except Exception:
+        return None
+    if not _usable_face(face, tolerance):
+        return None
+    area_ratio = abs(float(cq.Face(face).Area())) / max(patch.area, tolerance**2)
+    if not 0.75 <= area_ratio <= 1.25:
+        return None
+    return _orient_face(face, patch, mesh)
+
+
+def _graph_bspline_face(
+    patch: FreeformPatch,
+    edges: list[_TrimEdge],
+    mesh: object,
+    tolerance: float,
+) -> TopoDS_Face | None:
+    """Prefer shared topology, then retain the validated independent trim."""
+
+    fitted = _graph_bspline_face_impl(patch, edges, mesh, tolerance)
+    if fitted is not None or not edges:
+        return fitted
+    return _graph_bspline_face_impl(
+        patch,
+        edges,
+        mesh,
+        tolerance,
+        shared_topology=False,
+    )
+
+
 def _faceted_residual_faces(
     patch: SurfacePatch,
     trim_edges: list[_TrimEdge],
@@ -2396,6 +2802,7 @@ def _faceted_residual_faces(
     patch_vertex_ids = np.unique(triangles)
     source_vertices = np.asarray(mesh.vertices, dtype=float)
     local_tree = cKDTree(source_vertices[patch_vertex_ids])
+    topology_tolerance = max(tolerance * 0.01, 1e-9)
 
     conforming_edges: dict[tuple[int, int], tuple[TopoDS_Edge, tuple[int, int]]] = {}
     canonical_vertices: dict[int, tuple[TopoDS_Vertex, np.ndarray]] = {}
@@ -2439,7 +2846,7 @@ def _faceted_residual_faces(
         else:
             point = np.asarray(source_vertices[identifier], dtype=float)
             vertex = BRepBuilderAPI_MakeVertex(_point(point)).Vertex()
-            builder.UpdateVertex(vertex, tolerance * 5)
+            builder.UpdateVertex(vertex, topology_tolerance)
         vertex_shapes[identifier] = vertex
 
     edge_shapes: dict[tuple[int, int], tuple[TopoDS_Edge, tuple[int, int]]] = dict(conforming_edges)
@@ -2453,7 +2860,7 @@ def _faceted_residual_faces(
             if not maker.IsDone():
                 return None
             stored = (
-                _set_edge_tolerance(maker.Edge(), tolerance * 5),
+                _set_edge_tolerance(maker.Edge(), topology_tolerance),
                 (low, high),
             )
             edge_shapes[key] = stored
@@ -3021,11 +3428,16 @@ def _sew_faces(
         if make_solids and sewing.NbFreeEdges() == 0
         else []
     )
-    # Do not call a partially repaired compound closed when only one of its
-    # shells became a solid. A repaired solid is authoritative only when it
-    # contains the complete fitted face set supplied to sewing.
-    if sum(len(cq.Shape(solid).Faces()) for solid in solids) != len(faces):
-        solids = []
+    # Sewing may legally merge coincident sliver faces, so face-count equality
+    # is not a completeness invariant. Compare represented area instead: a
+    # missing model-scale face is rejected, while a merged zero-area seam does
+    # not invalidate an otherwise complete closed shell.
+    if solids:
+        source_area = sum(abs(float(cq.Face(face).Area())) for face in faces)
+        solid_area = sum(abs(float(cq.Shape(solid).Area())) for solid in solids)
+        area_error = abs(solid_area - source_area)
+        if area_error > max(source_area * 1e-5, tolerance**2 * 10):
+            solids = []
     return sewing, solids
 
 
@@ -3165,6 +3577,16 @@ def _free_boundary_fill_faces(
         source_area += float(cq.Face(TopoDS.Face_s(source_explorer.Current())).Area())
         source_explorer.Next()
 
+    def usable_gap_face(face: TopoDS_Face) -> bool:
+        # The accepted sewing tolerance is intentionally broad enough to
+        # reconcile independently fitted surfaces. A real crack bounded by
+        # that topology can be much smaller than tolerance**2, particularly
+        # where a cone, cylinder, and plane meet. Reject only numerically empty
+        # faces here; the perimeter/source-area checks below still prevent a
+        # large invented cap from being accepted.
+        minimum_area = max(tolerance**2 * 1e-8, 1e-15)
+        return _valid_face_with_minimum_area(face, minimum_area)
+
     def face_from_wire(wire: TopoDS_Wire) -> TopoDS_Face | None:
         edge_explorer = TopExp_Explorer(wire, TopAbs_EDGE)
         boundary: list[_TrimEdge] = []
@@ -3187,19 +3609,19 @@ def _free_boundary_fill_faces(
             edge_explorer.Next()
         if not boundary or len(boundary) > 64:
             return None
-        face: TopoDS_Face | None = None
+        minimum_gap_area = max(tolerance**2 * 1e-8, 1e-15)
+        face: TopoDS_Face | None = _fill_surface_from_nodes(
+            boundary,
+            np.empty((0, 3), dtype=float),
+            tolerance,
+            minimum_area=minimum_gap_area,
+        )
         try:
-            planar = BRepBuilderAPI_MakeFace(wire, True)
-            if planar.IsDone() and _usable_face(planar.Face(), tolerance):
+            planar = BRepBuilderAPI_MakeFace(wire, True) if face is None else None
+            if planar is not None and planar.IsDone() and usable_gap_face(planar.Face()):
                 face = planar.Face()
         except Exception:
             pass
-        if face is None:
-            face = _fill_surface_from_nodes(
-                boundary,
-                np.empty((0, 3), dtype=float),
-                tolerance,
-            )
         if face is not None:
             perimeter = sum(float(cq.Edge(item.edge).Length()) for item in boundary)
             maximum_area = min(
@@ -3264,7 +3686,7 @@ def _free_boundary_fill_faces(
             ruled_face = BRepFill.Face_s(first.edge, ruled_second)
         except Exception:
             ruled_face = None
-        if ruled_face is not None and _usable_face(ruled_face, tolerance):
+        if ruled_face is not None and usable_gap_face(ruled_face):
             return [ruled_face]
     if len(raw_edges) >= 4 and len(raw_edges) % 2 == 0:
         unmatched = list(raw_edges)
@@ -3305,7 +3727,7 @@ def _free_boundary_fill_faces(
                 )
             except Exception:
                 continue
-            if not _usable_face(ruled_face, tolerance):
+            if not usable_gap_face(ruled_face):
                 continue
             ruled_faces.append(ruled_face)
         if ruled_faces:
@@ -3341,7 +3763,7 @@ def _free_boundary_fill_faces(
                         ruled_face = BRepFill.Face_s(first.edge, ruled_second)
                     except Exception:
                         continue
-                    if _usable_face(ruled_face, tolerance):
+                    if usable_gap_face(ruled_face):
                         return [ruled_face]
                 maker = BRepBuilderAPI_MakeWire()
                 maker.Add(first.edge)
@@ -3415,7 +3837,7 @@ def _merge_coincident_free_edges(
 ) -> list[TopoDS_Face]:
     """Unify duplicate crack edges only when their full curves coincide."""
 
-    if not hasattr(sewing, "FreeEdge") or not 2 <= sewing.NbFreeEdges() <= 32:
+    if not hasattr(sewing, "FreeEdge") or not 2 <= sewing.NbFreeEdges() <= 256:
         return []
     records: list[tuple[TopoDS_Edge, np.ndarray, np.ndarray]] = []
     try:
@@ -3734,6 +4156,21 @@ def build_surface_brep(
                 data.mesh,
                 tolerance,
             )
+            if not faceted:
+                # Dense STL transitions often contain edges shorter than the
+                # analytic sewing tolerance. Giving those tiny triangles the
+                # neighboring surface's broad canonical vertex tolerances can
+                # make otherwise valid source facets self-intersect in OCCT.
+                # Keep the exact source triangles in that case; final sewing
+                # may still join their boundary to the fitted cylinder within
+                # the recognition tolerance, and the geometry/STEP gates below
+                # remain authoritative.
+                faceted = _faceted_residual_faces(
+                    patch,
+                    [],
+                    data.mesh,
+                    tolerance,
+                )
         except Exception:
             faceted = []
         if not faceted:
@@ -3758,14 +4195,14 @@ def build_surface_brep(
             if isinstance(patch, ToroidalPatch) and patch.boundary_loops:
                 try:
                     face = (
-                        _analytic_face(
+                        _rectangular_torus_face(
                             model,
-                            trim_edges.get(patch.patch_id, []),
                             data.mesh,
                             tolerance,
                         )
-                        or _rectangular_torus_face(
+                        or _analytic_face(
                             model,
+                            trim_edges.get(patch.patch_id, []),
                             data.mesh,
                             tolerance,
                         )
@@ -3847,6 +4284,26 @@ def build_surface_brep(
                 if face is not None and _usable_face(face, tolerance):
                     faces.append(face)
                     continue
+            if isinstance(patch, PlanarPatch):
+                # A tiny planar sliver can be smaller than the global sewing
+                # tolerance, making an otherwise exact one-wire trim
+                # degenerate in OCCT. Retain its source triangle subdivision
+                # on the recognized plane instead of relabeling the region as
+                # a freeform B-spline. The local-topology builder uses a
+                # scale-aware tolerance and every emitted face remains PLANE.
+                planar_faces = _faceted_residual_faces(
+                    patch,
+                    [],
+                    data.mesh,
+                    tolerance,
+                )
+                if planar_faces and all(
+                    cq.Face(planar_face).geomType() == "PLANE"
+                    and _usable_face(planar_face, tolerance * 0.01)
+                    for planar_face in planar_faces
+                ):
+                    faces.extend(planar_faces)
+                    continue
             analytic_failures.append(patch.kind)
             if isinstance(patch, ToroidalPatch):
                 add_faceted_or_mark(patch)
@@ -3862,24 +4319,19 @@ def build_surface_brep(
                 (len(loop) for loop in fallback.boundary_loops),
                 default=0,
             )
-            # GeomPlate is both expensive and capable of terminating OCCT in
-            # native code when a failed analytic patch contains thousands of
-            # constraints or a long multiply-connected boundary. Keep the
-            # recognized support in the graph, but use its conforming source
-            # facets instead of sending an unsafe problem to the plate solver.
-            if (
-                len(fallback.vertex_indices) > 500
-                or len(fallback.face_indices) > 300
-                or longest_boundary > 32
-            ):
-                fitted = None
-            else:
-                fitted = _point_fitted_face(
+            fitted = (
+                _point_fitted_face(
                     fallback,
                     trim_edges.get(patch.patch_id, []),
                     data.mesh,
                     tolerance,
-                ) or _point_fitted_face(fallback, [], data.mesh, tolerance)
+                )
+                or _point_fitted_face(fallback, [], data.mesh, tolerance)
+                if len(fallback.vertex_indices) <= 500
+                and len(fallback.face_indices) <= 300
+                and longest_boundary <= 32
+                else None
+            )
             if fitted is not None:
                 faces.append(fitted)
                 point_fitted_face_count += 1
@@ -3930,7 +4382,11 @@ def build_surface_brep(
                 data.mesh,
                 tolerance,
             )
-            if fitted is None:
+            if (
+                fitted is None
+                and len(patch.vertex_indices) <= 500
+                and len(patch.face_indices) <= 300
+            ):
                 fitted = _surface_of_revolution_face(
                     patch,
                     trim_edges.get(patch.patch_id, []),
@@ -3996,7 +4452,17 @@ def build_surface_brep(
                 or len(patch.face_indices) > 300
                 or longest_boundary > 32
             ):
-                add_faceted_or_mark(patch)
+                fitted = _graph_bspline_face(
+                    patch,
+                    trim_edges.get(patch.patch_id, []),
+                    data.mesh,
+                    tolerance,
+                )
+                if fitted is not None:
+                    faces.append(fitted)
+                    point_fitted_face_count += 1
+                else:
+                    add_faceted_or_mark(patch)
                 continue
             # Arbitrary intersection-edge mixtures can drive OCCT's plate
             # solver into a native failure. Fit residual charts from their own
@@ -4032,8 +4498,9 @@ def build_surface_brep(
         warnings.append(
             f"Retained {faceted_patch_count} unfitted residual "
             f"region{'s' if faceted_patch_count != 1 else ''} as "
-            f"{faceted_face_count} conforming B-rep facets. Boundary facets "
-            "were deformed onto adjacent analytic trim curves."
+            f"{faceted_face_count} B-rep facets. Analytic boundary conformance "
+            "was used where topologically safe; tiny transition facets kept "
+            "their local source topology for sewing."
         )
     if progress_callback is not None:
         progress_callback(f"trimmed_faces_done faces={len(faces)}")
@@ -4057,6 +4524,32 @@ def build_surface_brep(
             if solids:
                 break
     filled_gap_count = 0
+    if not solids and 0 < sewing.NbFreeEdges() <= 64:
+        # Repair the partially sewn face complex before classifying its free
+        # boundaries. ShapeAnalysis can otherwise expose transient seam edges
+        # from an invalid p-curve graph, causing a cap to be built against the
+        # wrong loop. Re-sewing the shape-fixed faces gives the boundary repair
+        # the same stable topology that will later be exported.
+        try:
+            sewed_shape = cq.Shape(sewing.SewedShape())
+            if not sewed_shape.isValid():
+                fixer = ShapeFix_Shape(sewing.SewedShape())
+                fixer.SetPrecision(tolerance)
+                fixer.Perform()
+                fixed_faces: list[TopoDS_Face] = []
+                fixed_explorer = TopExp_Explorer(fixer.Shape(), TopAbs_FACE)
+                while fixed_explorer.More():
+                    fixed_faces.append(TopoDS.Face_s(fixed_explorer.Current()))
+                    fixed_explorer.Next()
+                fixed_sewing, fixed_solids = _sew_faces(
+                    fixed_faces,
+                    effective_tolerance,
+                )
+                if fixed_sewing.NbFreeEdges() <= sewing.NbFreeEdges():
+                    faces = fixed_faces
+                    sewing, solids = fixed_sewing, fixed_solids
+        except Exception:
+            pass
     # Filling one closed free-bound loop can expose a smaller nested loop after
     # the new face is sewn. Recompute free bounds after every accepted repair,
     # and stop unless the free-edge count strictly decreases.
@@ -4072,16 +4565,17 @@ def build_surface_brep(
             sewed_faces.append(TopoDS.Face_s(explorer.Current()))
             explorer.Next()
         repaired_faces = [*sewed_faces, *gap_faces]
+        gap_sewing_tolerance = max(tolerance, effective_tolerance * 0.1)
         repaired, repaired_solids = _sew_faces(
             repaired_faces,
-            effective_tolerance,
+            gap_sewing_tolerance,
         )
         if repaired.NbFreeEdges() == 0 and not repaired_solids:
             reversed_gap_faces = [TopoDS.Face_s(face.Reversed()) for face in gap_faces]
             reversed_faces = [*sewed_faces, *reversed_gap_faces]
             reversed_sewing, reversed_solids = _sew_faces(
                 reversed_faces,
-                effective_tolerance,
+                gap_sewing_tolerance,
             )
             if reversed_solids:
                 repaired = reversed_sewing
@@ -4098,7 +4592,7 @@ def build_surface_brep(
             f"Filled {filled_gap_count} closed residual boundary "
             f"loop{'s' if filled_gap_count != 1 else ''} with C0 surfaces."
         )
-    if not solids and 0 < sewing.NbFreeEdges() <= 32:
+    if not solids and 0 < sewing.NbFreeEdges() <= 256:
         merged_faces = _merge_coincident_free_edges(sewing, effective_tolerance)
         if merged_faces:
             merged, merged_solids = _sew_faces(
@@ -4111,20 +4605,50 @@ def build_surface_brep(
                 warnings.append(
                     "Unified coincident residual crack edges without changing their fitted curves."
                 )
-                final_gap_faces = _free_boundary_fill_faces(
-                    sewing,
-                    effective_tolerance,
-                )
-                if final_gap_faces:
-                    final_faces = [*faces, *final_gap_faces]
-                    final_sewing, final_solids = _sew_faces(
-                        final_faces,
+                # Merging coincident cracks can expose a smaller nested loop.
+                # Recompute after each accepted fill instead of assuming that
+                # one pass sees the final free boundary.
+                for _ in range(4):
+                    if solids or sewing.NbFreeEdges() == 0:
+                        break
+                    final_gap_faces = _free_boundary_fill_faces(
+                        sewing,
                         effective_tolerance,
+                    )
+                    if not final_gap_faces:
+                        break
+                    final_candidates: list[
+                        tuple[
+                            BRepBuilderAPI_Sewing,
+                            list[TopoDS_Solid],
+                            list[TopoDS_Face],
+                        ]
+                    ] = []
+                    for oriented_gaps in (
+                        final_gap_faces,
+                        [TopoDS.Face_s(face.Reversed()) for face in final_gap_faces],
+                    ):
+                        candidate_faces = [*faces, *oriented_gaps]
+                        candidate_sewing, candidate_solids = _sew_faces(
+                            candidate_faces,
+                            effective_tolerance,
+                        )
+                        final_candidates.append(
+                            (candidate_sewing, candidate_solids, candidate_faces)
+                        )
+                    final_sewing, final_solids, final_faces = min(
+                        final_candidates,
+                        key=lambda item: (
+                            not bool(item[1]),
+                            item[0].NbFreeEdges(),
+                        ),
                     )
                     if final_sewing.NbFreeEdges() < sewing.NbFreeEdges():
                         sewing, solids = final_sewing, final_solids
                         faces = final_faces
                         point_fitted_face_count += len(final_gap_faces)
+                    else:
+                        break
     if not solids and 0 < sewing.NbFreeEdges() <= 32:
         try:
             permissive, permissive_solids = _sew_faces(
@@ -4136,6 +4660,26 @@ def build_surface_brep(
             permissive, permissive_solids = sewing, solids
         if permissive.NbFreeEdges() < sewing.NbFreeEdges() and permissive_solids:
             sewing, solids = permissive, permissive_solids
+    if len(solids) > 1:
+        volumes = [abs(float(cq.Shape(solid).Volume())) for solid in solids]
+        largest_volume = max(volumes, default=0.0)
+        artifact_limit = max(
+            largest_volume * 1e-8,
+            effective_tolerance**3 * 10,
+        )
+        retained_solids = [
+            solid
+            for solid, volume in zip(solids, volumes, strict=True)
+            if volume > artifact_limit
+        ]
+        if retained_solids and len(retained_solids) < len(solids):
+            removed_count = len(solids) - len(retained_solids)
+            solids = retained_solids
+            warnings.append(
+                f"Discarded {removed_count} microscopic closed sewing "
+                f"artifact{'s' if removed_count != 1 else ''}; all retained "
+                "source-scale geometry remains in the reconstructed solid."
+            )
     # A valid, complete repaired solid has no topological free boundary even
     # if the pre-repair sewing diagnostic still reports the seams it repaired.
     free_edge_count = 0 if solids else int(sewing.NbFreeEdges())
