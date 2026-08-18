@@ -31,6 +31,39 @@ def _passes_surface_gate(result: object, score: object, threshold: float) -> boo
     )
 
 
+def _report_has_valid_solid(report: ReconstructionReport) -> bool:
+    """Apply the geometric/STEP gate without relabeling facets as analytic."""
+
+    surface = report.surface
+    score = report.score
+    diagonal = sum(value * value for value in report.mesh.dimensions_mm) ** 0.5
+    return bool(
+        surface
+        and score
+        and surface.closed
+        and surface.free_edge_count == 0
+        and score.valid_brep
+        and score.valid_solid
+        and score.chamfer_p95_mm <= _acceptance_threshold(diagonal)
+        and score.volume_error_percent <= 2.0
+    )
+
+
+def _preserve_analytic_diagnostic(directory: Path) -> None:
+    """Keep a failed fitted result beside the verified fallback carrier."""
+
+    for source_name, diagnostic_name in (
+        ("reconstruction.step", "analytic_diagnostic.step"),
+        ("reconstruction.stl", "analytic_diagnostic.stl"),
+        ("joined_surfaces.step", "analytic_diagnostic_joined_surfaces.step"),
+        ("surface_graph.json", "analytic_diagnostic_surface_graph.json"),
+        ("report.json", "analytic_diagnostic_report.json"),
+    ):
+        source = directory / source_name
+        if source.is_file():
+            source.replace(directory / diagnostic_name)
+
+
 def _reconstruct_surfaces_direct(
     run_id: str,
     stl_path: Path,
@@ -280,11 +313,22 @@ def reconstruct_surfaces(
             report = ReconstructionReport.model_validate_json(
                 report_path.read_text(encoding="utf-8")
             )
+            if _report_has_valid_solid(report) or not report.mesh.watertight:
+                if progress_callback is not None:
+                    progress_callback(
+                        "surface_isolated_worker_done preview=reconstruction.stl"
+                    )
+                return report
+            _preserve_analytic_diagnostic(stl_path.parent)
+            reason = (
+                "the isolated analytic reconstruction did not pass the strict "
+                "solid, error, and STEP round-trip gate; its diagnostic artifacts "
+                "were preserved separately"
+            )
             if progress_callback is not None:
                 progress_callback(
-                    "surface_isolated_worker_done preview=reconstruction.stl"
+                    "surface_isolated_worker_invalid recovering=faceted"
                 )
-            return report
         except Exception:
             reason = "the isolated analytic worker returned an unreadable report"
     if progress_callback is not None:

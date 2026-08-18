@@ -11,6 +11,12 @@ from shapely.geometry import Polygon
 
 import app.surface_brep as surface_brep
 import app.surface_reconstruction as surface_reconstruction
+from app.schemas import (
+    MeshReport,
+    ReconstructionReport,
+    ScoreReport,
+    SurfaceBRepReport,
+)
 from app.surface_brep import (
     build_faceted_brep,
     build_surface_brep,
@@ -23,6 +29,8 @@ from app.surface_graph import (
     PlanarPatch,
     SurfaceAdjacency,
     SurfaceGraph,
+    ToroidalPatch,
+    _plane_basis,
 )
 from app.surface_reconstruction import reconstruct_surfaces
 
@@ -222,6 +230,72 @@ def test_tiny_mesh_uses_scale_aware_kernel_tolerances() -> None:
     assert result.closed
     assert result.face_count == 3
     assert result.free_edge_count == 0
+
+
+def test_clipped_torus_uses_segmented_uv_boundary_wire() -> None:
+    major_radius = 8.0
+    minor_radius = 1.5
+    axis = np.asarray([0.0, 0.0, 1.0])
+    first, second = _plane_basis(axis)
+    u_values = np.linspace(0.2, 0.8, 80)
+    v_values = np.linspace(-0.7, 0.87, 40)
+    u_grid, v_grid = np.meshgrid(u_values, v_values, indexing="ij")
+    radial = (
+        np.cos(u_grid)[..., None] * first
+        + np.sin(u_grid)[..., None] * second
+    )
+    vertices = (
+        (major_radius + minor_radius * np.cos(v_grid))[..., None] * radial
+        + (minor_radius * np.sin(v_grid))[..., None] * axis
+    ).reshape((-1, 3))
+    faces: list[tuple[int, int, int]] = []
+    columns = len(v_values)
+    for row in range(len(u_values) - 1):
+        for column in range(columns - 1):
+            first_index = row * columns + column
+            faces.extend(
+                (
+                    (first_index, first_index + columns, first_index + columns + 1),
+                    (first_index, first_index + columns + 1, first_index + 1),
+                )
+            )
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    boundary_indices = (
+        [row * columns for row in range(len(u_values))]
+        + [
+            (len(u_values) - 1) * columns + column
+            for column in range(1, columns)
+        ]
+        + [
+            row * columns + columns - 1
+            for row in range(len(u_values) - 2, -1, -1)
+        ]
+        + [column for column in range(columns - 2, 0, -1)]
+        + [0]
+    )
+    patch = ToroidalPatch(
+        patch_id="clipped-torus",
+        face_indices=np.arange(len(faces), dtype=np.int64),
+        vertex_indices=np.arange(len(vertices), dtype=np.int64),
+        center=np.zeros(3),
+        axis=axis,
+        major_radius=major_radius,
+        minor_radius=minor_radius,
+        area=float(mesh.area),
+        boundary_loops=[vertices[boundary_indices]],
+        rms_error=0.0,
+        max_error=0.0,
+        normal_error_degrees=0.0,
+    )
+    model = surface_brep._surface_model(patch, mesh)
+
+    face = surface_brep._uv_boundary_face(model, mesh, 0.01)
+
+    assert face is not None
+    assert cq.Face(face).isValid()
+    assert cq.Face(face).geomType() == "TORUS"
+    assert len(cq.Face(face).Edges()) > 4
+    assert cq.Face(face).Area() == pytest.approx(mesh.area, rel=0.01)
 
 
 def test_box_boundaries_use_one_canonical_edge_and_vertex_graph() -> None:
@@ -500,3 +574,85 @@ def test_native_worker_failure_is_reported_as_faceted_best_effort(
     assert report.surface.faceted_face_count == len(mesh.faces)
     assert report.surface.closed
     assert report.score is not None and report.score.valid_solid
+
+
+def test_invalid_worker_solid_preserves_diagnostic_then_uses_faceted_carrier(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    mesh = trimesh.creation.box(extents=(7, 5, 3))
+    stl_path = tmp_path / "input.stl"
+    mesh.export(stl_path)
+    invalid_report = ReconstructionReport(
+        id="invalid-worker-test",
+        status="best_effort",
+        engine="surface_brep",
+        mesh=MeshReport(
+            file_name="input.stl",
+            triangle_count=len(mesh.faces),
+            vertex_count=len(mesh.vertices),
+            watertight=True,
+            body_count=1,
+            dimensions_mm=tuple(float(value) for value in mesh.extents),
+            volume_mm3=float(mesh.volume),
+            surface_area_mm2=float(mesh.area),
+            input_units="mm",
+            unit_scale=1.0,
+        ),
+        plan=None,
+        surface=SurfaceBRepReport(
+            recognized_surface_count=6,
+            surface_counts={"plane": 6},
+            adjacency_count=12,
+            brep_face_count=6,
+            solid_count=0,
+            free_edge_count=3,
+            sewing_tolerance_mm=0.01,
+            closed=False,
+        ),
+        score=ScoreReport(
+            score=100.0,
+            chamfer_rms_mm=0.0,
+            chamfer_p95_mm=0.0,
+            chamfer_max_mm=0.0,
+            volume_error_percent=0.0,
+            valid_solid=False,
+            candidate_count=1,
+            valid_brep=False,
+        ),
+        warnings=["diagnostic open shell"],
+        elapsed_seconds=1.0,
+    )
+
+    def invalid_worker(*args, **kwargs):
+        (tmp_path / "reconstruction.step").write_text(
+            "invalid analytic diagnostic",
+            encoding="utf-8",
+        )
+        (tmp_path / "surface_graph.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "report.json").write_text(
+            invalid_report.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(surface_reconstruction.subprocess, "run", invalid_worker)
+
+    report = reconstruct_surfaces(
+        "invalid-worker-test",
+        stl_path,
+        "input.stl",
+    )
+
+    assert report.surface is not None
+    assert report.surface.source_mesh_fallback
+    assert report.surface.closed
+    assert report.score is not None and report.score.valid_solid
+    assert (tmp_path / "analytic_diagnostic.step").read_text(encoding="utf-8") == (
+        "invalid analytic diagnostic"
+    )
+    assert (tmp_path / "analytic_diagnostic_report.json").is_file()
+    assert (tmp_path / "analytic_diagnostic_surface_graph.json").is_file()
+    roundtrip = cq.importers.importStep(str(tmp_path / "reconstruction.step")).val()
+    assert roundtrip.isValid()
+    assert len(roundtrip.Solids()) == 1

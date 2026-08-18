@@ -38,7 +38,6 @@ from OCP.Geom import (
     Geom_SurfaceOfRevolution,
     Geom_ToroidalSurface,
 )
-from OCP.Geom2dAPI import Geom2dAPI_Interpolate
 from OCP.GeomAbs import GeomAbs_C0, GeomAbs_C2
 from OCP.GeomAPI import (
     GeomAPI_Interpolate,
@@ -76,7 +75,6 @@ from OCP.TColgp import (
     TColgp_Array1OfPnt,
     TColgp_Array2OfPnt,
     TColgp_HArray1OfPnt,
-    TColgp_HArray1OfPnt2d,
 )
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID, TopAbs_WIRE
 from OCP.TopExp import TopExp, TopExp_Explorer
@@ -1923,30 +1921,41 @@ def _uv_boundary_face(
         uv = _periodic_surface_uv(model, loop)
         if uv is None or len(uv) < 4:
             continue
-        # The first and last 3-D points are identical, but a non-contractible
-        # loop may legitimately end one period away in U or V.
-        parameters = TColgp_HArray1OfPnt2d(1, len(uv))
-        for index, value in enumerate(uv, start=1):
-            parameters.SetValue(index, gp_Pnt2d(float(value[0]), float(value[1])))
+        # Build the complete boundary as one coordinated UV wire. A single
+        # high-degree interpolated p-curve can self-intersect at the corners of
+        # a clipped cylinder or torus even though every source interval is
+        # valid. Keeping one exact surface segment per interval preserves those
+        # corners and lets ShapeFix repair the wire without increasing the
+        # sewing tolerance.
         try:
-            interpolator = Geom2dAPI_Interpolate(parameters, False, 1e-9)
-            interpolator.Perform()
-            if not interpolator.IsDone():
+            wire_maker = BRepBuilderAPI_MakeWire()
+            for index in range(len(uv) - 1):
+                segment = GCE2d_MakeSegment(
+                    gp_Pnt2d(float(uv[index, 0]), float(uv[index, 1])),
+                    gp_Pnt2d(float(uv[index + 1, 0]), float(uv[index + 1, 1])),
+                )
+                edge_maker = BRepBuilderAPI_MakeEdge(
+                    segment.Value(),
+                    model.surface,
+                )
+                if not edge_maker.IsDone():
+                    break
+                wire_maker.Add(edge_maker.Edge())
+            else:
+                if not wire_maker.IsDone():
+                    continue
+                wire = wire_maker.Wire()
+                if not wire.Closed():
+                    continue
+                signed_area = float(
+                    np.sum(
+                        uv[:-1, 0] * uv[1:, 1]
+                        - uv[:-1, 1] * uv[1:, 0]
+                    )
+                    / 2
+                )
+                candidates.append((abs(signed_area), wire))
                 continue
-            edge_maker = BRepBuilderAPI_MakeEdge(
-                interpolator.Curve(),
-                model.surface,
-            )
-            if not edge_maker.IsDone():
-                continue
-            wire_maker = BRepBuilderAPI_MakeWire(edge_maker.Edge())
-            if not wire_maker.IsDone():
-                continue
-            wire = wire_maker.Wire()
-            if not wire.Closed():
-                continue
-            signed_area = float(np.sum(uv[:-1, 0] * uv[1:, 1] - uv[:-1, 1] * uv[1:, 0]) / 2)
-            candidates.append((abs(signed_area), wire))
         except Exception:
             continue
     if not candidates:
