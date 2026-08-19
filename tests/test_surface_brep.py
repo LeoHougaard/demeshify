@@ -549,6 +549,57 @@ def test_source_topology_faceted_fallback_is_a_valid_step_solid(tmp_path) -> Non
     assert len(roundtrip.Solids()) == 1
 
 
+def test_source_topology_faceted_fallback_preserves_multiple_bodies(
+    tmp_path,
+) -> None:
+    first = trimesh.creation.box(extents=(10, 8, 6))
+    second = trimesh.creation.box(extents=(2, 2, 2))
+    second.apply_translation((20, 0, 0))
+    mesh = trimesh.util.concatenate((first, second))
+
+    result = build_faceted_brep(
+        _mesh_data(mesh),
+        reason="test multibody recovery",
+    )
+
+    assert result.valid
+    assert result.closed
+    assert result.free_edge_count == 0
+    assert result.solid_count == 2
+    assert len(result.shape.Solids()) == 2
+    assert all(solid.isValid() for solid in result.shape.Solids())
+
+    export_surface_brep(result, tmp_path, verify_roundtrip=False)
+    roundtrip = cq.importers.importStep(str(tmp_path / "reconstruction.step")).val()
+    assert roundtrip.isValid()
+    assert len(roundtrip.Solids()) == 2
+    assert all(solid.isValid() for solid in roundtrip.Solids())
+
+
+def test_source_topology_faceted_fallback_keeps_single_body_fast_path(
+    monkeypatch,
+) -> None:
+    mesh = trimesh.creation.box(extents=(10, 8, 6))
+    assert mesh.body_count == 1
+
+    def unexpected_component_graph(*_args, **_kwargs):
+        raise AssertionError("single-body carrier rebuilt the component graph")
+
+    monkeypatch.setattr(
+        trimesh.graph,
+        "connected_components",
+        unexpected_component_graph,
+    )
+
+    result = build_faceted_brep(
+        _mesh_data(mesh),
+        reason="test single-body recovery fast path",
+    )
+
+    assert result.valid
+    assert result.solid_count == 1
+
+
 def test_native_worker_failure_is_reported_as_faceted_best_effort(
     monkeypatch,
     tmp_path,

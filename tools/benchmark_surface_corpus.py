@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -169,7 +170,10 @@ def is_clean_analytic_reconstruction(
     )
 
 
-def benchmark_summary(results: list[dict[str, object]]) -> dict[str, object]:
+def benchmark_summary(
+    results: list[dict[str, object]],
+    wall_seconds: float | None = None,
+) -> dict[str, object]:
     total = len(results)
     statuses = Counter(str(result.get("status", "unknown")) for result in results)
     closed = sum(bool(result.get("closed")) for result in results)
@@ -185,7 +189,7 @@ def benchmark_summary(results: list[dict[str, object]]) -> dict[str, object]:
         for result in results
         if isinstance(result.get("free_edge_count"), int)
     ]
-    return {
+    summary = {
         "case_count": total,
         "status_counts": dict(statuses),
         "valid_brep_rate": valid_brep / max(total, 1),
@@ -197,6 +201,9 @@ def benchmark_summary(results: list[dict[str, object]]) -> dict[str, object]:
         "total_free_edges": sum(free_edges),
         "maximum_free_edges": max(free_edges, default=0),
     }
+    if wall_seconds is not None:
+        summary["wall_seconds"] = wall_seconds
+    return summary
 
 
 def benchmark_case(
@@ -279,6 +286,7 @@ def benchmark_case(
             ),
             "triangles": report.mesh.triangle_count,
             "status": report.status,
+            "elapsed_seconds": report.elapsed_seconds,
             "recognized_surface_count": (
                 surface.recognized_surface_count if surface else 0
             ),
@@ -324,6 +332,11 @@ def benchmark_case(
                 "reconstruction.step",
                 "surface_graph.json",
                 "report.json",
+                "analytic_diagnostic.stl",
+                "analytic_diagnostic.step",
+                "analytic_diagnostic_joined_surfaces.step",
+                "analytic_diagnostic_surface_graph.json",
+                "analytic_diagnostic_report.json",
             ):
                 artifact = working / name
                 if artifact.is_file():
@@ -445,11 +458,18 @@ def _bounded_case(
     return json.loads(cache_path.read_text(encoding="utf-8"))
 
 
-def _write_output(path: Path, results: list[dict[str, object]]) -> None:
+def _write_output(
+    path: Path,
+    results: list[dict[str, object]],
+    wall_seconds: float | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
-            {"summary": benchmark_summary(results), "results": results},
+            {
+                "summary": benchmark_summary(results, wall_seconds),
+                "results": results,
+            },
             indent=2,
         ),
         encoding="utf-8",
@@ -518,6 +538,7 @@ def main() -> None:
     cache_directory = arguments.output.parent / f"{arguments.output.stem}_cases"
     cache_directory.mkdir(parents=True, exist_ok=True)
     results_by_index: dict[int, dict[str, object]] = {}
+    benchmark_started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=max(arguments.workers, 1)) as executor:
         futures = {
             executor.submit(
@@ -536,7 +557,11 @@ def main() -> None:
             result = future.result()
             results_by_index[index] = result
             ordered = [results_by_index[item] for item in sorted(results_by_index)]
-            _write_output(arguments.output, ordered)
+            _write_output(
+                arguments.output,
+                ordered,
+                time.perf_counter() - benchmark_started,
+            )
             print(
                 f"[{completed}/{len(cases)}] {result['id']}: "
                 f"{result['status']}, closed={result.get('closed')}, "
@@ -545,8 +570,9 @@ def main() -> None:
             )
 
     results = [results_by_index[item] for item in sorted(results_by_index)]
-    _write_output(arguments.output, results)
-    print(json.dumps(benchmark_summary(results), indent=2))
+    wall_seconds = time.perf_counter() - benchmark_started
+    _write_output(arguments.output, results, wall_seconds)
+    print(json.dumps(benchmark_summary(results, wall_seconds), indent=2))
 
 
 if __name__ == "__main__":

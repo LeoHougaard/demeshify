@@ -10,6 +10,7 @@ from pathlib import Path
 
 import cadquery as cq
 import numpy as np
+import trimesh
 from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve
 from OCP.BRepBuilderAPI import (
@@ -3516,18 +3517,44 @@ def build_faceted_brep(
             raise ValueError("Could not construct a source triangle face")
         faces.append(face_maker.Face())
 
-    shell = TopoDS_Shell()
-    builder.MakeShell(shell)
-    for face in faces:
-        builder.Add(shell, face)
-    shell.Closed(True)
-    solid_maker = BRepBuilderAPI_MakeSolid(shell)
-    if not solid_maker.IsDone():
-        raise ValueError("Could not construct a solid from source mesh topology")
-    solid = solid_maker.Solid()
-    shape = cq.Shape(solid)
-    if not BRepCheck_Analyzer(solid).IsValid() or not shape.isValid():
-        raise ValueError("Source mesh topology produced an invalid faceted solid")
+    # ``mesh.body_count`` was already computed while loading the mesh.
+    # Preserve the original linear carrier path for the overwhelmingly common
+    # one-body case: rebuilding a 75k-face adjacency graph here can push an
+    # otherwise completed dense recovery past its outer benchmark budget.
+    components = (
+        [range(len(faces))]
+        if mesh.body_count == 1
+        else trimesh.graph.connected_components(
+            np.asarray(mesh.face_adjacency, dtype=np.int64),
+            nodes=np.arange(len(faces), dtype=np.int64),
+        )
+    )
+    solids: list[TopoDS_Solid] = []
+    for component in components:
+        shell = TopoDS_Shell()
+        builder.MakeShell(shell)
+        for face_index in component:
+            builder.Add(shell, faces[int(face_index)])
+        shell.Closed(True)
+        solid_maker = BRepBuilderAPI_MakeSolid(shell)
+        if not solid_maker.IsDone():
+            raise ValueError("Could not construct a solid from source mesh topology")
+        solid = solid_maker.Solid()
+        if not BRepCheck_Analyzer(solid).IsValid() or not cq.Shape(solid).isValid():
+            raise ValueError("Source mesh topology produced an invalid faceted solid")
+        solids.append(solid)
+    if not solids:
+        raise ValueError("Source mesh topology produced no faceted solids")
+    shape = (
+        cq.Shape(solids[0])
+        if len(solids) == 1
+        else cq.Compound.makeCompound([cq.Shape(solid) for solid in solids])
+    )
+    # Each solid was already checked above. Revalidating a single dense solid
+    # here repeats a full 75k-face traversal and can consume the remaining
+    # recovery budget; only the newly introduced compound needs a final check.
+    if len(solids) > 1 and not shape.isValid():
+        raise ValueError("Source mesh topology produced an invalid faceted compound")
 
     retained_graph = graph or SurfaceGraph()
     counts = {
@@ -3545,7 +3572,7 @@ def build_faceted_brep(
         graph=retained_graph,
         surface_counts=counts,
         face_count=len(faces),
-        solid_count=1,
+        solid_count=len(solids),
         free_edge_count=0,
         sewing_tolerance=tolerance,
         valid=True,

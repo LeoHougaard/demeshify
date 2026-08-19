@@ -73,6 +73,77 @@ viewer, the recovered `78685` STEP result matched the source silhouette and
 through-hole without a visible open seam, while residual triangle regions and
 the `REJECTED: FALLBACK GEOMETRY` label remained clearly exposed.
 
+## 2026-08-19 pinned Voron assemblies and multi-body recovery
+
+To add representative printable parts without relying on filenames or model
+site scraping, `materialize_assembly_corpus.py` matches watertight STL files to
+individual solids in official assembly STEP files using unique, one-to-one
+absolute-volume and surface-area signatures. The generated manifests retain
+the upstream URL, exact commit, GPL-3.0 license, hashes, signatures, and STEP
+topology metadata. The pinned sources produced 3 Tap R8 and 19 Stealthburner
+Clockwork 2 matches; all other files were rejected rather than guessed.
+
+The strict gate was frozen before iteration: valid closed solid, zero free
+edges, unchanged error limit, and successful STEP re-import are required for
+geometric acceptance. Clean analytic acceptance additionally forbids every
+faceted carrier or hybrid face. On the same one-worker, 240-second setup, the
+old commit and candidate compare as follows:
+
+| Metric | `a284287` | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Cases | 22 | 22 | — |
+| Strict geometric acceptance | 21 | 22 | +1 |
+| Clean analytic acceptance | 1 | 1 | 0 |
+| Valid STEP re-imports | 21 | 22 | +1 |
+| Full faceted carriers | 13 | 14 | +1 recovered case |
+| Any faceted geometry | 17 | 18 | +1 recovered case |
+| Timeouts / crashes | 0 / 1 | 0 / 0 | crash removed |
+| Total / maximum free edges among accepted cases | 0 / 0 | 0 / 0 | unchanged |
+| Wall time | 1,240.179 s | 1,250.089 s | +0.8% |
+| Case-P95 P50 / P90 / P95 / P99 / max (mm) | 4.019e-14 / 0.003189 / 0.003305 / 0.003318 / 0.003321 | 3.599e-14 / 0.003114 / 0.003300 / 0.003318 / 0.003321 | no error regression |
+
+The recovered Stealthburner cable-door STL contains two disconnected watertight
+bodies: a 3,066-face main body and a 50-face, approximately 0.099 mm³ body. The
+old fallback forced both components into one invalid shell. The carrier now
+constructs and validates one solid per connected face component and returns a
+valid two-solid compound. Its STEP re-import contains two valid solids, zero
+free edges, and 1.465e-14 mm P95 error. It remains explicitly labelled rejected
+fallback geometry and does not increase analytic coverage.
+
+The improvement-loop iteration record is:
+
+1. **Promote corpus materialization:** unique geometric matching reproduced 22
+   official printable STL/STEP pairs and rejected open or ambiguous candidates.
+2. **Reject trim-shell healing:** six Voron analytic shells were edge-closed but
+   contained `BRepCheck_BadOrientationOfSubshape` in one or two face trim wires.
+   STEP re-import, `ShapeFix`, face rebuild, and wire rebuild candidates either
+   remained invalid or failed STEP re-import.
+3. **Reject the first multi-body candidate:** although it recovered the crash,
+   it added a fifth stress timeout on dense case `129428_edce5555_0` by rebuilding
+   a component graph for every fallback.
+4. **Revise and promote:** reuse the mesh's cached one-body result, compute
+   connected components only for genuine multi-body inputs, and avoid a second
+   redundant whole-shape validity traversal after the single solid has already
+   passed both OCCT and CadQuery validation. The dense matched control passed in
+   about 221 seconds on `a284287`; the final candidate passed in 236.633 seconds,
+   within the unchanged 240-second budget.
+
+Final exact-manifest verification preserves the prior headline gates. Curated
+`improvement_curated60_voron_v1.json` is 60/60 strict-valid with 60 STEP
+re-imports, zero free edges, zero timeouts/crashes, and 41/60 clean analytic;
+its one-worker wall time was 2,054.625 seconds versus the prior 1,950.3 seconds.
+Stress `improvement_stress60_voron_v2.json` remains 53/60 strict-valid with 53
+STEP re-imports, zero free edges among successes, 35/60 clean analytic, four
+timeouts, and three open/inconsistent-source crashes; wall time was 3,512.430
+seconds versus 3,423.138 seconds. Error percentiles and failed case identities
+are unchanged from the 2026-08-18 exact runs. These +5.3% and +2.6% wall-time
+movements are reported as sequential-run variability, not a scaling win.
+
+In the real viewer, the recovered cable-door STEP preserved the source
+silhouette and separate small cylindrical body. The UI correctly displayed
+`REJECTED: FALLBACK GEOMETRY`, zero analytic surfaces, and all 3,116 fallback
+faces; input and STEP edge overlays agreed without a visible missing component.
+
 ## Failure mechanisms observed during development
 
 | Mechanism | Evidence | Common fix | Status |
@@ -102,15 +173,21 @@ the `REJECTED: FALLBACK GEOMETRY` label remained clearly exposed.
 | Dense failed extrusion enters GeomPlate | A 1,538-face patch spent more than a minute in a native plate solve | Apply the same vertex, face, and boundary-complexity limits used for other residual types | Implemented |
 | Smooth non-planar model over-segmented by local consensus | `78685_2fe9291a_2` grew from 10 useful swept patches to 43 fragments and reached an unsafe plate fit | Reserve aggressive local peeling for models with planar mechanical datums or very dense meshes | Improved to a watertight hybrid STEP with 0.01188 mm P95; two residual faceted regions remain and are not analytic success |
 | Open/inconsistent source cannot use closed faceted carrier | Parent recovery raises when an analytic worker fails and the STL itself is not manifold | Repair or reconstruct source topology before carrier construction; do not label an open quilt watertight | Improved for `78685`; still open for `104995`, `66762`, and `51913` |
+| Disconnected watertight bodies forced into one shell | Voron cable-door source has two closed components; one-shell fallback was invalid | Build and validate one solid per connected component, then return a validated compound | Implemented and STEP round-trip tested |
+| Dense single-body fallback repeats whole-shape validation | `129428_edce5555_0` passed the old control but timed out after broad component handling | Use cached one-body topology and retain per-solid OCCT/CadQuery checks without a duplicate compound traversal | Implemented; exact stress timeout set restored |
+| Edge-closed Voron shell has bad trim-wire orientation | Six zero-free-edge shells contain `BadOrientationOfSubshape` inside one or two analytic faces | Reconstruct coordinated UV boundary wires and shared 3-D trim edges rather than post-hoc shell healing | Open; repair attempts rejected by unchanged STEP gate |
 
 ## Next common fix
 
 Correctness coverage on the curated corpus remains 60/60 without weakening the
-acceptance gate, and the exact stress run improves from 50/60 to 53/60. The
-coordinated periodic UV wire is implemented; the next periodic step is sharing
-its physical 3-D trim edges between adjacent analytic supports so `147141` does
-not retain 15 free edges before recovery. The separate scaling priority is a
-topology-repair carrier for the three remaining open/inconsistent stress inputs,
-plus the four dense cases that still exceed 240 seconds. Until those mechanisms
-succeed, invalid fitted shells remain diagnostic-only and a faceted carrier is
-retained only when the source mesh can validly supply one.
+acceptance gate, the exact stress run remains 53/60, and the new official Voron
+set improves from 21/22 to 22/22 strict correctness. Voron clean analytic
+coverage is still only 1/22: six edge-closed invalid trim shells, four valid
+hybrids, three open analytic cracks, three analytic timeouts, three valid but
+non-clean B-spline results, and two carrier-only recoveries expose the next
+work. The highest-value common fix remains coordinated UV wires that reuse one
+physical 3-D trim edge across adjacent periodic/freeform supports. Separately,
+the exact stress limitations remain the four cases exceeding 240 seconds and
+the three open/inconsistent inputs (`104995`, `66762`, `51913`) that cannot
+truthfully use a closed source-topology carrier. Invalid shells remain
+diagnostic-only until they pass the unchanged solid, error, and STEP gates.

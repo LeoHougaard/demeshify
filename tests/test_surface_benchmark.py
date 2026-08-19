@@ -29,13 +29,15 @@ def test_surface_benchmark_summary_tracks_watertight_step_acceptance() -> None:
                 "accepted": False,
                 "free_edge_count": 7,
             },
-        ]
+        ],
+        wall_seconds=12.5,
     )
 
     assert summary["case_count"] == 2
     assert summary["watertight_rate"] == 0.5
     assert summary["accepted_rate"] == 0.5
     assert summary["total_free_edges"] == 7
+    assert summary["wall_seconds"] == 12.5
 
 
 def test_faceted_geometric_match_is_not_an_analytic_success() -> None:

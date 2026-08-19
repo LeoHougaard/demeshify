@@ -31,3 +31,34 @@ Recommended sources:
 
 Do not scrape arbitrary model sites. A downloadable file is not automatically
 licensed for training, redistribution, or commercial use.
+
+## Pinned open-source assemblies
+
+`materialize_assembly_corpus.py` builds a strict corpus when a project publishes
+both printable STL parts and an assembly STEP. It compares rotation-invariant
+absolute volume and surface-area signatures, requires a unique one-to-one
+match, rejects open meshes and ambiguous matches, and exports the matched STEP
+solid as ground truth. The resulting manifest records the upstream URL, exact
+commit, license, file hashes, signatures, and STEP face/edge types.
+
+The checked benchmark artifacts use the GPL-3.0 Voron sources at these pinned
+commits:
+
+- Voron Tap: `29e900094a0f094aad88493c76ec5a6d39f94812`
+- Voron Stealthburner: `8bcb9c246fac19d8ac03931ef97fa07c5e5f0f2b`
+
+For example:
+
+```powershell
+.\.venv\Scripts\python.exe tools\materialize_assembly_corpus.py `
+  path\to\Tap_R8.step path\to\Voron-Tap\STLs `
+  --output datasets\voron_tap_r8 `
+  --source-name "Voron Tap R8" `
+  --source-url "https://github.com/VoronDesign/Voron-Tap" `
+  --source-commit 29e900094a0f094aad88493c76ec5a6d39f94812 `
+  --source-license GPL-3.0
+```
+
+Third-party model files and generated benchmark outputs remain ignored. Re-run
+the materializer from the pinned source checkout to reproduce them; do not
+commit or redistribute upstream geometry from this repository.
