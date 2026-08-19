@@ -1,0 +1,19 @@
+name: Feature request
+description: Suggest a focused product or reconstruction improvement.
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: What are you trying to reconstruct or do?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the smallest change that would solve the problem.
+    validations:
+      required: true

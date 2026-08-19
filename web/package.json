@@ -1,8 +1,11 @@
 {
-  "name": "meshmind-web",
+  "name": "stl-to-step-converter-web",
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build"

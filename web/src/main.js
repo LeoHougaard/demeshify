@@ -22,6 +22,11 @@ let undoStack = [];
 let redoStack = [];
 let editorBusy = false;
 let projectionMode = "perspective";
+let fileSelectionVersion = 0;
+let drawerReturnFocus = null;
+
+const MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
+const MAX_PREVIEW_BYTES = 50 * 1024 * 1024;
 
 const escapeHtml = (value) =>
   String(value ?? "")
@@ -29,174 +34,6 @@ const escapeHtml = (value) =>
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
-
-/* Previous multi-section layout retained temporarily for migration reference.
-  <header class="topbar">
-    <a class="brand" href="/">
-      <span class="brand-mark"><i></i><i></i><i></i></span>
-      <span>STL to STEP <b>Converter</b></span>
-    </a>
-    <div id="engineStatus" class="status-pill"><span></span> Checking reconstruction engine</div>
-  </header>
-  <main>
-    <section class="hero">
-      <div class="eyebrow">Mesh → manufacturing intent</div>
-      <h1>Turn mechanical STL files into <em>editable CAD.</em></h1>
-      <p>Automatic feature inference, geometric verification, and clean STEP export—without a human reverse-engineering pass.</p>
-    </section>
-
-    <section class="workspace">
-      <aside class="control-card">
-        <div class="step-label"><span>01</span> Source mesh</div>
-        <label id="dropzone" class="dropzone">
-          <input id="fileInput" type="file" accept=".stl,model/stl" />
-          <div class="upload-icon">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v5h14v-5"/></svg>
-          </div>
-          <strong>Drop your STL here</strong>
-          <span>or choose a file · up to 250 MB</span>
-        </label>
-        <div id="fileChip" class="file-chip hidden"></div>
-
-        <div class="field-row">
-          <label class="field">
-            <span>STL units</span>
-            <select id="units">
-              <option value="mm">Millimetres</option>
-              <option value="in">Inches</option>
-              <option value="cm">Centimetres</option>
-              <option value="m">Metres</option>
-            </select>
-          </label>
-          <label class="field">
-            <span>Reconstruction method</span>
-            <select id="engine">
-              <option value="surface_brep">Recognized surfaces (recommended)</option>
-              <option value="feature_tree">Parametric feature history</option>
-            </select>
-            <small>Surface mode fits analytic and B-spline faces to mesh nodes, then sews them where their boundaries close.</small>
-          </label>
-        </div>
-
-        <div class="step-label prompt-label"><span>02</span> Optional design intent</div>
-        <label class="field">
-          <span id="promptLabel">Tell the AI what matters</span>
-          <textarea id="prompt" rows="3" placeholder="e.g. Keep the four mounting holes exact and use nominal dimensions"></textarea>
-          <small id="promptHelp">Checking whether LLM refinement is configured.</small>
-        </label>
-
-        <button id="reconstructButton" class="primary-button" disabled>
-          <span>Reconstruct editable CAD</span>
-          <svg viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></svg>
-        </button>
-        <div id="errorBox" class="error-box hidden"></div>
-      </aside>
-
-      <div class="visual-card">
-        <div class="visual-toolbar">
-          <div>
-            <span class="visual-title">Geometry preview</span>
-            <span id="previewSubtitle" class="visual-subtitle">Waiting for an STL</span>
-          </div>
-          <div id="viewTabs" class="view-tabs hidden">
-            <button data-view="input">Input mesh</button>
-            <button class="active" data-view="output">CAD result</button>
-          </div>
-        </div>
-        <div id="viewer" class="viewer">
-          <div id="viewerEmpty" class="viewer-empty">
-            <div class="grid-cube"><span></span><span></span><span></span></div>
-            <p>Your model will appear here</p>
-          </div>
-          <canvas id="inputCanvas"></canvas>
-          <canvas id="outputCanvas" class="hidden"></canvas>
-          <div id="surfaceLegend" class="surface-legend hidden">
-            <span><i class="fitted-edge"></i>Fitted surface boundary</span>
-            <span><i class="faceted-edge"></i>Fallback triangle edges</span>
-            <small id="surfaceLegendStatus"></small>
-          </div>
-          <div id="processing" class="processing hidden">
-            <div class="processing-card">
-              <div class="processing-heading">
-                <div class="scan-object"><span></span></div>
-                <div>
-                  <small>LIVE · PROVISIONAL CAD</small>
-                  <strong id="processingStage">Starting reconstruction</strong>
-                </div>
-              </div>
-              <p id="processingText">Preparing the local geometry engine</p>
-              <div class="progress"><i id="progressBar"></i></div>
-              <div class="progress-meta">
-                <span id="progressPercent">0%</span>
-                <span id="progressElapsed">0 seconds</span>
-              </div>
-              <p id="progressCounts" class="progress-counts">Waiting for geometry data</p>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <section id="results" class="results hidden">
-      <div class="result-heading">
-        <div>
-          <div class="eyebrow">Reconstruction report</div>
-          <h2 id="resultTitle">Editable model ready</h2>
-        </div>
-        <div id="confidence" class="confidence"></div>
-      </div>
-      <div class="metric-grid">
-        <article><span>Surface deviation P95</span><strong id="p95">—</strong><small>millimetres</small></article>
-        <article><span>Volume difference</span><strong id="volumeError">—</strong><small>percent</small></article>
-        <article><span>Detected construction</span><strong id="construction">—</strong><small id="constructionUnit">CAD representation</small></article>
-        <article><span>Processing time</span><strong id="elapsed">—</strong><small>seconds</small></article>
-      </div>
-      <div class="result-grid">
-        <article class="feature-card">
-          <h3 id="constructionHeading">Editable feature plan</h3>
-          <div id="featurePlan"></div>
-        </article>
-        <article class="download-card">
-          <h3>Export model</h3>
-          <p>STEP is compatible with Fusion, SolidWorks, FreeCAD, Onshape, and most mechanical CAD systems.</p>
-          <div id="downloads" class="downloads"></div>
-        </article>
-      </div>
-      <article id="featureEditor" class="feature-editor hidden">
-        <div class="editor-heading">
-          <div>
-            <div class="step-label"><span>03</span> Parametric feature tree</div>
-            <h3>Edit the reconstruction before export</h3>
-            <p>Change measured dimensions, suppress or reorder operations, then rebuild and verify against the original STL.</p>
-          </div>
-          <div class="editor-history-actions">
-            <button id="undoEdit" type="button" title="Undo local edit">Undo</button>
-            <button id="redoEdit" type="button" title="Redo local edit">Redo</button>
-            <button id="resetAllDimensions" type="button" title="Restore every measured value">Reset measured</button>
-          </div>
-        </div>
-        <div class="editor-layout">
-          <aside class="timeline-panel">
-            <div class="panel-label">Ordered history <small id="treeRevision"></small></div>
-            <div id="featureTree" class="feature-tree"></div>
-          </aside>
-          <section class="parameter-panel">
-            <div id="parameterHeader" class="parameter-header"></div>
-            <div id="parameterEditor" class="parameter-editor"></div>
-          </section>
-        </div>
-        <div class="editor-footer">
-          <div id="editorFeedback" class="editor-feedback"></div>
-          <button id="applyFeatureEdits" class="apply-edit-button" type="button">
-            Apply, rebuild &amp; verify
-          </button>
-        </div>
-      </article>
-      <div id="warnings"></div>
-    </section>
-  </main>
-  <footer><span>STL to STEP Converter · local-first reverse engineering</span><span>Outputs are verified against the source mesh</span></footer>
-*/
 
 // The converter is deliberately a single-screen tool. Detailed controls and
 // diagnostic output live in the Advanced drawer so the primary workflow stays
@@ -209,7 +46,7 @@ app.innerHTML = `
     </a>
     <div class="header-actions">
       <div id="engineStatus" class="status-pill"><span></span> Checking converter</div>
-      <button id="advancedToggle" class="advanced-toggle" type="button">Advanced</button>
+      <button id="advancedToggle" class="advanced-toggle" type="button" aria-controls="advancedDrawer" aria-expanded="false">Advanced</button>
     </div>
   </header>
 
@@ -217,21 +54,22 @@ app.innerHTML = `
     <aside class="converter-sidebar">
       <section class="import-panel">
         <div class="section-heading"><span>1</span><div><strong>Import STL</strong><small>Choose the mesh to convert</small></div></div>
-        <label id="dropzone" class="dropzone compact-dropzone">
-          <input id="fileInput" type="file" accept=".stl,model/stl" />
+        <label id="dropzone" class="dropzone compact-dropzone" role="button" tabindex="0">
+          <input id="fileInput" type="file" accept=".stl,model/stl" aria-label="Choose an STL file" />
           <div class="upload-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v5h14v-5"/></svg></div>
           <strong>Drop STL here</strong><span>or click to choose a file</span>
         </label>
+        <button id="sampleButton" class="sample-button" type="button">Try the sample plate</button>
         <div id="fileChip" class="file-chip hidden"></div>
       </section>
 
       <button id="reconstructButton" class="primary-button convert-button" disabled>
         <span>Convert to STEP</span><svg viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></svg>
       </button>
-      <div id="errorBox" class="error-box hidden"></div>
-      <div id="baseWarnings" class="base-warnings hidden"></div>
+      <div id="errorBox" class="error-box hidden" role="alert"></div>
+      <div id="baseWarnings" class="base-warnings hidden" aria-live="polite"></div>
 
-      <section id="results" class="compact-results hidden">
+      <section id="results" class="compact-results hidden" aria-live="polite">
         <div class="compact-result-heading">
           <div><small>Conversion result</small><strong id="resultTitle">STEP file ready</strong></div>
           <div id="confidence" class="confidence"></div>
@@ -250,19 +88,19 @@ app.innerHTML = `
       <div class="visual-toolbar">
         <div><span class="visual-title">Model viewer</span><span id="previewSubtitle" class="visual-subtitle">Import an STL to begin</span></div>
         <div class="viewer-actions">
-          <div id="projectionTabs" class="view-tabs projection-tabs" aria-label="Camera projection">
-            <button class="active" data-projection="perspective">Perspective</button><button data-projection="orthographic">Orthographic</button>
+          <div id="projectionTabs" class="view-tabs projection-tabs" role="group" aria-label="Camera projection">
+            <button class="active" data-projection="perspective" aria-pressed="true">Perspective</button><button data-projection="orthographic" aria-pressed="false">Orthographic</button>
           </div>
-          <div id="viewTabs" class="view-tabs hidden"><button data-view="input">Input mesh</button><button class="active" data-view="output">STEP result</button></div>
+          <div id="viewTabs" class="view-tabs hidden" role="group" aria-label="Displayed model"><button data-view="input" aria-pressed="false">Input mesh</button><button class="active" data-view="output" aria-pressed="true">STEP result</button></div>
         </div>
       </div>
       <div id="viewer" class="viewer">
-        <div id="viewerEmpty" class="viewer-empty"><div class="empty-file">STL</div><strong>Import a model to inspect it</strong><p>Drag to orbit · scroll to zoom</p></div>
+        <div id="viewerEmpty" class="viewer-empty"><div class="empty-file">STL</div><strong>Import a model to inspect it</strong><p>Drag to orbit · pinch or scroll to zoom</p></div>
         <canvas id="inputCanvas"></canvas><canvas id="outputCanvas" class="hidden"></canvas>
         <div id="surfaceLegend" class="surface-legend hidden"><span><i class="fitted-edge"></i>Fitted surface boundary</span><span><i class="faceted-edge"></i>Fallback triangle edges</span><small id="surfaceLegendStatus"></small></div>
         <div id="inputTriangleLegend" class="surface-legend input-triangle-legend hidden"><span><i class="source-triangle-edge"></i>Every source STL triangle edge</span><small id="inputTriangleLegendStatus"></small></div>
         <div class="navigation-hint">Right-drag rotates around model center · Middle-drag pan · Wheel zoom</div>
-        <div id="processing" class="processing hidden">
+        <div id="processing" class="processing hidden" role="status" aria-live="polite">
           <div class="processing-card">
             <div class="processing-heading"><div class="scan-object"><span></span></div><div><small>CONVERTING</small><strong id="processingStage">Starting reconstruction</strong></div></div>
             <p id="processingText">Preparing the geometry engine</p><div class="progress"><i id="progressBar"></i></div>
@@ -274,16 +112,15 @@ app.innerHTML = `
   </main>
 
   <div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
-  <aside id="advancedDrawer" class="advanced-drawer hidden" aria-label="Advanced converter options">
-    <header class="drawer-header"><div><small>Optional controls</small><strong>Advanced</strong></div><button id="advancedClose" type="button" aria-label="Close advanced settings">×</button></header>
+  <aside id="advancedDrawer" class="advanced-drawer hidden" role="dialog" aria-modal="true" aria-labelledby="advancedTitle" aria-hidden="true">
+    <header class="drawer-header"><div><small>Optional controls</small><strong id="advancedTitle">Advanced</strong></div><button id="advancedClose" type="button" aria-label="Close advanced settings">×</button></header>
     <div class="drawer-content">
       <section class="advanced-section">
         <h2>Conversion settings</h2>
         <div class="advanced-settings-grid">
           <label class="field"><span>STL units</span><select id="units"><option value="mm">Millimetres</option><option value="in">Inches</option><option value="cm">Centimetres</option><option value="m">Metres</option></select></label>
-          <label class="field"><span>Reconstruction method</span><select id="engine"><option value="surface_brep">Recognized surfaces (recommended)</option><option value="feature_tree">Parametric feature history</option></select><small>Fits analytic and B-spline surfaces, then joins their boundaries.</small></label>
+          <label class="field"><span>Reconstruction method</span><select id="engine"><option value="surface_brep">Recognized surfaces (recommended)</option><option value="feature_tree">Parametric feature history</option></select><small id="engineHelp">Fits analytic and B-spline surfaces, then joins their boundaries.</small></label>
         </div>
-        <label class="field advanced-prompt"><span id="promptLabel">Design intent is not needed</span><textarea id="prompt" rows="3" placeholder="For feature-history mode: keep the mounting holes exact"></textarea><small id="promptHelp">Surface mode reconstructs the final boundary directly from mesh geometry.</small></label>
       </section>
 
       <section class="advanced-section result-details">
@@ -301,20 +138,11 @@ app.innerHTML = `
   </aside>
 `;
 
-let aiConfigured = false;
-
 function updateEngineCopy() {
   const surfaceMode = document.querySelector("#engine").value === "surface_brep";
-  const prompt = document.querySelector("#prompt");
-  prompt.disabled = surfaceMode;
-  document.querySelector("#promptLabel").textContent = surfaceMode
-    ? "Design intent is not needed"
-    : "Tell the AI what matters";
-  document.querySelector("#promptHelp").textContent = surfaceMode
+  document.querySelector("#engineHelp").textContent = surfaceMode
     ? "Surface mode reconstructs the final boundary directly from mesh geometry."
-    : aiConfigured
-      ? "Your instruction may revise the measured feature plan; geometry scoring still gates it."
-      : "LLM refinement is off. Instructions are saved, but reconstruction remains deterministic.";
+    : "Feature-history mode builds an editable plan from measured mesh geometry.";
   document.querySelector("#reconstructButton span").textContent = "Convert to STEP";
 }
 
@@ -323,10 +151,8 @@ updateEngineCopy();
 
 fetch("/api/health")
   .then((response) => response.json())
-  .then((health) => {
-    aiConfigured = Boolean(health.ai_configured);
+  .then(() => {
     document.querySelector("#engineStatus").innerHTML = "<span></span> Converter ready";
-    updateEngineCopy();
   })
   .catch(() => {
     document.querySelector("#engineStatus").innerHTML = "<span></span> Converter offline";
@@ -760,19 +586,51 @@ const editorFeedback = document.querySelector("#editorFeedback");
 const applyFeatureEdits = document.querySelector("#applyFeatureEdits");
 const advancedDrawer = document.querySelector("#advancedDrawer");
 const drawerBackdrop = document.querySelector("#drawerBackdrop");
+const advancedToggle = document.querySelector("#advancedToggle");
+const advancedClose = document.querySelector("#advancedClose");
+const sampleButton = document.querySelector("#sampleButton");
 
 function setAdvancedOpen(open) {
+  const wasOpen = !advancedDrawer.classList.contains("hidden");
+  if (open === wasOpen) return;
+  if (open) drawerReturnFocus = document.activeElement;
   advancedDrawer.classList.toggle("hidden", !open);
   drawerBackdrop.classList.toggle("hidden", !open);
   document.body.classList.toggle("drawer-open", open);
+  advancedDrawer.setAttribute("aria-hidden", String(!open));
+  advancedToggle.setAttribute("aria-expanded", String(open));
+  if (open) {
+    advancedClose.focus();
+  } else if (drawerReturnFocus instanceof HTMLElement) {
+    drawerReturnFocus.focus();
+  }
 }
 
-document.querySelector("#advancedToggle").addEventListener("click", () => setAdvancedOpen(true));
-document.querySelector("#advancedClose").addEventListener("click", () => setAdvancedOpen(false));
+advancedToggle.addEventListener("click", () => setAdvancedOpen(true));
+advancedClose.addEventListener("click", () => setAdvancedOpen(false));
 document.querySelector("#openResultDetails").addEventListener("click", () => setAdvancedOpen(true));
 drawerBackdrop.addEventListener("click", () => setAdvancedOpen(false));
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") setAdvancedOpen(false);
+  if (advancedDrawer.classList.contains("hidden")) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    setAdvancedOpen(false);
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = [...advancedDrawer.querySelectorAll(
+    "button:not(:disabled), select:not(:disabled), textarea:not(:disabled), input:not(:disabled), a[href]",
+  )].filter((element) => element.getClientRects().length > 0);
+  if (focusable.length === 0) return;
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 });
 
 const cloneValue = (value) =>
@@ -908,12 +766,10 @@ function dimensionMeta(path, value) {
   const changed = Math.abs(delta) > 1e-10;
   const unit = isDimensionPath(path) ? " mm" : "";
   const source = editablePlan.parameter_sources?.[key] || "measured";
-  const locked = editablePlan.locked_parameters?.includes(key);
   return `<div class="parameter-field-meta">
     <span>measured ${measured.toFixed(4)}${unit}</span>
     <span class="${changed ? "changed" : ""}">${changed ? `Δ ${delta >= 0 ? "+" : ""}${delta.toFixed(4)}${unit}` : "unchanged"}</span>
     <span class="source">${escapeHtml(source)}</span>
-    <label title="Protect this parameter from AI revisions">lock <input class="parameter-lock" type="checkbox" data-lock-key="${escapeHtml(key)}" ${locked ? "checked" : ""}></label>
   </div>`;
 }
 
@@ -1154,14 +1010,6 @@ featureTree.addEventListener("change", (event) => {
 parameterEditor.addEventListener("change", (event) => {
   const input = event.target.closest("[data-param-path]");
   if (input && !editorBusy) applyLocalParameterChange(input);
-  const lock = event.target.closest("[data-lock-key]");
-  if (lock && !editorBusy) {
-    snapshotForUndo();
-    const values = new Set(editablePlan.locked_parameters || []);
-    lock.checked ? values.add(lock.dataset.lockKey) : values.delete(lock.dataset.lockKey);
-    editablePlan.locked_parameters = [...values].sort();
-    renderFeatureEditor();
-  }
 });
 
 document.querySelector("#undoEdit").addEventListener("click", () => {
@@ -1219,39 +1067,78 @@ const formatBytes = (bytes) => {
 
 async function chooseFile(file) {
   if (!file || !file.name.toLowerCase().endsWith(".stl")) {
-    showError("Please choose an STL file.");
+    showError("Choose a file with an .stl extension.");
+    fileInput.value = "";
     return;
   }
+  if (file.size === 0) {
+    showError("This STL is empty. Choose a file that contains mesh triangles.");
+    fileInput.value = "";
+    return;
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    showError("This STL is larger than the 250 MB upload limit.");
+    fileInput.value = "";
+    return;
+  }
+  const selectionVersion = ++fileSelectionVersion;
+  const showPreview = file.size <= MAX_PREVIEW_BYTES;
+  selectedFile = null;
+  button.disabled = true;
+  errorBox.classList.add("hidden");
+  if (showPreview) {
+    try {
+      const buffer = await file.arrayBuffer();
+      if (selectionVersion !== fileSelectionVersion) return;
+      inputViewer ||= new MeshViewer(inputCanvas, 0x8ebbd2);
+      await inputViewer.load(buffer);
+    } catch {
+      if (selectionVersion !== fileSelectionVersion) return;
+      fileInput.value = "";
+      showError("This file could not be read as an STL. Check that it is a valid binary or ASCII STL.");
+      return;
+    }
+  }
+  if (selectionVersion !== fileSelectionVersion) return;
   selectedFile = file;
   surfaceLegend.classList.add("hidden");
   surfaceLegendStatus.textContent = "";
-  inputTriangleLegend.classList.remove("hidden");
+  inputTriangleLegend.classList.toggle("hidden", !showPreview);
   errorBox.classList.add("hidden");
   baseWarnings.classList.add("hidden");
   fileChip.classList.remove("hidden");
   fileChip.innerHTML = `
     <span class="file-type">STL</span>
     <span><strong>${escapeHtml(file.name)}</strong><small>${formatBytes(file.size)}</small></span>
-    <button id="clearFile" aria-label="Remove file">×</button>
+    <button id="clearFile" type="button" aria-label="Remove file">×</button>
   `;
   document.querySelector("#clearFile").addEventListener("click", clearFile);
   dropzone.classList.add("hidden");
-  viewerEmpty.classList.add("hidden");
-  inputCanvas.classList.remove("hidden");
+  sampleButton.classList.add("hidden");
+  viewerEmpty.classList.toggle("hidden", showPreview);
+  viewerEmpty.querySelector("strong").textContent = showPreview
+    ? "Import a model to inspect it"
+    : "Preview skipped for this large STL";
+  viewerEmpty.querySelector("p").textContent = showPreview
+    ? "Drag to orbit · pinch or scroll to zoom"
+    : "Convert it to create a lighter result preview";
+  inputCanvas.classList.toggle("hidden", !showPreview);
   outputCanvas.classList.add("hidden");
-  inputViewer ||= new MeshViewer(inputCanvas, 0x8ebbd2);
-  await inputViewer.load(await file.arrayBuffer());
   document.querySelector("#previewSubtitle").textContent = file.name;
   button.disabled = false;
 }
 
 function clearFile(event) {
   event?.preventDefault();
+  fileSelectionVersion += 1;
   selectedFile = null;
   fileInput.value = "";
   fileChip.classList.add("hidden");
   dropzone.classList.remove("hidden");
+  sampleButton.classList.remove("hidden");
   viewerEmpty.classList.remove("hidden");
+  viewerEmpty.querySelector("strong").textContent = "Import a model to inspect it";
+  viewerEmpty.querySelector("p").textContent = "Drag to orbit · pinch or scroll to zoom";
   inputCanvas.classList.add("hidden");
   outputCanvas.classList.add("hidden");
   viewTabs.classList.add("hidden");
@@ -1262,6 +1149,27 @@ function clearFile(event) {
 }
 
 fileInput.addEventListener("change", (event) => chooseFile(event.target.files[0]));
+dropzone.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
+  fileInput.click();
+});
+sampleButton.addEventListener("click", async () => {
+  const originalText = sampleButton.textContent;
+  sampleButton.disabled = true;
+  sampleButton.textContent = "Loading sample…";
+  try {
+    const response = await fetch("/sample-plate.stl", { cache: "no-store" });
+    if (!response.ok) throw new Error();
+    const blob = await response.blob();
+    await chooseFile(new File([blob], "sample-plate.stl", { type: "model/stl" }));
+  } catch {
+    showError("The sample model could not be loaded.");
+  } finally {
+    sampleButton.disabled = false;
+    sampleButton.textContent = originalText;
+  }
+});
 ["dragenter", "dragover"].forEach((name) =>
   dropzone.addEventListener(name, (event) => {
     event.preventDefault();
@@ -1282,9 +1190,11 @@ projectionTabs.addEventListener("click", (event) => {
   projectionMode = tab.dataset.projection;
   inputViewer?.setProjection(projectionMode);
   outputViewer?.setProjection(projectionMode);
-  [...projectionTabs.children].forEach((item) =>
-    item.classList.toggle("active", item === tab),
-  );
+  [...projectionTabs.children].forEach((item) => {
+    const active = item === tab;
+    item.classList.toggle("active", active);
+    item.setAttribute("aria-pressed", String(active));
+  });
 });
 
 viewTabs.addEventListener("click", (event) => {
@@ -1295,7 +1205,11 @@ viewTabs.addEventListener("click", (event) => {
   outputCanvas.classList.toggle("hidden", !output);
   inputTriangleLegend.classList.toggle("hidden", output);
   surfaceLegend.classList.toggle("hidden", !output || !surfaceLegendStatus.textContent);
-  [...viewTabs.children].forEach((item) => item.classList.toggle("active", item === tab));
+  [...viewTabs.children].forEach((item) => {
+    const active = item === tab;
+    item.classList.toggle("active", active);
+    item.setAttribute("aria-pressed", String(active));
+  });
 });
 
 function showError(message) {
@@ -1362,10 +1276,28 @@ async function updateLivePreview(progress) {
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 async function waitForReconstruction(runId) {
+  let transientFailures = 0;
   while (true) {
-    const response = await fetch(`/api/runs/${runId}/progress`, { cache: "no-store" });
-    const progress = await response.json();
-    if (!response.ok) throw new Error(progress.detail || "Could not read reconstruction progress.");
+    let response;
+    let progress;
+    try {
+      response = await fetch(`/api/runs/${runId}/progress`, { cache: "no-store" });
+      progress = await response.json();
+      if (!response.ok) {
+        throw new Error(progress.detail || "Could not read reconstruction progress.");
+      }
+      transientFailures = 0;
+    } catch (error) {
+      transientFailures += 1;
+      if (transientFailures >= 4) {
+        throw new Error(
+          `The converter stopped responding. Reload this page to reconnect to run ${runId}.`,
+          { cause: error },
+        );
+      }
+      await wait(Math.min(5000, 750 * 2 ** (transientFailures - 1)));
+      continue;
+    }
     renderReconstructionProgress(progress);
     if (progress.status === "failed") {
       throw new Error(progress.error || "Reconstruction failed.");
@@ -1403,12 +1335,14 @@ button.addEventListener("click", async () => {
   const form = new FormData();
   form.append("file", selectedFile);
   form.append("input_units", document.querySelector("#units").value);
-  form.append("prompt", document.querySelector("#prompt").value);
   form.append("engine", document.querySelector("#engine").value);
   try {
     const response = await fetch("/api/reconstruct/start", { method: "POST", body: form });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.detail || "Reconstruction failed.");
+    const runUrl = new URL(window.location.href);
+    runUrl.searchParams.set("run", payload.id);
+    window.history.replaceState(null, "", runUrl);
     renderReconstructionProgress(payload);
     const report = await waitForReconstruction(payload.id);
     await renderResult(report);
@@ -1422,6 +1356,7 @@ button.addEventListener("click", async () => {
 
 async function renderResult(report, options = {}) {
   surfaceLegend.classList.add("hidden");
+  document.querySelector("#previewSubtitle").textContent = report.mesh?.file_name || "Saved result";
   const complete = report.status === "complete";
   const surfaceMode = report.engine === "surface_brep" && report.surface;
   const surfaceFallback = Boolean(surfaceMode && report.surface.faceted_fallback);
@@ -1628,31 +1563,43 @@ async function renderResult(report, options = {}) {
     : surfaceMode && report.surface.closed
       ? "Verified watertight analytic B-rep"
       : "Reconstructed CAD model";
-  document.querySelector("#downloads").innerHTML = `
-    <a class="download-primary" href="${fileBase}/reconstruction.step" download="${escapeHtml(reconstructedStepName)}">
-      <span><strong>${downloadTitle}</strong><small>${downloadDetail}</small></span><b>↓</b>
-    </a>
-  `;
-  document.querySelector("#advancedDownloads").innerHTML = surfaceMode
+  const hasOutput = report.status !== "failed";
+  document.querySelector("#downloads").innerHTML = hasOutput
     ? `
-      <a href="${fileBase}/surface_graph.json" download>Surface graph JSON <b>↓</b></a>
-      ${report.surface.closed ? "" : `<a href="${fileBase}/joined_surfaces.step" download>Joined-shell diagnostic <b>↓</b></a>`}
-      <a href="${fileBase}/report.json" download>Verification report <b>↓</b></a>
+      <a class="download-primary" href="${fileBase}/reconstruction.step" download="${escapeHtml(reconstructedStepName)}">
+        <span><strong>${downloadTitle}</strong><small>${downloadDetail}</small></span><b>↓</b>
+      </a>
     `
-    : `
-      <a href="${fileBase}/reconstruction.py" download>CadQuery source <b>↓</b></a>
-      <a href="${fileBase}/plan.json" download>Feature plan JSON <b>↓</b></a>
-      <a href="${fileBase}/report.json" download>Verification report <b>↓</b></a>
-    `;
+    : '<p class="no-output">No STEP file was produced for this run.</p>';
+  document.querySelector("#advancedDownloads").innerHTML = !hasOutput
+    ? `<a href="${fileBase}/report.json" download>Failure report <b>↓</b></a>`
+    : surfaceMode
+      ? `
+        <a href="${fileBase}/surface_graph.json" download>Surface graph JSON <b>↓</b></a>
+        ${report.surface.closed ? "" : `<a href="${fileBase}/joined_surfaces.step" download>Joined-shell diagnostic <b>↓</b></a>`}
+        <a href="${fileBase}/report.json" download>Verification report <b>↓</b></a>
+      `
+      : `
+        <a href="${fileBase}/reconstruction.py" download>CadQuery source <b>↓</b></a>
+        <a href="${fileBase}/plan.json" download>Feature plan JSON <b>↓</b></a>
+        <a href="${fileBase}/report.json" download>Verification report <b>↓</b></a>
+      `;
   const warnings = document.querySelector("#warnings");
   const reportWarnings = report.warnings || [];
   warnings.innerHTML = reportWarnings
     .map((warning) => `<div class="warning"><b>!</b><span>${escapeHtml(warning)}</span></div>`)
     .join("");
-  baseWarnings.innerHTML = reportWarnings
-    .map((warning) => `<div class="base-warning"><b>!</b><span>${escapeHtml(warning)}</span></div>`)
-    .join("");
+  baseWarnings.innerHTML = reportWarnings.length
+    ? `<div class="base-warning"><b>!</b><span>${escapeHtml(reportWarnings[0])}${
+        reportWarnings.length > 1
+          ? ` <button id="showAllWarnings" class="inline-warning-button" type="button">${reportWarnings.length - 1} more in Advanced</button>`
+          : ""
+      }</span></div>`
+    : "";
   baseWarnings.classList.toggle("hidden", reportWarnings.length === 0);
+  document.querySelector("#showAllWarnings")?.addEventListener("click", () => setAdvancedOpen(true));
+
+  document.querySelector("#results").classList.remove("hidden");
 
   if (report.status !== "failed") {
     if (report.plan) {
@@ -1662,13 +1609,25 @@ async function renderResult(report, options = {}) {
       editablePlan = null;
       featureEditor.classList.add("hidden");
     }
-    const response = await fetch(`${fileBase}/reconstruction.stl?revision=${report.plan?.revision || 0}`, {
-      cache: "no-store",
-    });
-    if (!response.ok) throw new Error("The reconstructed preview could not be loaded.");
-    const outputBuffer = await response.arrayBuffer();
-    outputViewer ||= new MeshViewer(outputCanvas, 0x8ebbd2);
-    await outputViewer.load(outputBuffer);
+    try {
+      const response = await fetch(`${fileBase}/reconstruction.stl?revision=${report.plan?.revision || 0}`, {
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error();
+      const outputBuffer = await response.arrayBuffer();
+      outputViewer ||= new MeshViewer(outputCanvas, 0x8ebbd2);
+      await outputViewer.load(outputBuffer);
+      viewerEmpty.classList.add("hidden");
+      inputCanvas.classList.add("hidden");
+      outputCanvas.classList.remove("hidden");
+    } catch {
+      viewerEmpty.querySelector("strong").textContent = "Result preview unavailable";
+      viewerEmpty.querySelector("p").textContent = "The STEP download is still available";
+      viewerEmpty.classList.remove("hidden");
+      inputCanvas.classList.add("hidden");
+      outputCanvas.classList.add("hidden");
+      document.querySelector("#previewSubtitle").textContent = "Preview unavailable · STEP export ready";
+    }
     let sourceMeshBuffer = null;
     try {
       const sourceResponse = await fetch(`${fileBase}/input.stl`, { cache: "no-store" });
@@ -1699,22 +1658,21 @@ async function renderResult(report, options = {}) {
         surfaceLegend.classList.add("hidden");
       }
     }
-    inputCanvas.classList.add("hidden");
-    outputCanvas.classList.remove("hidden");
     viewTabs.classList.remove("hidden");
-    [...viewTabs.children].forEach((item) =>
-      item.classList.toggle("active", item.dataset.view === "output"),
-    );
+    [...viewTabs.children].forEach((item) => {
+      const active = item.dataset.view === "output";
+      item.classList.toggle("active", active);
+      item.setAttribute("aria-pressed", String(active));
+    });
   } else {
     activeReport = report;
     editablePlan = null;
     featureEditor.classList.add("hidden");
   }
-  document.querySelector("#results").classList.remove("hidden");
 }
 
 const requestedRun = new URLSearchParams(window.location.search).get("run");
-if (/^[a-f0-9]{12}$/.test(requestedRun || "")) {
+if (/^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestedRun || "")) {
   fetch(`/api/runs/${requestedRun}`, { cache: "no-store" })
     .then(async (response) => {
       if (!response.ok) throw new Error("Saved reconstruction not found");

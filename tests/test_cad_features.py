@@ -24,6 +24,11 @@ from app.schemas import (
 )
 
 
+def test_schema_rejects_non_finite_geometry() -> None:
+    with pytest.raises(ValueError):
+        CircleProfile(center=(0, 0), radius=float("inf"))
+
+
 def rectangle(
     x_min: float,
     y_min: float,
@@ -38,6 +43,26 @@ def rectangle(
             (x_min, y_max),
         ]
     )
+
+
+def test_removed_plan_metadata_is_ignored_when_loading_an_old_run() -> None:
+    plan = ReconstructionPlan(
+        name="legacy-plan",
+        base=ExtrudeFeature(
+            axis=Axis.Z,
+            start=0,
+            depth=5,
+            outer=rectangle(-2, -2, 2, 2),
+        ),
+    )
+    data = plan.model_dump(mode="python")
+    data["source"] = "hybrid"
+    data["locked_parameters"] = ["base.depth"]
+    data["parameter_sources"] = {"base.depth": "ai"}
+
+    restored = ReconstructionPlan.model_validate(data)
+
+    assert restored.parameter_sources["base.depth"] == "user"
 
 
 def execute_generated_source(

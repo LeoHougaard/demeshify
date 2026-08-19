@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: |
+          uv python install 3.12
+          uv sync --locked
+
+      - name: Lint Python
+        run: uv run ruff check .
+
+      - name: Test Python
+        run: uv run pytest
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm --prefix web ci
+
+      - name: Audit frontend dependencies
+        run: npm --prefix web audit --audit-level=high
+
+      - name: Build frontend
+        run: npm --prefix web run build

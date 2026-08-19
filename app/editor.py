@@ -135,7 +135,6 @@ def apply_plan_edit(run_id: str, request: PlanEditRequest) -> ReconstructionRepo
         score=candidate.report,
         warnings=warnings,
         elapsed_seconds=time.perf_counter() - started,
-        prompt=current.prompt,
     )
     save_report(report)
     return report

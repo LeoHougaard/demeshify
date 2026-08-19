@@ -4807,6 +4807,7 @@ def export_surface_brep(
     directory: Path,
     source_stl_path: Path | None = None,
     *,
+    source_unit_scale: float = 1.0,
     verify_roundtrip: bool = True,
 ) -> None:
     directory.mkdir(parents=True, exist_ok=True)
@@ -4835,7 +4836,11 @@ def export_surface_brep(
             str(directory / "joined_surfaces.step"),
         )
     reconstruction_stl = directory / "reconstruction.stl"
-    if result.source_mesh_fallback and source_stl_path is not None:
+    if (
+        result.source_mesh_fallback
+        and source_stl_path is not None
+        and abs(source_unit_scale - 1.0) <= 1e-12
+    ):
         shutil.copy2(source_stl_path, reconstruction_stl)
     else:
         cq.exporters.export(

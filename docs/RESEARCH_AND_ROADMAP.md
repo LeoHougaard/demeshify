@@ -1,5 +1,8 @@
 # Research findings and reconstruction roadmap
 
+Status: updated for the public beta on 2026-08-19. The generation-two notes
+below are historical context. The final section is the active roadmap.
+
 ## What the first version got wrong
 
 The original implementation selected one cardinal axis, sampled three
@@ -14,8 +17,8 @@ reverse engineering.
 - [Point2Cyl (CVPR
   2022)](https://openaccess.thecvf.com/content/CVPR2022/papers/Uy_Point2Cyl_Reverse_Engineering_3D_Objects_From_Point_Clouds_to_Extrusion_CVPR_2022_paper.pdf)
   models parts as multiple sketch/extrusion cylinders and boolean
-  combinations. Its geometry-grounded decomposition—point segmentation, base
-  and barrel classification, normals, then closed-form parameter fitting—is
+  combinations. Its geometry-grounded decomposition (point segmentation, base
+  and barrel classification, normals, then closed-form parameter fitting) is
   the right conceptual model for mechanical parts.
 - [CAD-SIGNet (CVPR
   2024)](https://openaccess.thecvf.com/content/CVPR2024/html/Khan_CAD-SIGNet_CAD_Language_Inference_from_Point_Clouds_using_Layer-wise_Sketch_CVPR_2024_paper.html)
@@ -71,20 +74,24 @@ The product path is hybrid:
   arcs and lines, four-corner rounded plates, and combined pockets/side holes;
 - corpus conversion and batch benchmarking tools.
 
-## Next engineering stages
+## Current engineering stages
 
-1. Segment global planar and cylindrical surface patches, then recover through
-   and blind holes independently of the main extrusion axis.
-2. Add explicit pocket, boss, counterbore, countersink, slot, chamfer, and
-   fillet features instead of representing every change as an additive slab.
-3. Detect revolutions and lathe profiles for shafts with grooves and tapers.
-4. Generate multiple construction histories and use local continuous
-   optimization to refine their dimensions.
-5. Benchmark thousands of licensed ABC/DeepCAD/Fusion cases by feature count
-   and complexity buckets. Preserve a fixed holdout set.
+Global surface recognition, oriented holes, named edge finishes, revolutions,
+lofts, and competing construction histories now exist. The remaining work is:
+
+1. Close the seven unresolved cases in the strict 60-case surface corpus,
+   especially the four cases that exceed the 240-second evaluation budget.
+2. Move feature-history builds and plan edits into bounded worker processes so
+   malformed native CAD operations cannot stop the API server.
+3. Make run state durable across restarts and publish edits transactionally
+   before supporting any shared or multi-user deployment.
+4. Add opt-in artifact retention limits, deletion in the browser, and storage
+   quotas while keeping the local default predictable.
+5. Expand licensed corpus evaluation with fixed holdouts and publish compact,
+   reproducible result manifests that do not redistribute source geometry.
 6. Train or fine-tune a proposal model only after the deterministic evaluator
-   and corpus metrics are stable, so better-looking but incorrect programs
-   cannot pass unnoticed.
+   and corpus metrics are stable. A plausible but geometrically wrong program
+   must not pass because it looks simpler.
 
 ## Required benchmark metrics
 

@@ -1,147 +1,143 @@
-# MeshMind CAD
+# STL to STEP Converter
 
-MeshMind CAD is a local, autonomous mechanical STL-to-STEP reconstructor. It
-examines the mesh, infers a compact feature plan, builds editable CadQuery
-geometry, compares the reconstructed surfaces with the original, and exports
-the best valid solid.
+[![CI](https://github.com/LeoHougaard/stl-to-step-converter/actions/workflows/ci.yml/badge.svg)](https://github.com/LeoHougaard/stl-to-step-converter/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/LeoHougaard/stl-to-step-converter?quickstart=1)
 
-The current engine handles constant and multi-level mechanical extrusions,
-arbitrary-plane sketch extrusions, stepped parts, blind pockets, bosses,
-cardinal and oblique cylinders/tubes, aligned openings, countersinks,
-revolutions, tapered lofts, fillets/chamfers, and mixed line/circular-arc
-and changing-curvature spline profiles. It deliberately reports **best effort**
-instead of pretending that a geometrically poor reconstruction is exact.
+STL to STEP Converter turns mechanical STL meshes into STEP CAD models. It runs
+a local FastAPI geometry service and a browser-based Three.js viewer. The
+recommended engine recognizes and joins analytic or fitted surfaces. An
+experimental engine reconstructs an editable CadQuery feature history.
 
-## Run it on Windows
+This is public beta software. Inspect every best-effort result before machining,
+printing, or using it as a manufacturing reference.
 
-From PowerShell:
+## Use it in a browser
+
+The quickest path is the **Open in GitHub Codespaces** button above. GitHub builds
+the environment, starts the converter, and opens port 8421 in a private browser
+tab. The first setup can take several minutes and uses roughly 1.1 GiB for the
+Python environment. Codespaces usage may count against your GitHub allowance.
+
+To run it on your own computer, install:
+
+- Git
+- [Node.js 22 LTS](https://nodejs.org/)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/), or Python if the
+  launch script needs to install uv for your user account
+
+On Windows, open PowerShell:
 
 ```powershell
-git clone https://github.com/LeoHougaard/meshmind-cad.git
-cd meshmind-cad
+git clone https://github.com/LeoHougaard/stl-to-step-converter.git
+cd stl-to-step-converter
 .\run.ps1
 ```
 
-The first run installs a project-local Python 3.12 environment and JavaScript
-packages. Open <http://127.0.0.1:8421>.
+On macOS or Linux:
 
-## Output
-
-Every successful reconstruction produces:
-
-- `reconstruction.step` — editable boundary-representation solid
-- `reconstruction.py` — readable CadQuery construction history
-- `plan.json` — validated, machine-editable feature parameters
-- `reconstruction.stl` — preview tessellation
-- `report.json` — fit metrics, assumptions, and warnings
-
-`plan.json` uses the ordered v2 feature-tree schema. Every feature has a stable
-id, timeline position, dependency list, readable name, suppression state, and
-measured-parameter provenance. The browser editor can change scalar dimensions,
-vectors, and sketch geometry; reorder or suppress operations; lock parameters;
-undo/reset local changes; then rebuild and re-verify the result before replacing
-the current export. Previous saved revisions are retained under
-`runs/<id>/history/`.
-
-Mixed sketches preserve straight lines, constant-radius circular arcs, and
-changing-curvature tangent spline segments as separately editable geometry.
-Measured cardinal cylindrical cuts are emitted as Round hole features on X,
-Y, or Z; arbitrary-axis cylinders remain oriented cylinder features.
-
-To reopen a saved reconstruction directly in the editor, use
-`http://127.0.0.1:8421/?run=<run-id>`.
-
-Browser reconstructions run as local background jobs. The progress overlay
-reports the current geometry stage, elapsed time, candidates tested, and the
-number of features in the construction currently being evaluated. The bar is
-driven by reconstruction events rather than a looping time estimate.
-Each valid intermediate solid is also rendered as provisional CAD in the
-browser. This uses the browser GPU only for interactive visualization; the
-OpenCascade reconstruction and geometric verification remain CPU operations.
-The camera is preserved as newer feature-tree revisions replace the preview.
-
-Run artifacts stay under `runs/<id>/`. The input never needs to leave the
-computer unless you explicitly configure an external language-model endpoint.
-
-## How reconstruction works
-
-1. Load and normalize the triangle mesh with Trimesh.
-2. Detect coherent planar change levels, analytic surface patches, and both
-   cardinal and measured 3D feature axes.
-3. Fit analytic lines, circles, circular arcs, and tangent spline segments to
-   each sketch profile.
-4. Group equal adjacent sections into extrusion layers and separate oblique
-   analytic cylinders from polygonal slice approximations.
-5. Build competing single- and multi-feature parametric CadQuery solids,
-   including conical, revolved, lofted, and edge-finished alternatives.
-6. Tessellate each solid and calculate bidirectional surface distance, volume
-   error, validity, and a small complexity penalty.
-7. Export the best candidate and label it high-confidence only when it passes
-   automatic geometric thresholds.
-
-The language model is an optional planner, not the geometry kernel. Model
-responses must validate against the typed feature schema, are rebuilt by
-CadQuery, and must retain their geometric score. Model-generated code is never
-executed.
-
-## Optional AI guidance
-
-MeshMind accepts any OpenAI-compatible chat-completions endpoint. Copy
-`.env.example` values into your PowerShell environment before starting:
-
-```powershell
-$env:MESHMIND_LLM_URL = "http://127.0.0.1:8000/v1"
-$env:MESHMIND_LLM_MODEL = "your-model"
-$env:MESHMIND_LLM_KEY = ""
-.\run.ps1
+```bash
+git clone https://github.com/LeoHougaard/stl-to-step-converter.git
+cd stl-to-step-converter
+bash run.sh
 ```
 
-You can then enter instructions such as “prefer nominal dimensions” or “keep
-the mounting holes exact.” Without these variables, reconstruction stays fully
-deterministic and local.
+Open <http://127.0.0.1:8421>. Both launch scripts install Python 3.12 into the
+project environment, sync the locked dependencies, rebuild the browser app, and
+start one local server process. Press Ctrl+C in the terminal to stop it.
 
-## Test
+The app includes a small sample plate, so you can test the full conversion and
+download flow without finding an STL first.
+
+## Reconstruction modes
+
+| Mode | Best for | Result |
+| --- | --- | --- |
+| Recognized surfaces, recommended | Final-shape recovery, analytic faces, freeform residuals, multiple bodies | STEP B-rep, preview STL, surface graph, verification report |
+| Parametric feature history, experimental | Single-body mechanical parts that need editable dimensions and operations | STEP, CadQuery source, feature plan, preview STL, verification report |
+
+The surface engine fits planes, cylinders, cones, spheres, tori, extrusions,
+revolutions, and B-spline residual faces. It joins their boundaries when the
+topology closes. If native fitting crashes or exceeds its time limit, an isolated
+worker returns a clearly labelled faceted recovery instead of taking down the
+server.
+
+The feature-history engine detects extrusions, steps, pockets, bosses, holes,
+countersinks, oriented cylinders, revolutions, lofts, fillets, chamfers, arcs,
+and splines. Its browser editor can change dimensions, suppress or reorder
+operations, undo changes, rebuild the solid, and rerun geometric
+verification.
+
+## Reading the result
+
+`complete` means the automatic solid, STEP round trip, surface deviation, and
+volume checks passed. `best_effort` means the app produced a usable artifact but
+one or more confidence gates failed. The report explains why. A faceted fallback
+preserves source topology, but it is not an analytic reconstruction.
+
+Artifacts are stored under `runs/<run-id>/` by default. Set
+`STL_TO_STEP_RUNS_DIR` to keep them elsewhere. Feature-history edits retain older
+revisions under the run's `history/` directory. The converter does not delete runs
+automatically. Stop the server and remove the run directory when you no longer
+need its input STL or generated CAD.
+
+The documented launchers bind to `127.0.0.1`. Do not expose this beta directly
+to the internet. It has no user accounts or per-user file permissions and is
+designed for one person on one server process. Codespaces keeps the forwarded
+port private unless you change its visibility.
+
+## Current beta limits
+
+The strict surface stress corpus currently completes 53 of 60 cases. Four cases
+exceeded 240 seconds, and three open or internally inconsistent source meshes did
+not produce an accepted result. See the dated
+[surface failure ledger](docs/surface-failure-ledger.md) for exact cases and
+[research notes](docs/RESEARCH_AND_ROADMAP.md) for the current engineering work.
+
+Expect weaker results for damaged scans, very noisy meshes, decorative freeform
+shapes, assemblies, and designs whose original history is ambiguous. The surface
+engine can preserve multiple closed bodies. The feature-history engine currently
+targets one connected mechanical body. Large files can take minutes. The browser
+skips the input preview above 50 MB to avoid duplicating a large mesh in memory,
+but the server accepts STL files up to 250 MB.
+
+## Development
+
+Install and verify the locked project:
 
 ```powershell
-python -m uv sync
-python -m uv run pytest
-python -m uv run ruff check .
-cd web
-npm run build
+uv sync --locked
+uv run ruff check .
+uv run pytest
+npm --prefix web ci
+npm --prefix web audit --audit-level=high
+npm --prefix web run build
 ```
 
-The tests begin with editable STEP geometry, tessellate it to STL, discard the
-history, reconstruct it, and verify both the feature structure and resulting
-solid. Cases include stepped shafts, blind pockets, mixed line/arc profiles,
-rounded plates, and a pocket combined with a perpendicular hole.
+The current suite reconstructs generated STEP-derived meshes and checks feature
+structure, surface topology, validity, metrics, progress, API downloads, dataset
+helpers, and revision editing. Dataset instructions live in
+[datasets/README.md](datasets/README.md). CI runs the same checks on Windows.
 
-For large dataset evaluation, see [datasets/README.md](datasets/README.md) and
-the corpus tools under `tools/`. Research findings and the staged architecture
-are in [docs/RESEARCH_AND_ROADMAP.md](docs/RESEARCH_AND_ROADMAP.md).
+This repository is a source application, not an installable Python wheel. The
+browser build must sit beside the backend, which is why the launch scripts and
+Codespace build both parts together.
 
-## Current boundaries
+## Troubleshooting
 
-The feature plan still represents some pockets, bosses, and unusually complex
-edge-finish transitions as equivalent boolean extrusion layers rather than the
-original named design operation. Free-form decorative surfaces, assemblies,
-multi-body reconstruction, damaged scan data, and general non-mechanical
-meshes remain outside the verified scope. A `best_effort` result should always
-be reviewed before machining.
+- If port 8421 is busy, run `.\run.ps1 -Port 8422` on Windows or set
+  `STL_TO_STEP_PORT=8422` before `bash run.sh`.
+- If startup reports an old Node version, install Node.js 22 and open a new
+  terminal.
+- If the browser says the converter is offline, check the terminal for the first
+  error and confirm <http://127.0.0.1:8421/api/health> opens.
+- If a saved run stops loading after you delete its directory, remove the
+  `?run=...` query from the browser address.
 
-## Technical lineage
+Please use the issue templates for reproducible bugs and focused feature
+requests. Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing code and
+[SECURITY.md](SECURITY.md) before reporting a vulnerability. Release changes are
+recorded in [CHANGELOG.md](CHANGELOG.md).
 
-The implementation is original and uses permissive/open CAD infrastructure:
-CadQuery/OCCT for B-rep construction and STEP export, Trimesh/SciPy/Shapely for
-geometry analysis, and FastAPI/Three.js for the local application.
-
-Related work that informed the architecture includes
-[CADFit](https://github.com/AutodeskAILab/CADFit), which demonstrates
-render-and-compare search over CadQuery programs, and
-[CAD-Recode](https://github.com/filaPro/cad-recode), which studies direct
-point-cloud-to-CadQuery generation. CADFit's repository is non-commercially
-licensed and patent-noted, so its implementation was not copied into this
-project.
-
-## License
-
-MIT. Dependencies retain their own licenses.
+STL to STEP Converter is available under the [MIT License](LICENSE).
+Dependencies keep their own licenses.

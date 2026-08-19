@@ -1,0 +1,19 @@
+{
+  "name": "STL to STEP Converter",
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
+  },
+  "postCreateCommand": "python -m pip install uv && python -m uv sync --locked && npm --prefix web ci && npm --prefix web run build",
+  "postStartCommand": "bash .devcontainer/start.sh",
+  "forwardPorts": [8421],
+  "portsAttributes": {
+    "8421": {
+      "label": "STL to STEP Converter",
+      "onAutoForward": "openBrowser",
+      "visibility": "private"
+    }
+  }
+}

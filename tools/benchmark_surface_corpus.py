@@ -213,7 +213,7 @@ def benchmark_case(
 ) -> dict[str, object]:
     source = manifest_parent / str(case["stl"])
     ground_truth = case.get("ground_truth", {})
-    with tempfile.TemporaryDirectory(prefix="meshmind-surface-benchmark-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="stl-to-step-surface-benchmark-") as temporary:
         working = Path(temporary)
         input_path = working / "input.stl"
         shutil.copy2(source, input_path)

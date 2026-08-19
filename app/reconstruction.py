@@ -9,7 +9,6 @@ from pathlib import Path
 import cadquery as cq
 import numpy as np
 
-from .ai import is_configured, revise_plan
 from .cad import build_plan, export_plan
 from .mesh import MeshData, load_mesh
 from .profiles import (
@@ -84,13 +83,12 @@ def reconstruct(
     stl_path: Path,
     original_name: str,
     input_units: str = "mm",
-    prompt: str = "",
     progress_callback: Callable[[str], None] | None = None,
 ) -> ReconstructionReport:
     started = time.perf_counter()
     destination = stl_path.parent
 
-    trace_value = environ.get("MESHMIND_TRACE_PATH", "").strip()
+    trace_value = environ.get("STL_TO_STEP_TRACE_PATH", "").strip()
     trace_path = Path(trace_value) if trace_value else None
 
     def trace_stage(label: str) -> None:
@@ -322,14 +320,14 @@ def reconstruct(
     # timeout remains the wall-clock safety boundary.
     search_seconds = max(
         15.0,
-        float(environ.get("MESHMIND_MAX_SEARCH_SECONDS", "120")),
+        float(environ.get("STL_TO_STEP_MAX_SEARCH_SECONDS", "120")),
     )
-    search_deadline = time.process_time() + search_seconds
+    search_deadline = time.monotonic() + search_seconds
     budget_warning_added = False
 
     def search_budget_available() -> bool:
         nonlocal budget_warning_added
-        if time.process_time() <= search_deadline:
+        if time.monotonic() <= search_deadline:
             return True
         if not budget_warning_added:
             warnings.append(
@@ -449,7 +447,6 @@ def reconstruct(
                 "and aligned openings."
             ],
             elapsed_seconds=time.perf_counter() - started,
-            prompt=prompt,
         )
         save_report(report)
         return report
@@ -2752,33 +2749,6 @@ def reconstruct(
                 f"The redundant edge-finish check could not be built: {exc}"
             )
 
-    if prompt.strip():
-        if is_configured():
-            ai_result = revise_plan(data.report, best.plan, prompt.strip())
-            if ai_result.warning:
-                warnings.append(ai_result.warning)
-            if ai_result.plan is not None:
-                try:
-                    ai_candidate = score_plan(
-                        data,
-                        ai_result.plan,
-                        destination / "candidates" / "ai",
-                        candidate_count=len(generated) + 1,
-                    )
-                    if ai_candidate.report.score <= best.report.score * 1.08:
-                        best = ai_candidate
-                    else:
-                        warnings.append(
-                            "The AI revision reduced geometric fidelity and was not selected."
-                        )
-                except Exception as exc:
-                    warnings.append(f"The AI plan could not produce valid CAD: {exc}")
-        else:
-            warnings.append(
-                "The instruction was saved, but no LLM is configured; deterministic "
-                "reconstruction was used."
-            )
-
     trace_stage(f"export_start operations={len(best.plan.operations)}")
     export_plan(best.plan, destination)
     threshold = _acceptance_threshold(data.diagonal)
@@ -2807,7 +2777,6 @@ def reconstruct(
         score=best.report,
         warnings=warnings,
         elapsed_seconds=time.perf_counter() - started,
-        prompt=prompt,
     )
     save_report(report)
     trace_stage(

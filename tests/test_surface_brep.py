@@ -11,6 +11,7 @@ from shapely.geometry import Polygon
 
 import app.surface_brep as surface_brep
 import app.surface_reconstruction as surface_reconstruction
+from app.mesh import load_mesh
 from app.schemas import (
     MeshReport,
     ReconstructionReport,
@@ -547,6 +548,24 @@ def test_source_topology_faceted_fallback_is_a_valid_step_solid(tmp_path) -> Non
     roundtrip = cq.importers.importStep(str(tmp_path / "reconstruction.step")).val()
     assert roundtrip.isValid()
     assert len(roundtrip.Solids()) == 1
+
+
+def test_faceted_fallback_preview_uses_scaled_input_units(tmp_path) -> None:
+    source = tmp_path / "inch-box.stl"
+    source.write_bytes(trimesh.creation.box(extents=(1, 2, 3)).export(file_type="stl"))
+    data = load_mesh(source, source.name, "in")
+    result = build_faceted_brep(data, reason="test unit recovery")
+
+    export_surface_brep(
+        result,
+        tmp_path,
+        source,
+        source_unit_scale=data.report.unit_scale,
+        verify_roundtrip=False,
+    )
+
+    preview = trimesh.load(tmp_path / "reconstruction.stl", force="mesh", process=False)
+    assert preview.extents == pytest.approx((25.4, 50.8, 76.2), rel=1e-5)
 
 
 def test_source_topology_faceted_fallback_preserves_multiple_bodies(

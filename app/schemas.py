@@ -3,13 +3,17 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Point2D = tuple[float, float]
 Point3D = tuple[float, float, float]
 
 
-class FeatureNode(BaseModel):
+class SchemaModel(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid")
+
+
+class FeatureNode(SchemaModel):
     """Common identity and timeline state for every editable CAD feature.
 
     Geometry generators only need to provide their historical geometric
@@ -31,29 +35,29 @@ class Axis(StrEnum):
     Z = "Z"
 
 
-class CircleProfile(BaseModel):
+class CircleProfile(SchemaModel):
     kind: Literal["circle"] = "circle"
     center: Point2D
     radius: Annotated[float, Field(gt=0)]
 
 
-class PolygonProfile(BaseModel):
+class PolygonProfile(SchemaModel):
     kind: Literal["polygon"] = "polygon"
     points: Annotated[list[Point2D], Field(min_length=3)]
 
 
-class LineSegment(BaseModel):
+class LineSegment(SchemaModel):
     kind: Literal["line"] = "line"
     end: Point2D
 
 
-class ArcSegment(BaseModel):
+class ArcSegment(SchemaModel):
     kind: Literal["arc"] = "arc"
     mid: Point2D
     end: Point2D
 
 
-class SplineSegment(BaseModel):
+class SplineSegment(SchemaModel):
     """An open, changing-curvature sketch segment.
 
     ``points`` are editable interpolation points between the current path point
@@ -74,13 +78,13 @@ PathSegment = Annotated[
 ]
 
 
-class PathProfile(BaseModel):
+class PathProfile(SchemaModel):
     kind: Literal["path"] = "path"
     start: Point2D
     segments: Annotated[list[PathSegment], Field(min_length=2)]
 
 
-class SplineProfile(BaseModel):
+class SplineProfile(SchemaModel):
     kind: Literal["spline"] = "spline"
     points: Annotated[list[Point2D], Field(min_length=4, max_length=256)]
     periodic: Literal[True] = True
@@ -388,7 +392,7 @@ OperationFeature = Annotated[
 ]
 
 
-class ReconstructionPlan(BaseModel):
+class ReconstructionPlan(SchemaModel):
     schema_version: Literal["2.0"] = "2.0"
     revision: Annotated[int, Field(ge=0)] = 0
     name: str
@@ -401,14 +405,28 @@ class ReconstructionPlan(BaseModel):
     measured_values: dict[str, float] = Field(default_factory=dict)
     parameter_sources: dict[
         str,
-        Literal["measured", "nominal", "user", "ai"],
+        Literal["measured", "nominal", "user"],
     ] = Field(default_factory=dict)
-    locked_parameters: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
-    source: Literal["deterministic", "ai", "hybrid"] = "deterministic"
     # Sampled fallbacks can be useful previews, but they must never be
     # advertised as a clean semantic feature reconstruction.
     representation: Literal["semantic", "sampled_approximation"] = "semantic"
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_removed_metadata(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        data.pop("source", None)
+        data.pop("locked_parameters", None)
+        parameter_sources = data.get("parameter_sources")
+        if isinstance(parameter_sources, dict):
+            data["parameter_sources"] = {
+                path: "user" if source == "ai" else source
+                for path, source in parameter_sources.items()
+            }
+        return data
 
     @model_validator(mode="after")
     def normalize_feature_tree(self) -> ReconstructionPlan:
@@ -514,18 +532,15 @@ class ReconstructionPlan(BaseModel):
             path: self.parameter_sources.get(path, "measured")
             for path in current_values
         }
-        self.locked_parameters = sorted(
-            path for path in set(self.locked_parameters) if path in current_values
-        )
         return self
 
 
-class PlanEditRequest(BaseModel):
+class PlanEditRequest(SchemaModel):
     plan: ReconstructionPlan
     expected_revision: Annotated[int, Field(ge=0)]
 
 
-class MeshReport(BaseModel):
+class MeshReport(SchemaModel):
     file_name: str
     triangle_count: int
     vertex_count: int
@@ -538,7 +553,7 @@ class MeshReport(BaseModel):
     unit_scale: float
 
 
-class ScoreReport(BaseModel):
+class ScoreReport(SchemaModel):
     score: float
     chamfer_rms_mm: float
     chamfer_p95_mm: float
@@ -550,7 +565,7 @@ class ScoreReport(BaseModel):
     volume_comparable: bool = True
 
 
-class SurfaceBRepReport(BaseModel):
+class SurfaceBRepReport(SchemaModel):
     recognized_surface_count: int
     surface_counts: dict[str, int]
     adjacency_count: int
@@ -568,7 +583,7 @@ class SurfaceBRepReport(BaseModel):
     source_mesh_fallback: bool = False
 
 
-class ReconstructionReport(BaseModel):
+class ReconstructionReport(SchemaModel):
     id: str
     status: Literal["complete", "best_effort", "failed"]
     engine: Literal["feature_tree", "surface_brep"] = "feature_tree"
@@ -578,4 +593,12 @@ class ReconstructionReport(BaseModel):
     score: ScoreReport | None
     warnings: list[str] = Field(default_factory=list)
     elapsed_seconds: float
-    prompt: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_removed_metadata(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        data.pop("prompt", None)
+        return data

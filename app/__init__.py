@@ -1,1 +1,1 @@
-"""MeshMind CAD reconstruction package."""
+"""STL to STEP reconstruction package."""

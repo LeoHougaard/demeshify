@@ -360,7 +360,7 @@ def benchmark_case(
 ) -> dict[str, object]:
     reconstruction_module.save_report = lambda report: None
     source = manifest_parent / str(case["stl"])
-    with tempfile.TemporaryDirectory(prefix="meshmind-benchmark-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="stl-to-step-benchmark-") as temporary:
         working = Path(temporary)
         input_path = working / "input.stl"
         shutil.copy2(source, input_path)
@@ -657,7 +657,7 @@ def _benchmark_selected_cases(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark MeshMind against a generated STEP-to-STL corpus."
+        description="Benchmark the converter against a generated STEP-to-STL corpus."
     )
     parser.add_argument("manifest", type=Path)
     parser.add_argument(

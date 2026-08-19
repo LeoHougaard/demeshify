@@ -65,10 +65,12 @@ seconds stress. The older JSON schema did not record wall or per-case runtime,
 so an exact before/after runtime ratio cannot be recovered without rerunning the
 old commit; filesystem timestamps are not treated as benchmark evidence.
 
-Focused evidence is retained in `improvement_periodic_regression4.json` (4/4
-known periodic cases remain clean analytic),
+Focused evidence is retained locally in `improvement_periodic_regression4.json`
+(4/4 known periodic cases remain clean analytic),
 `improvement_recovery_regression3.json` (3/3 strict-valid recovery cases), and
-the exact-run artifact directories under `benchmarks/artifacts/`. In the real
+the exact-run artifact directories under `benchmarks/artifacts/`. These files
+are intentionally untracked because the source datasets cannot be redistributed.
+In the real
 viewer, the recovered `78685` STEP result matched the source silhouette and
 through-hole without a visible open seam, while residual triangle regions and
 the `REJECTED: FALLBACK GEOMETRY` label remained clearly exposed.
@@ -91,7 +93,7 @@ old commit and candidate compare as follows:
 
 | Metric | `a284287` | Candidate | Change |
 | --- | ---: | ---: | ---: |
-| Cases | 22 | 22 | — |
+| Cases | 22 | 22 | n/a |
 | Strict geometric acceptance | 21 | 22 | +1 |
 | Clean analytic acceptance | 1 | 1 | 0 |
 | Valid STEP re-imports | 21 | 22 | +1 |

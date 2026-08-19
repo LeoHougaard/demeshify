@@ -1,0 +1,37 @@
+name: Bug report
+description: Report a reproducible conversion, setup, or browser problem.
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach confidential CAD files. A small synthetic STL is ideal.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include the expected result and the result you saw.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can we reproduce it?
+      description: List the engine, input units, steps, and any safe sample file.
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Converter revision
+      description: Paste the commit hash from `git rev-parse --short HEAD`.
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Operating system, browser, Python, and Node versions.
+  - type: textarea
+    id: report
+    attributes:
+      label: Report and logs
+      description: Attach report.json and relevant terminal output after checking them for private paths or data.

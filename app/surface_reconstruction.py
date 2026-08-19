@@ -10,6 +10,7 @@ from pathlib import Path
 from .mesh import load_mesh
 from .schemas import ReconstructionReport, SurfaceBRepReport
 from .scoring import score_exported_shape
+from .storage import atomic_write_text
 from .surface_brep import build_faceted_brep, build_surface_brep, export_surface_brep
 
 
@@ -69,7 +70,6 @@ def _reconstruct_surfaces_direct(
     stl_path: Path,
     original_name: str,
     input_units: str = "mm",
-    prompt: str = "",
     progress_callback: Callable[[str], None] | None = None,
 ) -> ReconstructionReport:
     """Recover, trim, sew, and verify a surface-based OpenCascade solid."""
@@ -95,7 +95,12 @@ def _reconstruct_surfaces_direct(
     # be a successful analytic result. Process-level crash/timeout recovery is
     # still isolated below, but it is explicitly reported as best effort.
     update("surface_export_start")
-    export_surface_brep(result, stl_path.parent, data.source_path)
+    export_surface_brep(
+        result,
+        stl_path.parent,
+        data.source_path,
+        source_unit_scale=data.report.unit_scale,
+    )
     update("surface_verification_start preview=reconstruction.stl")
     score = score_exported_shape(data, stl_path.parent, require_solid=False)
     passed = _passes_surface_gate(result, score, threshold)
@@ -144,12 +149,8 @@ def _reconstruct_surfaces_direct(
         score=score,
         warnings=warnings,
         elapsed_seconds=time.perf_counter() - started,
-        prompt=prompt,
     )
-    (stl_path.parent / "report.json").write_text(
-        report.model_dump_json(indent=2),
-        encoding="utf-8",
-    )
+    atomic_write_text(stl_path.parent / "report.json", report.model_dump_json(indent=2))
     update(
         f"surface_reconstruction_complete surfaces={len(result.graph.patches)} "
         "preview=reconstruction.stl"
@@ -162,7 +163,6 @@ def _reconstruct_faceted_only(
     stl_path: Path,
     original_name: str,
     input_units: str,
-    prompt: str,
     reason: str,
     progress_callback: Callable[[str], None] | None,
 ) -> ReconstructionReport:
@@ -179,6 +179,7 @@ def _reconstruct_faceted_only(
         result,
         stl_path.parent,
         data.source_path,
+        source_unit_scale=data.report.unit_scale,
         verify_roundtrip=False,
     )
     score = score_exported_shape(data, stl_path.parent, require_solid=False)
@@ -213,12 +214,8 @@ def _reconstruct_faceted_only(
         score=score,
         warnings=result.warnings,
         elapsed_seconds=time.perf_counter() - started,
-        prompt=prompt,
     )
-    (stl_path.parent / "report.json").write_text(
-        report.model_dump_json(indent=2),
-        encoding="utf-8",
-    )
+    atomic_write_text(stl_path.parent / "report.json", report.model_dump_json(indent=2))
     update(
         f"faceted_recovery_complete faces={result.faceted_face_count} "
         "preview=reconstruction.stl"
@@ -231,7 +228,6 @@ def reconstruct_surfaces(
     stl_path: Path,
     original_name: str,
     input_units: str = "mm",
-    prompt: str = "",
     progress_callback: Callable[[str], None] | None = None,
     *,
     isolate: bool = True,
@@ -250,7 +246,6 @@ def reconstruct_surfaces(
             stl_path,
             original_name,
             input_units,
-            prompt,
             progress_callback,
         )
     if progress_callback is not None:
@@ -270,6 +265,8 @@ def reconstruct_surfaces(
             worker_timeout = 90 if triangle_count <= 60_000 else 60
     except (OSError, struct.error):
         pass
+    worker_progress_path = stl_path.parent / "surface-worker-progress.log"
+    worker_progress_path.unlink(missing_ok=True)
     command = [
         sys.executable,
         "-m",
@@ -282,8 +279,8 @@ def reconstruct_surfaces(
         original_name,
         "--input-units",
         input_units,
-        "--prompt",
-        prompt,
+        "--progress-path",
+        str(worker_progress_path.resolve()),
     ]
     creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
@@ -338,7 +335,6 @@ def reconstruct_surfaces(
         stl_path,
         original_name,
         input_units,
-        prompt,
         reason,
         progress_callback,
     )
