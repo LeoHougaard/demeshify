@@ -225,6 +225,7 @@ class SurfaceGraph:
     face_patch_ids: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=object)
     )
+    source_face_indices: np.ndarray | None = None
 
     @property
     def patches(self) -> list[SurfacePatch]:

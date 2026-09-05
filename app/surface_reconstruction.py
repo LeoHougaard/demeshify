@@ -7,15 +7,16 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from .mesh import load_mesh
+from .mesh import load_mesh, mesh_warnings
 from .schemas import ReconstructionReport, SurfaceBRepReport
 from .scoring import score_exported_shape
 from .storage import atomic_write_text
 from .surface_brep import build_faceted_brep, build_surface_brep, export_surface_brep
+from .verification import acceptance_threshold, passes_geometry_gate, verification_warnings
 
 
 def _acceptance_threshold(diagonal: float) -> float:
-    return max(0.12, diagonal * 0.003)
+    return acceptance_threshold(diagonal)
 
 
 def _passes_surface_gate(result: object, score: object, threshold: float) -> bool:
@@ -24,11 +25,8 @@ def _passes_surface_gate(result: object, score: object, threshold: float) -> boo
         and result.closed
         and not result.faceted_fallback
         and not result.source_mesh_fallback
-        and score.valid_brep
-        and score.valid_solid
         and result.free_edge_count == 0
-        and score.chamfer_p95_mm <= threshold
-        and score.volume_error_percent <= 2.0
+        and passes_geometry_gate(score, threshold)
     )
 
 
@@ -43,10 +41,7 @@ def _report_has_valid_solid(report: ReconstructionReport) -> bool:
         and score
         and surface.closed
         and surface.free_edge_count == 0
-        and score.valid_brep
-        and score.valid_solid
-        and score.chamfer_p95_mm <= _acceptance_threshold(diagonal)
-        and score.volume_error_percent <= 2.0
+        and passes_geometry_gate(score, _acceptance_threshold(diagonal))
     )
 
 
@@ -105,7 +100,8 @@ def _reconstruct_surfaces_direct(
     score = score_exported_shape(data, stl_path.parent, require_solid=False)
     passed = _passes_surface_gate(result, score, threshold)
 
-    warnings = list(result.warnings)
+    warnings = [*mesh_warnings(data), *result.warnings]
+    warnings.extend(verification_warnings(score, threshold))
     if result.point_fitted_face_count:
         warnings.append(
             f"{result.point_fitted_face_count} residual regions were represented "
@@ -212,7 +208,10 @@ def _reconstruct_faceted_only(
         plan=None,
         surface=surface,
         score=score,
-        warnings=result.warnings,
+        warnings=[
+            *mesh_warnings(data), *result.warnings,
+            *verification_warnings(score, _acceptance_threshold(data.diagonal)),
+        ],
         elapsed_seconds=time.perf_counter() - started,
     )
     atomic_write_text(stl_path.parent / "report.json", report.model_dump_json(indent=2))
@@ -240,6 +239,7 @@ def reconstruct_surfaces(
     source-topology carrier when the child crashes or exceeds its time budget.
     """
 
+    started = time.perf_counter()
     if not isolate:
         return _reconstruct_surfaces_direct(
             run_id,
@@ -293,17 +293,27 @@ def reconstruct_surfaces(
             creationflags=creation_flags,
             check=False,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         completed = None
+        worker_stdout, worker_stderr = exc.stdout, exc.stderr
         reason = (
             "the isolated analytic worker exceeded "
             f"{worker_timeout} seconds"
         )
     else:
+        worker_stdout = getattr(completed, "stdout", "")
+        worker_stderr = getattr(completed, "stderr", "")
         reason = (
             "the isolated analytic worker terminated unexpectedly "
             f"(exit code {completed.returncode})"
         )
+    for name, output in (
+        ("surface-worker.stdout.log", worker_stdout),
+        ("surface-worker.stderr.log", worker_stderr),
+    ):
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        (stl_path.parent / name).write_text(output or "", encoding="utf-8")
     report_path = stl_path.parent / "report.json"
     if completed is not None and completed.returncode == 0 and report_path.is_file():
         try:
@@ -311,6 +321,8 @@ def reconstruct_surfaces(
                 report_path.read_text(encoding="utf-8")
             )
             if _report_has_valid_solid(report) or not report.mesh.watertight:
+                report.elapsed_seconds = time.perf_counter() - started
+                atomic_write_text(report_path, report.model_dump_json(indent=2))
                 if progress_callback is not None:
                     progress_callback(
                         "surface_isolated_worker_done preview=reconstruction.stl"
@@ -330,7 +342,8 @@ def reconstruct_surfaces(
             reason = "the isolated analytic worker returned an unreadable report"
     if progress_callback is not None:
         progress_callback("surface_isolated_worker_recovering")
-    return _reconstruct_faceted_only(
+    _preserve_analytic_diagnostic(stl_path.parent)
+    report = _reconstruct_faceted_only(
         run_id,
         stl_path,
         original_name,
@@ -338,3 +351,6 @@ def reconstruct_surfaces(
         reason,
         progress_callback,
     )
+    report.elapsed_seconds = time.perf_counter() - started
+    atomic_write_text(report_path, report.model_dump_json(indent=2))
+    return report

@@ -58,9 +58,15 @@ download flow without finding an STL first.
 
 The surface engine fits planes, cylinders, cones, spheres, tori, extrusions,
 revolutions, and B-spline residual faces. It joins their boundaries when the
-topology closes. If native fitting crashes or exceeds its time limit, an isolated
-worker returns a clearly labelled faceted recovery instead of taking down the
-server.
+topology closes. If native fitting crashes or exceeds its time limit, the
+converter attempts a clearly labelled faceted recovery within the total job
+deadline.
+
+The API supervises the complete conversion or feature edit in a separate
+process with a 240-second total deadline, including recovery, export, and
+verification. Closed bodies with disjoint bounding boxes use their own fitting scale. Input
+cleanup removes duplicate and zero-area triangles without moving vertices;
+the report exposes remaining open and non-manifold edges.
 
 The feature-history engine detects extrusions, steps, pockets, bosses, holes,
 countersinks, oriented cylinders, revolutions, lofts, fillets, chamfers, arcs,
@@ -70,9 +76,11 @@ verification.
 
 ## Reading the result
 
-`complete` means the automatic solid, STEP round trip, surface deviation, and
-volume checks passed. `best_effort` means the app produced a usable artifact but
-one or more confidence gates failed. The report explains why. A faceted fallback
+`complete` means the delivered STEP was re-imported and passed solid validity,
+sampled surface deviation, local deviation, component-count, and volume checks.
+Verification tessellates that STEP with absolute millimetre deflection; preview
+STL files cannot establish a successful conversion. `best_effort` means the app
+produced an artifact but one or more confidence gates failed. The report explains why. A faceted fallback
 preserves source topology, but it is not an analytic reconstruction.
 
 Artifacts are stored under `runs/<run-id>/` by default. Set
@@ -88,11 +96,14 @@ port private unless you change its visibility.
 
 ## Current beta limits
 
-The strict surface stress corpus currently completes 53 of 60 cases. Four cases
+The August 19 surface stress baseline accepted 53 of 60 cases. Four cases
 exceeded 240 seconds, and three open or internally inconsistent source meshes did
 not produce an accepted result. See the dated
 [surface failure ledger](docs/surface-failure-ledger.md) for exact cases and
 [research notes](docs/RESEARCH_AND_ROADMAP.md) for the current engineering work.
+The stronger verification gates and subsequent targeted evaluations are
+recorded in the [robustness work log](docs/robustness-work.md). The older corpus
+counts are not a full rerun under those stronger gates.
 
 Expect weaker results for damaged scans, very noisy meshes, decorative freeform
 shapes, assemblies, and designs whose original history is ambiguous. The surface

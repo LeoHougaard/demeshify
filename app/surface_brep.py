@@ -5,7 +5,7 @@ import math
 import shutil
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import cadquery as cq
@@ -1631,21 +1631,50 @@ def _replace_periodic_boundary_edges(
         replaced_count = 0
         for support_edge in support_edges:
             support_length = float(support_edge.Length())
+            support_center = np.asarray(support_edge.Center().toTuple(), dtype=float)
+
+            def matching_error(
+                item: _TrimEdge,
+                center: np.ndarray = support_center,
+                length: float = support_length,
+            ) -> float:
+                candidate = cq.Edge(item.edge)
+                center_error = float(
+                    np.linalg.norm(np.asarray(candidate.Center().toTuple()) - center)
+                )
+                length_error = abs(float(candidate.Length()) - length)
+                if length_error > max(tolerance * 20, length * 0.01):
+                    return math.inf
+                # Opposite ends of a cylinder have identical circumferences.
+                # Length alone can replace a top trim with the bottom trim.
+                return center_error
+
             match = min(
                 unused,
-                key=lambda item: abs(float(cq.Edge(item.edge).Length()) - support_length),
+                key=matching_error,
                 default=None,
             )
-            if match is None:
-                continue
-            length_error = abs(float(cq.Edge(match.edge).Length()) - support_length)
-            if length_error > max(tolerance * 20, support_length * 0.01):
+            if match is None or matching_error(match) > tolerance * 5:
                 continue
             try:
                 edge_fixer.FixAddPCurve(match.edge, face, False, tolerance)
             except Exception:
                 continue
-            reshaper.Replace(support_edge.wrapped, match.edge)
+            old_vertex = TopExp.FirstVertex_s(support_edge.wrapped, True)
+            new_vertex = TopExp.FirstVertex_s(match.edge, True)
+            if old_vertex.IsNull() or new_vertex.IsNull():
+                continue
+            if BRep_Tool.Pnt_s(old_vertex).Distance(BRep_Tool.Pnt_s(new_vertex)) > tolerance * 5:
+                # A different periodic seam requires rebuilding its p-curves,
+                # not moving the endpoint of the existing seam edge.
+                continue
+            # The generated seam also touches this endpoint. Replacing only
+            # the circle leaves that seam attached to a different TopoDS_Vertex.
+            reshaper.Replace(old_vertex, new_vertex)
+            replacement = TopoDS.Edge_s(match.edge.Oriented(support_edge.wrapped.Orientation()))
+            if support_edge.tangentAt(0).dot(cq.Edge(match.edge).tangentAt(0)) < 0:
+                replacement = TopoDS.Edge_s(replacement.Reversed())
+            reshaper.Replace(support_edge.wrapped, replacement)
             unused.remove(match)
             replaced_count += 1
         if replaced_count == 0:
@@ -1971,8 +2000,10 @@ def _uv_boundary_face(
         if not maker.IsDone():
             return None
         fixer = ShapeFix_Face(maker.Face())
-        fixer.SetPrecision(tolerance)
-        fixer.SetMaxTolerance(tolerance * 5)
+        # These segments already lie exactly on the analytic support. A mesh
+        # fitting tolerance can erase narrow trim details during wire repair.
+        fixer.SetPrecision(1e-7)
+        fixer.SetMaxTolerance(1e-6)
         fixer.FixOrientation()
         fixer.Perform()
         face = _orient_face(fixer.Face(), patch, mesh)
@@ -1990,6 +2021,17 @@ def _analytic_face(
     mesh: object,
     tolerance: float,
 ) -> TopoDS_Face | None:
+    if isinstance(model.patch, ConicalPatch):
+        patch = model.patch
+        points = np.asarray(mesh.vertices[patch.vertex_indices], dtype=float)
+        if _angular_coverage(points, patch.apex, patch.axis) < math.radians(330):
+            # A clipped cone can have several nearby intersection branches.
+            # Its mesh boundary identifies the intended region in UV space;
+            # a valid wire assembled from 3D intersections may enclose a
+            # different region even when every supporting surface fits well.
+            trimmed = _uv_boundary_face(model, mesh, tolerance)
+            if trimmed is not None:
+                return trimmed
     # A UV-bounded cone band carries a generated periodic p-curve which can
     # become self-intersecting when sewing substitutes its circular borders.
     # Trim cones directly with their canonical shared intersection edges.
@@ -2896,13 +2938,29 @@ def _faceted_residual_faces(
         face: TopoDS_Face | None = None
         if has_curved_boundary:
             try:
+                triangle_points = np.asarray(
+                    [cq.Vertex(vertex_shapes[index]).toTuple() for index in identifiers]
+                )
+                longest_side = max(
+                    np.linalg.norm(triangle_points[index] - triangle_points[(index + 1) % 3])
+                    for index in range(3)
+                )
+                altitude = np.linalg.norm(np.cross(
+                    triangle_points[1] - triangle_points[0],
+                    triangle_points[2] - triangle_points[0],
+                )) / max(longest_side, 1e-15)
+                # The global fitting tolerance can span a thin triangle's
+                # entire width. Its three boundary curves then acquire broad
+                # tolerances and STEP may reverse the resulting trim loop.
+                # Resolve the local width when fitting this transition face.
+                filling_tolerance = max(min(tolerance, altitude * 0.001), 1e-9)
                 filling = BRepFill_Filling(
                     3,
                     8,
                     2,
                     False,
-                    max(tolerance * 0.1, 1e-10),
-                    tolerance,
+                    max(filling_tolerance * 0.1, 1e-10),
+                    filling_tolerance,
                     0.01,
                     max(tolerance * 10, 1e-8),
                     6,
@@ -4060,7 +4118,10 @@ def surface_graph_json(
         if source_mesh_fallback and not faceted_ids
         else sorted(
             {
-                int(face_index)
+                int(
+                    graph.source_face_indices[face_index]
+                    if graph.source_face_indices is not None else face_index
+                )
                 for patch in graph.patches
                 if patch.patch_id in faceted_ids
                 for face_index in patch.face_indices
@@ -4117,7 +4178,95 @@ def surface_graph_json(
     }
 
 
+def _disjoint_component_brep(
+    data: MeshData,
+    progress_callback: Callable[[str], None] | None,
+) -> SurfaceBRepResult | None:
+    components = trimesh.graph.connected_components(
+        data.mesh.face_adjacency, nodes=np.arange(len(data.mesh.faces)), min_len=1
+    )
+    if not 1 < len(components) <= 64:
+        return None
+    parts = []
+    for face_ids in components:
+        vertex_ids, inverse = np.unique(data.mesh.faces[face_ids], return_inverse=True)
+        mesh = trimesh.Trimesh(
+            vertices=data.mesh.vertices[vertex_ids], faces=inverse.reshape((-1, 3)),
+            process=False,
+        )
+        parts.append((face_ids, vertex_ids, mesh))
+    # Overlapping bounds may describe nested cavity shells. Preserve the joint
+    # path for those inputs rather than assuming that every shell is a body.
+    for index, (_, _, first) in enumerate(parts):
+        for _, _, second in parts[index + 1:]:
+            if not np.any(
+                (first.bounds[1] < second.bounds[0]) | (second.bounds[1] < first.bounds[0])
+            ):
+                return None
+
+    combined = SurfaceGraph(face_patch_ids=np.full(len(data.mesh.faces), "", dtype=object))
+    results = []
+    for index, (face_ids, vertex_ids, mesh) in enumerate(parts):
+        if progress_callback:
+            progress_callback(f"surface_component_start index={index} triangles={len(mesh.faces)}")
+        local = replace(data, mesh=mesh, section_cache={})
+        result = _build_surface_brep_single(local, progress_callback)
+        prefix = f"body-{index + 1}:"
+        for patch in result.graph.patches:
+            patch.patch_id = prefix + patch.patch_id
+            patch.face_indices = face_ids[patch.face_indices]
+            patch.vertex_indices = vertex_ids[patch.vertex_indices]
+            combined.face_patch_ids[patch.face_indices] = patch.patch_id
+        for adjacency in result.graph.adjacency:
+            adjacency.first_patch_id = prefix + adjacency.first_patch_id
+            adjacency.second_patch_id = prefix + adjacency.second_patch_id
+        for name in (
+            "planar_patches", "cylindrical_patches", "conical_patches", "spherical_patches",
+            "toroidal_patches", "extrusion_patches", "revolution_patches", "freeform_patches",
+            "adjacency",
+        ):
+            getattr(combined, name).extend(getattr(result.graph, name))
+        result.faceted_patch_ids = [prefix + value for value in result.faceted_patch_ids]
+        result.unfitted_patch_ids = [prefix + value for value in result.unfitted_patch_ids]
+        results.append(result)
+    shape = cq.Compound.makeCompound([result.shape for result in results])
+    closed = all(result.closed for result in results)
+    counts = Counter()
+    for result in results:
+        counts.update(result.surface_counts)
+    return SurfaceBRepResult(
+        shape=shape, graph=combined, surface_counts=dict(counts),
+        face_count=len(shape.Faces()), solid_count=len(shape.Solids()),
+        free_edge_count=sum(result.free_edge_count for result in results),
+        sewing_tolerance=max(result.sewing_tolerance for result in results),
+        valid=bool(shape.isValid()), closed=closed,
+        faceted_fallback=any(result.faceted_fallback for result in results),
+        point_fitted_face_count=sum(result.point_fitted_face_count for result in results),
+        topology_vertex_count=sum(result.topology_vertex_count for result in results),
+        topology_edge_count=sum(result.topology_edge_count for result in results),
+        joined_shape=shape if closed else None,
+        warnings=[warning for result in results for warning in result.warnings],
+        faceted_patch_count=sum(result.faceted_patch_count for result in results),
+        faceted_face_count=sum(result.faceted_face_count for result in results),
+        faceted_patch_ids=[value for result in results for value in result.faceted_patch_ids],
+        unfitted_patch_ids=[value for result in results for value in result.unfitted_patch_ids],
+    )
+
+
 def build_surface_brep(
+    data: MeshData,
+    progress_callback: Callable[[str], None] | None = None,
+) -> SurfaceBRepResult:
+    result = None
+    if isinstance(data, MeshData) and data.mesh.body_count > 1 and data.mesh.is_watertight:
+        result = _disjoint_component_brep(data, progress_callback)
+    if result is None:
+        result = _build_surface_brep_single(data, progress_callback)
+    result.graph.source_face_indices = getattr(data, "source_face_indices", None)
+    return result
+
+
+def _build_surface_brep_single(
     data: MeshData,
     progress_callback: Callable[[str], None] | None = None,
 ) -> SurfaceBRepResult:

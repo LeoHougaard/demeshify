@@ -10,7 +10,7 @@ import cadquery as cq
 import numpy as np
 
 from .cad import build_plan, export_plan
-from .mesh import MeshData, load_mesh
+from .mesh import MeshData, load_mesh, mesh_warnings
 from .profiles import (
     PlanCandidate,
     generate_adaptive_layer_candidates,
@@ -70,12 +70,13 @@ from .schemas import (
     SphereFeature,
     TaperedAddFeature,
 )
-from .scoring import ScoredCandidate, score_plan
+from .scoring import ScoredCandidate, score_exported_shape, score_plan
 from .storage import save_report
+from .verification import acceptance_threshold, passes_geometry_gate, verification_warnings
 
 
 def _acceptance_threshold(diagonal: float) -> float:
-    return max(0.12, diagonal * 0.003)
+    return acceptance_threshold(diagonal)
 
 
 def reconstruct(
@@ -107,7 +108,7 @@ def reconstruct(
         f"mesh_loaded triangles={data.report.triangle_count} "
         f"watertight={data.report.watertight}"
     )
-    warnings: list[str] = []
+    warnings: list[str] = mesh_warnings(data)
     mesh_detector_cache: dict[str, bool] = {}
 
     def detected_mesh_property(
@@ -2751,11 +2752,13 @@ def reconstruct(
 
     trace_stage(f"export_start operations={len(best.plan.operations)}")
     export_plan(best.plan, destination)
+    best.report = score_exported_shape(
+        data, destination, candidate_count=best.report.candidate_count
+    )
     threshold = _acceptance_threshold(data.diagonal)
+    warnings.extend(verification_warnings(best.report, threshold))
     passed = (
-        best.report.valid_solid
-        and best.report.chamfer_p95_mm <= threshold
-        and best.report.volume_error_percent <= 2.0
+        passes_geometry_gate(best.report, threshold)
         and best.plan.representation == "semantic"
     )
     if best.plan.representation == "sampled_approximation":

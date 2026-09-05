@@ -551,6 +551,11 @@ class MeshReport(SchemaModel):
     surface_area_mm2: float
     input_units: str
     unit_scale: float
+    boundary_edge_count: int | None = None
+    nonmanifold_edge_count: int | None = None
+    winding_consistent: bool | None = None
+    removed_degenerate_triangles: int = 0
+    removed_duplicate_triangles: int = 0
 
 
 class ScoreReport(SchemaModel):
@@ -563,6 +568,12 @@ class ScoreReport(SchemaModel):
     candidate_count: int
     valid_brep: bool = True
     volume_comparable: bool = True
+    step_geometry_verified: bool = False
+    component_count_match: bool | None = None
+    source_component_count: int | None = None
+    step_shell_count: int | None = None
+    verification_tessellation_mm: float | None = None
+    local_max_mm: float | None = None
 
 
 class SurfaceBRepReport(SchemaModel):

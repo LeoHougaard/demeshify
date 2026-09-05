@@ -10,10 +10,10 @@ from typing import Any
 from pydantic import BaseModel
 
 from .mesh import load_mesh
-from .reconstruction import _acceptance_threshold
 from .schemas import PlanEditRequest, ReconstructionPlan, ReconstructionReport
-from .scoring import score_plan
+from .scoring import score_exported_shape, score_plan
 from .storage import load_report, run_dir, save_report
+from .verification import acceptance_threshold, passes_geometry_gate, verification_warnings
 
 EDITABLE_ARTIFACTS = (
     "reconstruction.step",
@@ -109,24 +109,27 @@ def apply_plan_edit(run_id: str, request: PlanEditRequest) -> ReconstructionRepo
             Path(scratch_name),
             candidate_count=(current.score.candidate_count + 1 if current.score else 1),
         )
+        candidate.report = score_exported_shape(
+            data, candidate.directory, candidate_count=candidate.report.candidate_count
+        )
         _snapshot(directory, current.plan.revision)
         for file_name in EDITABLE_ARTIFACTS:
             shutil.copy2(candidate.directory / file_name, directory / file_name)
 
     passed = (
-        candidate.report.valid_solid
-        and candidate.report.chamfer_p95_mm <= _acceptance_threshold(data.diagonal)
-        and candidate.report.volume_error_percent <= 2.0
+        passes_geometry_gate(candidate.report, acceptance_threshold(data.diagonal))
+        and candidate.plan.representation == "semantic"
     )
     warnings = [
         warning
         for warning in current.warnings
-        if not warning.startswith("Feature tree revision ")
+        if not warning.startswith(("Feature tree revision ", "Verification:"))
     ]
     warnings.append(
         f"Feature tree revision {edited.revision} was edited by the user and "
         "rebuilt against the original STL."
     )
+    warnings.extend(verification_warnings(candidate.report, acceptance_threshold(data.diagonal)))
     report = ReconstructionReport(
         id=run_id,
         status="complete" if passed else "best_effort",

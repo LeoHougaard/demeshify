@@ -1,11 +1,14 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import tools.benchmark_surface_corpus as benchmark_module
 from tools.benchmark_surface_corpus import (
     _write_output,
     analytic_quality_metrics,
     benchmark_summary,
     case_has_analytic_curves,
+    evaluation_fingerprint,
     is_clean_analytic_reconstruction,
 )
 
@@ -190,3 +193,76 @@ def test_surface_benchmark_writes_failure_ledger(tmp_path: Path) -> None:
     assert output.is_file()
     assert (tmp_path / "surface_failures.json").is_file()
     assert (tmp_path / "surface_failures.md").is_file()
+
+
+def test_missing_reference_cannot_be_a_clean_reconstruction():
+    surface = SimpleNamespace(
+        faceted_fallback=False, source_mesh_fallback=False,
+        faceted_patch_count=0, faceted_face_count=0,
+    )
+    assert not is_clean_analytic_reconstruction(
+        surface, {"reference_comparison_available": False}, []
+    )
+
+
+def test_resume_identity_changes_with_input_reference_and_budget(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"cases": []}', encoding="utf-8")
+    source = tmp_path / "input.stl"
+    source.write_bytes(b"first mesh")
+    reference = tmp_path / "source.step"
+    case = {"id": "case", "stl": "input.stl", "source_step": "source.step"}
+    first = evaluation_fingerprint(case, manifest, 240)
+    assert first == evaluation_fingerprint(case, manifest, 240)
+    source.write_bytes(b"second mesh")
+    second = evaluation_fingerprint(case, manifest, 240)
+    assert first != second
+    reference.write_bytes(b"reference geometry")
+    third = evaluation_fingerprint(case, manifest, 240)
+    assert second != third
+    assert third != evaluation_fingerprint(case, manifest, 120)
+
+
+def test_benchmark_without_reference_records_unknown_quality(tmp_path):
+    import trimesh
+
+    from tools.benchmark_surface_corpus import benchmark_case
+
+    trimesh.creation.box().export(tmp_path / "box.stl")
+    result = benchmark_case({"id": "box", "stl": "box.stl"}, tmp_path)
+
+    assert result["geometric_accepted"]
+    assert not result["reference_comparison_available"]
+    assert result["minimum_analytic_area_recall"] is None
+    assert not result["clean_analytic"]
+    assert not result["accepted"]
+
+
+def test_resume_reuses_only_matching_results_and_survives_bad_worker_json(tmp_path, monkeypatch):
+    source = tmp_path / "input.stl"
+    source.write_bytes(b"first input")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{}', encoding="utf-8")
+    case = {"id": "part", "stl": "input.stl"}
+    calls = []
+
+    def worker(command, **kwargs):
+        calls.append(command)
+        path = Path(command[command.index("--worker-output") + 1])
+        path.write_text(
+            json.dumps({"id": "part", "status": "best_effort"})
+            if len(calls) == 1 else 'incomplete JSON',
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(benchmark_module, "run_bounded_process", worker)
+    first = benchmark_module._bounded_case(case, manifest, tmp_path, 240, True)
+    cached = benchmark_module._bounded_case(case, manifest, tmp_path, 240, True)
+    assert first == cached
+    assert len(calls) == 1
+    source.write_bytes(b"changed input")
+    failed = benchmark_module._bounded_case(case, manifest, tmp_path, 240, True)
+    assert len(calls) == 2
+    assert failed["status"] == "crashed"
+    assert not failed["accepted"]

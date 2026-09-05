@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -17,7 +20,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app.jobs import run_bounded_process  # noqa: E402
 from app.surface_reconstruction import reconstruct_surfaces  # noqa: E402
+from app.verification import acceptance_threshold, passes_geometry_gate  # noqa: E402
 from tools.analyze_surface_failures import (  # noqa: E402
     analyze_results,
     markdown_report,
@@ -156,6 +161,7 @@ def is_clean_analytic_reconstruction(
     warning_text = " ".join(warnings).lower()
     return bool(
         surface
+        and analytic_metrics.get("reference_comparison_available", True)
         and not surface.faceted_fallback
         and not surface.source_mesh_fallback
         and surface.faceted_patch_count == 0
@@ -168,6 +174,50 @@ def is_clean_analytic_reconstruction(
         and "source-mesh" not in warning_text
         and "c0 surfaces" not in warning_text
     )
+
+
+def _case_path(value: object, manifest_parent: Path) -> Path:
+    path = Path(str(value))
+    return path if path.is_absolute() else manifest_parent / path
+
+
+def evaluation_fingerprint(
+    case: dict[str, object], manifest_path: Path, timeout: int
+) -> str:
+    """Invalidate resume data when geometry, code, dependencies or budgets change."""
+
+    digest = hashlib.sha256()
+    digest.update(json.dumps(case, sort_keys=True).encode())
+    digest.update(f"{timeout}:{sys.version}:{sys.platform}".encode())
+    versions = sorted(
+        (item.metadata["Name"], item.version) for item in importlib.metadata.distributions()
+    )
+    digest.update(json.dumps(versions).encode())
+    digest.update(json.dumps({
+        name: os.environ.get(name) for name in (
+            "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"
+        )
+    }, sort_keys=True).encode())
+    paths = [
+        *sorted((PROJECT_ROOT / "app").glob("*.py")),
+        Path(__file__).resolve(),
+        PROJECT_ROOT / "tools" / "analyze_surface_failures.py",
+        PROJECT_ROOT / "pyproject.toml",
+        PROJECT_ROOT / "uv.lock",
+        manifest_path,
+        _case_path(case["stl"], manifest_path.parent),
+    ]
+    if case.get("source_step"):
+        paths.append(_case_path(case["source_step"], manifest_path.parent))
+    for path in paths:
+        digest.update(str(path.resolve()).encode())
+        if not path.is_file():
+            digest.update(b"missing")
+            continue
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def benchmark_summary(
@@ -234,8 +284,8 @@ def benchmark_case(
 
         source_metrics: dict[str, object] = {}
         source_step = case.get("source_step")
-        if source_step and Path(str(source_step)).is_file():
-            source_metrics = step_surface_metrics(Path(str(source_step)))
+        if source_step and _case_path(source_step, manifest_parent).is_file():
+            source_metrics = step_surface_metrics(_case_path(source_step, manifest_parent))
         analytic_metrics = (
             analytic_quality_metrics(source_metrics, output_metrics)
             if source_metrics and output_metrics
@@ -244,25 +294,26 @@ def benchmark_case(
                 "missing_analytic_surface_types": [],
                 "analytic_area_recall_by_type": {},
                 "analytic_area_precision_by_type": {},
-                "minimum_analytic_area_recall": 1.0,
-                "minimum_analytic_area_precision": 1.0,
-                "circular_edge_length_recall": 1.0,
+                "minimum_analytic_area_recall": None,
+                "minimum_analytic_area_precision": None,
+                "circular_edge_length_recall": None,
                 "unexpected_nonanalytic_surface_types": [],
             }
+        )
+        analytic_metrics["reference_comparison_available"] = bool(
+            source_metrics and output_metrics
         )
 
         surface = report.surface
         score = report.score
         diagonal = sum(value * value for value in report.mesh.dimensions_mm) ** 0.5
-        p95_limit = max(0.12, diagonal * 0.003)
+        p95_limit = acceptance_threshold(diagonal)
         geometric_accepted = bool(
             surface
             and score
             and surface.closed
             and surface.free_edge_count == 0
-            and score.valid_brep
-            and score.valid_solid
-            and score.chamfer_p95_mm <= p95_limit
+            and passes_geometry_gate(score, p95_limit)
             and step_roundtrip_valid
             and step_roundtrip_solids > 0
         )
@@ -308,6 +359,11 @@ def benchmark_case(
             "valid_solid": bool(score and score.valid_solid),
             "p95_mm": score.chamfer_p95_mm if score else None,
             "maximum_mm": score.chamfer_max_mm if score else None,
+            "local_max_mm": score.local_max_mm if score else None,
+            "volume_error_percent": score.volume_error_percent if score else None,
+            "volume_comparable": score.volume_comparable if score else False,
+            "component_count_match": score.component_count_match if score else None,
+            "step_geometry_verified": score.step_geometry_verified if score else False,
             "p95_limit_mm": p95_limit,
             "step_roundtrip_valid": step_roundtrip_valid,
             "step_roundtrip_solids": step_roundtrip_solids,
@@ -337,6 +393,9 @@ def benchmark_case(
                 "analytic_diagnostic_joined_surfaces.step",
                 "analytic_diagnostic_surface_graph.json",
                 "analytic_diagnostic_report.json",
+                "surface-worker-progress.log",
+                "surface-worker.stderr.log",
+                "surface-worker.stdout.log",
             ):
                 artifact = working / name
                 if artifact.is_file():
@@ -392,70 +451,55 @@ def _bounded_case(
 ) -> dict[str, object]:
     identifier = str(case["id"])
     cache_path = cache_directory / f"{identifier}.json"
-    if not (resume and cache_path.is_file()):
-        command = [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            str(manifest_path.resolve()),
-            "--worker-id",
-            identifier,
-            "--worker-output",
-            str(cache_path.resolve()),
-        ]
-        if artifacts_root is not None:
-            command.extend(["--artifacts-root", str(artifacts_root.resolve())])
+    fingerprint = evaluation_fingerprint(case, manifest_path, timeout)
+    if resume and cache_path.is_file():
         try:
-            subprocess.run(
-                command,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                creationflags=(
-                    subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-                ),
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("evaluation_fingerprint") == fingerprint:
+                return cached
+        except (ValueError, OSError):
+            pass
+    cache_path.unlink(missing_ok=True)
+    command = [
+        sys.executable, str(Path(__file__).resolve()), str(manifest_path.resolve()),
+        "--worker-id", identifier, "--worker-output", str(cache_path.resolve()),
+    ]
+    if artifacts_root is not None:
+        command.extend(["--artifacts-root", str(artifacts_root.resolve())])
+    started = time.perf_counter()
+    failure = None
+    try:
+        returncode = run_bounded_process(
+            command, cwd=PROJECT_ROOT, timeout=timeout,
+            stdout_path=cache_path.with_suffix(".stdout.log"),
+            stderr_path=cache_path.with_suffix(".stderr.log"),
+        )
+        if returncode:
+            raise subprocess.CalledProcessError(
+                returncode, command,
+                stderr=cache_path.with_suffix(".stderr.log").read_text(
+                    encoding="utf-8", errors="replace"
+                )[-4000:],
             )
-        except subprocess.TimeoutExpired:
-            cache_path.write_text(
-                json.dumps(
-                    {
-                        "id": identifier,
-                        "family": (
-                            case.get("ground_truth", {}).get("family", "unknown")
-                            if isinstance(case.get("ground_truth"), dict)
-                            else "unknown"
-                        ),
-                        "status": "timeout",
-                        "error": f"Exceeded {timeout} seconds",
-                        "geometric_accepted": False,
-                        "clean_analytic": False,
-                        "accepted": False,
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        except subprocess.CalledProcessError as exc:
-            cache_path.write_text(
-                json.dumps(
-                    {
-                        "id": identifier,
-                        "family": (
-                            case.get("ground_truth", {}).get("family", "unknown")
-                            if isinstance(case.get("ground_truth"), dict)
-                            else "unknown"
-                        ),
-                        "status": "crashed",
-                        "error": (exc.stderr or str(exc))[-4000:],
-                        "geometric_accepted": False,
-                        "clean_analytic": False,
-                        "accepted": False,
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-    return json.loads(cache_path.read_text(encoding="utf-8"))
+        result = json.loads(cache_path.read_text(encoding="utf-8"))
+    except subprocess.TimeoutExpired:
+        failure = ("timeout", f"Exceeded {timeout} seconds")
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        failure = ("crashed", (getattr(exc, "stderr", None) or str(exc))[-4000:])
+    if failure:
+        result = {
+            "id": identifier,
+            "family": (
+                case.get("ground_truth", {}).get("family", "unknown")
+                if isinstance(case.get("ground_truth"), dict) else "unknown"
+            ),
+            "status": failure[0], "error": failure[1],
+            "geometric_accepted": False, "clean_analytic": False, "accepted": False,
+        }
+    result["case_wall_seconds"] = time.perf_counter() - started
+    result["evaluation_fingerprint"] = fingerprint
+    cache_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
 
 
 def _write_output(

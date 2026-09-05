@@ -81,8 +81,10 @@ lofts, and competing construction histories now exist. The remaining work is:
 
 1. Close the seven unresolved cases in the strict 60-case surface corpus,
    especially the four cases that exceed the 240-second evaluation budget.
-2. Move feature-history builds and plan edits into bounded worker processes so
-   malformed native CAD operations cannot stop the API server.
+2. Extend the supervised API worker checks to broader malformed-input and
+   long-running native workloads. Conversion, fallback, and feature-history
+   edits now share a bounded process supervisor; see
+   [robustness work](robustness-work.md).
 3. Make run state durable across restarts and publish edits transactionally
    before supporting any shared or multi-user deployment.
 4. Add opt-in artifact retention limits, deletion in the browser, and storage

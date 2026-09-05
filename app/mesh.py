@@ -23,6 +23,7 @@ class MeshData:
     report: MeshReport
     source_path: Path
     section_cache: dict[tuple[str, float], Any] = field(default_factory=dict)
+    source_face_indices: np.ndarray | None = None
 
     @property
     def diagonal(self) -> float:
@@ -42,11 +43,28 @@ def load_mesh(path: Path, file_name: str, input_units: str = "mm") -> MeshData:
         raise ValueError("The STL contains no triangles")
 
     mesh = loaded.copy()
+    source_face_indices = np.arange(len(mesh.faces), dtype=np.int64)
+    if not np.all(np.isfinite(mesh.vertices)):
+        raise ValueError("The STL contains non-finite coordinates")
     scale = UNIT_SCALE[input_units]
     if scale != 1.0:
         mesh.apply_scale(scale)
+    nonzero = np.asarray(mesh.area_faces) > 0
+    removed_degenerate = int(np.count_nonzero(~nonzero))
+    if removed_degenerate:
+        mesh.update_faces(nonzero)
+        source_face_indices = source_face_indices[nonzero]
+    unique = mesh.unique_faces()
+    removed_duplicate = int(np.count_nonzero(~unique))
+    if removed_duplicate:
+        mesh.update_faces(unique)
+        source_face_indices = source_face_indices[unique]
+    if len(mesh.faces) == 0:
+        raise ValueError("The STL contains no non-degenerate triangles")
     mesh.remove_unreferenced_vertices()
     mesh.fix_normals(multibody=True)
+
+    incidence = np.bincount(mesh.edges_unique_inverse, minlength=len(mesh.edges_unique))
 
     volume = abs(float(mesh.volume)) if mesh.is_watertight else None
     report = MeshReport(
@@ -60,8 +78,33 @@ def load_mesh(path: Path, file_name: str, input_units: str = "mm") -> MeshData:
         surface_area_mm2=float(mesh.area),
         input_units=input_units,
         unit_scale=scale,
+        boundary_edge_count=int(np.count_nonzero(incidence == 1)),
+        nonmanifold_edge_count=int(np.count_nonzero(incidence > 2)),
+        winding_consistent=bool(mesh.is_winding_consistent),
+        removed_degenerate_triangles=removed_degenerate,
+        removed_duplicate_triangles=removed_duplicate,
     )
-    return MeshData(mesh=mesh, report=report, source_path=path)
+    return MeshData(
+        mesh=mesh, report=report, source_path=path, source_face_indices=source_face_indices
+    )
+
+
+def mesh_warnings(data: MeshData) -> list[str]:
+    report = data.report
+    warnings = []
+    removed = report.removed_degenerate_triangles + report.removed_duplicate_triangles
+    if removed:
+        warnings.append(
+            f"Removed {report.removed_degenerate_triangles} zero-area and "
+            f"{report.removed_duplicate_triangles} duplicate triangles without moving vertices."
+        )
+    if report.boundary_edge_count or report.nonmanifold_edge_count:
+        warnings.append(
+            f"Input topology has {report.boundary_edge_count} boundary edges and "
+            f"{report.nonmanifold_edge_count} non-manifold edges. "
+            "Openings were not automatically filled."
+        )
+    return warnings
 
 
 def surface_samples(mesh: trimesh.Trimesh, count: int = 5000) -> np.ndarray:

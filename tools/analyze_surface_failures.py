@@ -36,6 +36,17 @@ def classify_failure(result: dict[str, Any]) -> list[str]:
     if isinstance(p95, (int, float)) and isinstance(p95_limit, (int, float)):
         if p95 > p95_limit:
             categories.append("surface_deviation")
+        for field in ("maximum_mm", "local_max_mm"):
+            value = result.get(field)
+            if isinstance(value, (int, float)) and value > p95_limit:
+                categories.append("local_surface_deviation")
+    if result.get("component_count_match") is False:
+        categories.append("component_mismatch")
+    if result.get("reference_comparison_available") is False:
+        categories.append("missing_reference_geometry")
+    volume_error = result.get("volume_error_percent")
+    if isinstance(volume_error, (int, float)) and volume_error > 2.0:
+        categories.append("volume_deviation")
     if "analytic trimming failed" in warnings:
         categories.append("analytic_trim_failure")
     if "residual" in warnings and "b-spline" in warnings:

@@ -5,6 +5,7 @@ import logging
 import re
 import uuid
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from threading import Lock
 from typing import Annotated
@@ -13,12 +14,11 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from .editor import RevisionConflictError, apply_plan_edit
+from .editor import RevisionConflictError
+from .jobs import edit_in_worker, reconstruct_in_worker
 from .progress import apply_stage, new_progress, public_progress
-from .reconstruction import reconstruct
 from .schemas import PlanEditRequest, ReconstructionReport
 from .storage import ROOT, load_report, run_dir
-from .surface_reconstruction import reconstruct_surfaces
 
 app = FastAPI(title="STL to STEP Converter", version="0.1.0")
 LOGGER = logging.getLogger(__name__)
@@ -90,10 +90,8 @@ def health() -> dict[str, object]:
 
 
 def _reconstructor(engine: str):
-    if engine == "surface_brep":
-        return reconstruct_surfaces
-    if engine == "feature_tree":
-        return reconstruct
+    if engine in {"surface_brep", "feature_tree"}:
+        return partial(reconstruct_in_worker, engine=engine)
     raise HTTPException(400, "Unsupported reconstruction engine")
 
 
@@ -430,7 +428,7 @@ async def edit_plan_endpoint(
     async with lock:
         try:
             async with RECONSTRUCTION_SLOT:
-                return await asyncio.to_thread(apply_plan_edit, run_id, request)
+                return await asyncio.to_thread(edit_in_worker, run_id, request)
         except FileNotFoundError as exc:
             raise HTTPException(404, "Run not found") from exc
         except RevisionConflictError as exc:
