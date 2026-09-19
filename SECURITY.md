@@ -8,7 +8,8 @@ versioned builds.
 
 ## Reporting a vulnerability
 
-Use GitHub's private vulnerability reporting for this repository. Do not open a
+Use [GitHub's private vulnerability reporting](https://github.com/LeoHougaard/demeshify/security/advisories/new)
+for this repository. Do not open a
 public issue with exploit details, private model files, credentials, or local
 filesystem paths. Include the affected commit, impact, reproduction steps, and a
 small synthetic input if one is needed.
@@ -23,3 +24,8 @@ bounded job system.
 
 Uploaded STLs, reports, generated scripts, and CAD exports remain in the runs
 directory until the operator deletes them.
+
+The server accepts local hostnames and the current Codespace hostname. It rejects
+cross-origin browser writes. For a private deployment using another hostname, set
+`STL_TO_STEP_ALLOWED_HOSTS` to the exact hostname, without a scheme or port.
+Separate multiple hostnames with commas. This setting does not add authentication.

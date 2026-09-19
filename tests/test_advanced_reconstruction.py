@@ -236,6 +236,29 @@ def test_equal_cost_revolve_fit_keeps_full_tangent_arc() -> None:
     assert tangent.end[0] == pytest.approx(10.0, abs=0.002)
 
 
+def test_tangent_circular_arcs_keep_their_distinct_radii() -> None:
+    first_angles = np.linspace(-math.pi / 2, 0, 25)
+    second_angles = np.linspace(0, math.pi / 4, 25)
+    first = 5 * np.column_stack((np.cos(first_angles), np.sin(first_angles))) + [0, 5]
+    second = 10 * np.column_stack((np.cos(second_angles), np.sin(second_angles))) + [-5, 5]
+    ring = np.vstack((first, second[1:], [-3, second[-1, 1]], [-3, 0], first[0]))
+
+    profile = _fit_path_profile(ring, tolerance=0.012)
+
+    assert profile is not None
+    assert sum(isinstance(segment, ArcSegment) for segment in profile.segments) == 2
+    assert not any(isinstance(segment, SplineSegment) for segment in profile.segments)
+    solid = build_plan(ReconstructionPlan(
+        name="tangent_arcs", base=ExtrudeFeature(
+            axis=Axis.Z, start=0.0, depth=2.0, outer=profile,
+        ),
+    )).val()
+    assert solid.isValid()
+    radii = sorted(face._geomAdaptor().Cylinder().Radius()
+                   for face in solid.Faces() if face.geomType() == "CYLINDER")
+    assert radii == pytest.approx([5.0, 10.0], abs=0.03)
+
+
 def test_changing_curvature_tangent_is_an_editable_spline_segment() -> None:
     x = np.linspace(0.0, 8.0, 35)
     # Curvature changes continuously, so no single circle can represent this

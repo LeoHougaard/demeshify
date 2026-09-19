@@ -5,6 +5,7 @@ import logging
 import re
 import uuid
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from threading import Lock
@@ -18,9 +19,11 @@ from .editor import RevisionConflictError
 from .jobs import edit_in_worker, reconstruct_in_worker
 from .progress import apply_stage, new_progress, public_progress
 from .schemas import PlanEditRequest, ReconstructionReport
+from .security import LocalRequestMiddleware
 from .storage import ROOT, load_report, run_dir
 
 app = FastAPI(title="STL to STEP Converter", version="0.1.0")
+app.add_middleware(LocalRequestMiddleware)
 LOGGER = logging.getLogger(__name__)
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
 MAX_PENDING_JOBS = 4
@@ -40,12 +43,34 @@ EDIT_LOCKS: dict[str, asyncio.Lock] = {}
 RUN_PROGRESS: dict[str, dict[str, object]] = {}
 RUN_PROGRESS_LOCK = Lock()
 RUN_TASKS: set[asyncio.Task[None]] = set()
+REQUEST_TASKS: set[asyncio.Task] = set()
 RECONSTRUCTION_SLOT = asyncio.Semaphore(1)
 ADMISSION_LOCK = asyncio.Lock()
 
 
 def _valid_run_id(run_id: str) -> bool:
     return RUN_ID_PATTERN.fullmatch(run_id) is not None
+
+
+def _check_queue_capacity() -> None:
+    if len(RUN_TASKS) + len(REQUEST_TASKS) >= MAX_PENDING_JOBS:
+        raise HTTPException(
+            429,
+            "The local reconstruction queue is full. Try again after a job finishes.",
+            headers={"Retry-After": "10"},
+        )
+
+
+@asynccontextmanager
+async def _request_job():
+    task = asyncio.current_task()
+    async with ADMISSION_LOCK:
+        _check_queue_capacity()
+        REQUEST_TASKS.add(task)
+    try:
+        yield
+    finally:
+        REQUEST_TASKS.discard(task)
 
 
 @app.middleware("http")
@@ -141,24 +166,29 @@ async def reconstruct_endpoint(
     engine: Annotated[str, Form()] = "surface_brep",
 ) -> ReconstructionReport:
     reconstructor = _reconstructor(engine)
-    run_id, target, safe_name = await _receive_upload(file, input_units)
     try:
-        async with RECONSTRUCTION_SLOT:
-            return await asyncio.to_thread(
-                reconstructor,
-                run_id,
-                target,
-                safe_name,
-                input_units,
-            )
+        async with _request_job():
+            run_id, target, safe_name = await _receive_upload(file, input_units)
+            async with RECONSTRUCTION_SLOT:
+                return await asyncio.to_thread(
+                    reconstructor,
+                    run_id,
+                    target,
+                    safe_name,
+                    input_units,
+                )
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     except Exception as exc:
-        LOGGER.exception("Synchronous reconstruction failed for run %s", run_id)
+        LOGGER.exception("Synchronous reconstruction failed")
         raise HTTPException(
             500,
             "Reconstruction failed. Check the server log for details.",
         ) from exc
+    finally:
+        await file.close()
 
 
 def _consume_worker_progress(
@@ -281,13 +311,11 @@ async def start_reconstruction_endpoint(
 ) -> dict[str, object]:
     _reconstructor(engine)
     async with ADMISSION_LOCK:
-        if len(RUN_TASKS) >= MAX_PENDING_JOBS:
+        try:
+            _check_queue_capacity()
+        except HTTPException:
             await file.close()
-            raise HTTPException(
-                429,
-                "The local reconstruction queue is full. Try again after a job finishes.",
-                headers={"Retry-After": "10"},
-            )
+            raise
         run_id, target, safe_name = await _receive_upload(file, input_units)
         with RUN_PROGRESS_LOCK:
             RUN_PROGRESS[run_id] = new_progress(run_id)
@@ -424,10 +452,12 @@ async def edit_plan_endpoint(
 ) -> ReconstructionReport:
     if not _valid_run_id(run_id):
         raise HTTPException(404, "Run not found")
-    lock = EDIT_LOCKS.setdefault(run_id, asyncio.Lock())
-    async with lock:
+    if not (run_dir(run_id, create=False) / "report.json").is_file():
+        raise HTTPException(404, "Run not found")
+    async with _request_job():
+        lock = EDIT_LOCKS.setdefault(run_id, asyncio.Lock())
         try:
-            async with RECONSTRUCTION_SLOT:
+            async with lock, RECONSTRUCTION_SLOT:
                 return await asyncio.to_thread(edit_in_worker, run_id, request)
         except FileNotFoundError as exc:
             raise HTTPException(404, "Run not found") from exc

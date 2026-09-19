@@ -1,8 +1,8 @@
 # STL to STEP Converter
 
-[![CI](https://github.com/LeoHougaard/stl-to-step-converter/actions/workflows/ci.yml/badge.svg)](https://github.com/LeoHougaard/stl-to-step-converter/actions/workflows/ci.yml)
+[![CI](https://github.com/LeoHougaard/demeshify/actions/workflows/ci.yml/badge.svg)](https://github.com/LeoHougaard/demeshify/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/LeoHougaard/stl-to-step-converter?quickstart=1)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/LeoHougaard/demeshify?quickstart=1)
 
 STL to STEP Converter turns mechanical STL meshes into STEP CAD models. It runs
 a local FastAPI geometry service and a browser-based Three.js viewer. The
@@ -29,16 +29,16 @@ To run it on your own computer, install:
 On Windows, open PowerShell:
 
 ```powershell
-git clone https://github.com/LeoHougaard/stl-to-step-converter.git
-cd stl-to-step-converter
+git clone https://github.com/LeoHougaard/demeshify.git
+cd demeshify
 .\run.ps1
 ```
 
 On macOS or Linux:
 
 ```bash
-git clone https://github.com/LeoHougaard/stl-to-step-converter.git
-cd stl-to-step-converter
+git clone https://github.com/LeoHougaard/demeshify.git
+cd demeshify
 bash run.sh
 ```
 
@@ -48,6 +48,11 @@ start one local server process. Press Ctrl+C in the terminal to stop it.
 
 The app includes a small sample plate, so you can test the full conversion and
 download flow without finding an STL first.
+
+Choose the STL export units before converting and check the displayed output
+size. STL files do not store units. For example, a 0.18 × 0.25 model exported in
+metres should become 180 × 250 mm. The viewer loads the file in your browser;
+conversion and downloads require the local server to remain running.
 
 ## Reconstruction modes
 
@@ -79,9 +84,11 @@ verification.
 `complete` means the delivered STEP was re-imported and passed solid validity,
 sampled surface deviation, local deviation, component-count, and volume checks.
 Verification tessellates that STEP with absolute millimetre deflection; preview
-STL files cannot establish a successful conversion. `best_effort` means the app
-produced an artifact but one or more confidence gates failed. The report explains why. A faceted fallback
-preserves source topology, but it is not an analytic reconstruction.
+STL files cannot establish a successful conversion. `best_effort` means CAD
+surface recovery is incomplete or a geometry check failed. The report explains
+why. A "Verified faceted fallback" has passed the geometry checks but still uses
+triangle faces. Dense fallbacks may simplify the triangles; verification always
+compares the exported STEP with the full-resolution input.
 
 Artifacts are stored under `runs/<run-id>/` by default. Set
 `STL_TO_STEP_RUNS_DIR` to keep them elsewhere. Feature-history edits retain older
@@ -96,14 +103,25 @@ port private unless you change its visibility.
 
 ## Current beta limits
 
-The August 19 surface stress baseline accepted 53 of 60 cases. Four cases
-exceeded 240 seconds, and three open or internally inconsistent source meshes did
-not produce an accepted result. See the dated
-[surface failure ledger](docs/surface-failure-ledger.md) for exact cases and
-[research notes](docs/RESEARCH_AND_ROADMAP.md) for the current engineering work.
-The stronger verification gates and subsequent targeted evaluations are
-recorded in the [robustness work log](docs/robustness-work.md). The older corpus
-counts are not a full rerun under those stronger gates.
+The September 17 release test evaluated 500 distinct mechanical-part STLs.
+497 passed the delivered-STEP geometry checks (99.4%); 382 also passed strict
+CAD-surface recovery checks without triangle fallbacks (76.4%). Another 17
+produced verified non-faceted models below the CAD-quality threshold, and 98
+used verified faceted fallbacks. Three open or non-manifold inputs remained
+unverified. No conversion exceeded the 240-second limit in the final batch.
+
+CAD recovery is still well below 100%, particularly for fillets and complex
+printed parts. See the [release report](docs/release-report.md) for the corpus
+scope, unchanged acceptance gates, known failures, and all 500 per-file results.
+These development-corpus results support a local public beta, not a guarantee
+for arbitrary STL files.
+
+A [September 18 evaluation](docs/design-evaluation-2026-09-18.md) retains all
+previous passes on those 500 files and improves strict CAD recovery to 383/500
+(76.6%). It also tests 56 additional files: 54 pass geometry and 19 have verified
+output without facets, up from 13. Only 7 of the 36 reference-backed additional
+cases pass strict CAD recovery, up from 5. These harder designs show a substantial
+remaining gap in surface recovery even when the source meshes are watertight.
 
 Expect weaker results for damaged scans, very noisy meshes, decorative freeform
 shapes, assemblies, and designs whose original history is ambiguous. The surface

@@ -552,7 +552,16 @@ def _fit_path_profile(points: np.ndarray, tolerance: float) -> PathProfile | Non
                     choices[start] = (end, segment)
             arc = _arc_segment(sample, tolerance)
             if arc is not None:
-                arc_cost = 1.05
+                # Two truly circular tangent spans should remain dimensionable
+                # arcs rather than become one cheaper general spline. Reserve
+                # this preference for much stronger evidence than the ordinary
+                # approximation tolerance, preserving changing-curvature curves.
+                fitted_circle = _circle_values(sample)
+                exact_arc = (
+                    fitted_circle is not None
+                    and float(np.max(fitted_circle[3])) <= tolerance * 0.05
+                )
+                arc_cost = 0.5 if exact_arc else 1.05
                 next_choice = choices[end]
                 if next_choice is not None and isinstance(
                     next_choice[1], LineSegment
@@ -687,8 +696,54 @@ def _profile_from_ring(points: np.ndarray, tolerance: float) -> tuple[Profile, P
     return profile, polygon
 
 
-def section_shape(data: MeshData, axis: Axis, location: float) -> SectionShape | None:
-    cache_key = (axis.value, round(float(location), 9))
+def _section_profile_tolerance(data: MeshData, axis: Axis) -> float:
+    # Tie the fitting tolerance to the sketch plane as well as the model
+    # diagonal.  A long, thin extrusion can be tens of millimetres long while
+    # its entire sketch is sub-millimetre; a diagonal-only tolerance erases
+    # small but real line/arc features and forces a many-slab fallback.
+    transverse_extents = np.delete(np.asarray(data.mesh.extents), AXES[axis][3])
+    positive_extents = transverse_extents[transverse_extents > 1e-9]
+    profile_scale = (
+        float(np.min(positive_extents))
+        if len(positive_extents)
+        else data.diagonal
+    )
+    return max(
+        min(data.diagonal * 0.0008, profile_scale * 0.002),
+        0.001,
+    )
+
+
+def _section_polygon(
+    data: MeshData, axis: Axis, location: float,
+) -> Polygon | MultiPolygon | None:
+    """Measure section persistence before fitting any editable curves."""
+    normal, _, _, index = AXES[axis]
+    origin = np.zeros(3)
+    origin[index] = location
+    section = data.mesh.section(plane_origin=origin, plane_normal=normal)
+    if section is None:
+        return None
+    tolerance = _section_profile_tolerance(data, axis)
+    result = Polygon()
+    for discrete in section.discrete:
+        if len(discrete) < 4:
+            continue
+        ring = Polygon(_project(np.asarray(discrete), axis))
+        if not ring.is_valid:
+            ring = ring.buffer(0)
+        if isinstance(ring, MultiPolygon):
+            ring = max(ring.geoms, key=lambda item: item.area)
+        if not ring.is_empty and ring.area > tolerance**2:
+            result = result.symmetric_difference(ring)
+    return result if not result.is_empty else None
+
+
+def section_shape(
+    data: MeshData, axis: Axis, location: float, *, tolerance_scale: float = 1.0,
+) -> SectionShape | None:
+    cache_axis = axis.value if tolerance_scale == 1.0 else f"{axis.value}:{tolerance_scale:g}"
+    cache_key = (cache_axis, round(float(location), 9))
     if cache_key in data.section_cache:
         cached = data.section_cache[cache_key]
         return cached if isinstance(cached, SectionShape) else None
@@ -700,22 +755,7 @@ def section_shape(data: MeshData, axis: Axis, location: float) -> SectionShape |
     if section is None:
         data.section_cache[cache_key] = None
         return None
-
-    # Tie the fitting tolerance to the sketch plane as well as the model
-    # diagonal.  A long, thin extrusion can be tens of millimetres long while
-    # its entire sketch is sub-millimetre; a diagonal-only tolerance erases
-    # small but real line/arc features and forces a many-slab fallback.
-    transverse_extents = np.delete(np.asarray(data.mesh.extents), index)
-    positive_extents = transverse_extents[transverse_extents > 1e-9]
-    profile_scale = (
-        float(np.min(positive_extents))
-        if len(positive_extents)
-        else data.diagonal
-    )
-    tolerance = max(
-        min(data.diagonal * 0.0008, profile_scale * 0.002),
-        0.001,
-    )
+    tolerance = _section_profile_tolerance(data, axis) * tolerance_scale
     rings: list[tuple[Profile, Polygon]] = []
     for discrete in section.discrete:
         projected = _project(np.asarray(discrete), axis)
@@ -786,7 +826,9 @@ def _polygon_similarity(first: Polygon, second: Polygon) -> float:
     return float(first.intersection(second).area / union)
 
 
-def generate_prismatic_candidates(data: MeshData, name: str) -> list[PlanCandidate]:
+def generate_prismatic_candidates(
+    data: MeshData, name: str, minimum_consistency: float = 0.0,
+) -> list[PlanCandidate]:
     bounds = data.mesh.bounds
     candidates: list[PlanCandidate] = []
     target_volume = data.report.volume_mm3
@@ -797,16 +839,27 @@ def generate_prismatic_candidates(data: MeshData, name: str) -> list[PlanCandida
         if depth <= 0:
             continue
         positions = [start + depth * fraction for fraction in (0.2, 0.5, 0.8)]
-        sections = [section_shape(data, axis, position) for position in positions]
-        if any(section is None for section in sections):
-            continue
-        low, middle, high = sections
-        assert low is not None and middle is not None and high is not None
-
-        similarity = min(
-            _polygon_similarity(low.polygon, middle.polygon),
-            _polygon_similarity(middle.polygon, high.polygon),
-        )
+        if minimum_consistency > 0:
+            polygons = [_section_polygon(data, axis, position) for position in positions]
+            if any(polygon is None for polygon in polygons):
+                continue
+            similarity = min(_polygon_similarity(polygons[0], polygons[1]),
+                             _polygon_similarity(polygons[1], polygons[2]))
+            if similarity < minimum_consistency:
+                continue
+            middle = section_shape(data, axis, positions[1])
+            if middle is None:
+                continue
+        else:
+            sections = [section_shape(data, axis, position) for position in positions]
+            if any(section is None for section in sections):
+                continue
+            low, middle, high = sections
+            assert low is not None and middle is not None and high is not None
+            similarity = min(
+                _polygon_similarity(low.polygon, middle.polygon),
+                _polygon_similarity(middle.polygon, high.polygon),
+            )
         estimated_volume = middle.area * depth
         volume_error = (
             abs(estimated_volume - target_volume) / max(target_volume, 1e-9)
@@ -953,19 +1006,52 @@ def _base_from_section(
     )
 
 
-def generate_layered_candidates(data: MeshData, name: str) -> list[PlanCandidate]:
+def generate_layered_candidates(
+    data: MeshData, name: str, minimum_consistency: float = 0.0,
+    maximum_operations: int | None = None,
+    *, profile_tolerance_scale: float = 1.0,
+) -> list[PlanCandidate]:
     candidates: list[PlanCandidate] = []
     target_volume = data.report.volume_mm3
     for axis in AXES:
         levels = _axis_levels(data, axis)
         if len(levels) < 3:
             continue
+        if minimum_consistency > 0 or maximum_operations is not None:
+            measured = []
+            for start, end in zip(levels, levels[1:], strict=False):
+                if end - start <= max(data.diagonal * 1e-5, 0.001):
+                    continue
+                polygon = _section_polygon(data, axis, (start + end) / 2)
+                if polygon is None:
+                    continue
+                start, end = _clean(start), _clean(end)
+                if (
+                    measured and abs(start - measured[-1][1]) <= 0.005
+                    and _polygon_similarity(measured[-1][2], polygon) >= 0.998
+                ):
+                    measured[-1] = (measured[-1][0], end, measured[-1][2])
+                else:
+                    measured.append((start, end, polygon))
+            operations = sum(len(polygon.geoms) if isinstance(polygon, MultiPolygon) else 1
+                             for _, _, polygon in measured) - 1
+            measured_volume = sum(polygon.area * (end - start)
+                                  for start, end, polygon in measured)
+            if (
+                len(measured) < 2
+                or (maximum_operations is not None and operations > maximum_operations)
+                or (target_volume is not None and abs(measured_volume - target_volume)
+                    / max(target_volume, 1e-9) > 1 - minimum_consistency)
+            ):
+                continue
         layers: list[tuple[float, float, SectionShape]] = []
         for start, end in zip(levels, levels[1:], strict=False):
             depth = end - start
             if depth <= max(data.diagonal * 1e-5, 0.001):
                 continue
-            section = section_shape(data, axis, start + depth / 2)
+            section = section_shape(
+                data, axis, start + depth / 2, tolerance_scale=profile_tolerance_scale,
+            )
             if section is not None:
                 layers.append((_clean(start), _clean(end), section))
         if len(layers) < 2:

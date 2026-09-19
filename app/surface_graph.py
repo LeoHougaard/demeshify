@@ -744,6 +744,41 @@ def _circular_extrusion_axis(
     return _canonical_direction(patch.direction), origin, radius
 
 
+def _cylinder_normals_follow_chords(
+    triangles: np.ndarray, normals: np.ndarray, axis: np.ndarray, origin: np.ndarray,
+    *, allow_transition_slivers: bool = False,
+) -> bool:
+    """Allow tessellation error without absorbing a flat wall's rounded ends."""
+    relative = triangles - origin
+    radial = relative - np.einsum("ijk,k->ij", relative, axis)[..., None] * axis
+    radial /= np.maximum(np.linalg.norm(radial, axis=2)[..., None], 1e-15)
+    middle = np.mean(radial, axis=1)
+    middle /= np.maximum(np.linalg.norm(middle, axis=1)[:, None], 1e-15)
+    span = np.arccos(np.clip(np.einsum("ijk,ik->ij", radial, middle), -1, 1)).max(axis=1)
+    error = np.arccos(np.clip(np.abs(np.einsum("ij,ij->i", normals, middle)), 0, 1))
+    if np.percentile(error - span, 95) <= math.radians(0.5):
+        return True
+    if not allow_transition_slivers:
+        return False
+    areas = np.linalg.norm(np.cross(
+        triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0],
+    ), axis=1)
+    # Tiny transition triangles should not outweigh the cylinder they border.
+    # Weight support by area so the result does not depend on local tessellation
+    # density; a broad flat wall still fails this check.
+    supported = error - span <= math.radians(0.5)
+    if np.sum(areas[supported]) < 0.95 * np.sum(areas):
+        return False
+    mean_normal = np.average(normals[supported], axis=0, weights=areas[supported])
+    variation = np.average(
+        np.linalg.norm(np.cross(normals[supported], mean_normal), axis=1) ** 2,
+        weights=areas[supported],
+    )
+    # Area alone would let one broad plane overwhelm its rounded ends. Require
+    # measurable curvature in the supporting normals before tolerating slivers.
+    return bool(variation >= math.sin(math.radians(1.0)) ** 2)
+
+
 def _validated_seeded_cylinder_fit(
     mesh: object,
     face_indices: np.ndarray,
@@ -785,10 +820,17 @@ def _validated_seeded_cylinder_fit(
     lengths = np.linalg.norm(expected, axis=1)
     if np.any(lengths <= 1e-12):
         return None
+    # End nodes alone can fit a shallow circle across a long flat wall. Check
+    # triangle interiors too so that sparse planar spans cannot become bows.
+    # Allow ordinary tessellation chord error up to the final geometric budget.
+    if float(np.max(np.abs(lengths - radius))) > max(distance_tolerance * 10, 0.12):
+        return None
     expected /= lengths[:, None]
     normals = np.asarray(mesh.face_normals[indices], dtype=float)
     normal_error = _normal_error_degrees(normals, expected)
-    if normal_error > normal_tolerance_degrees:
+    if normal_error > normal_tolerance_degrees or not _cylinder_normals_follow_chords(
+        np.asarray(mesh.triangles[indices]), normals, axis, origin,
+    ):
         return None
     start, end = float(np.min(axial)), float(np.max(axial))
     if end - start <= distance_tolerance * 2:
@@ -1141,6 +1183,8 @@ def _fit_cylinder(
     normals: np.ndarray,
     distance_tolerance: float,
     normal_tolerance_degrees: float,
+    triangles: np.ndarray,
+    *, allow_transition_slivers: bool = False,
 ) -> _AnalyticFit | None:
     _, singular_values, vectors = np.linalg.svd(normals, full_matrices=False)
     if (
@@ -1189,7 +1233,12 @@ def _fit_cylinder(
     if (
         rms_error > distance_tolerance
         or max_error > distance_tolerance * 3
+        or float(np.max(np.abs(radial_lengths - radius))) > max(distance_tolerance * 10, 0.12)
         or normal_error > normal_tolerance_degrees
+        or not _cylinder_normals_follow_chords(
+            triangles, normals, axis, center_perpendicular,
+            allow_transition_slivers=allow_transition_slivers,
+        )
     ):
         return None
     origin = center_perpendicular + axis * start
@@ -1528,6 +1577,12 @@ def _fit_cone(
         return radial - np.abs(sample_z - apex_z) * tangent
 
     margin = max(diagonal, distance_tolerance * 20)
+    # A shallow cone can have its apex far outside the sampled band. Include
+    # the estimated apex in the search interval so a valid initial estimate
+    # cannot abort recognition of the entire mesh. The fit checks below still
+    # require the original node and normal tolerances.
+    lower_apex = min(float(np.min(z) - 5 * margin), initial_apex_z - margin)
+    upper_apex = max(float(np.max(z) + 5 * margin), initial_apex_z + margin)
     result = least_squares(
         residual,
         np.asarray(
@@ -1538,7 +1593,7 @@ def _fit_cone(
                 [
                     float(np.min(u) - margin),
                     float(np.min(v) - margin),
-                    float(np.min(z) - 5 * margin),
+                    lower_apex,
                     math.log(0.005),
                 ]
             ),
@@ -1546,7 +1601,7 @@ def _fit_cone(
                 [
                     float(np.max(u) + margin),
                     float(np.max(v) + margin),
-                    float(np.max(z) + 5 * margin),
+                    upper_apex,
                     math.log(20.0),
                 ]
             ),
@@ -2178,6 +2233,7 @@ def _fit_component(
     *,
     torus_max_nfev: int = 180,
     allowed_kinds: tuple[str, ...] = ("cylinder", "cone", "sphere", "torus"),
+    allow_transition_slivers: bool = False,
 ) -> _AnalyticFit | None:
     mesh = data.mesh
     vertex_indices = np.unique(mesh.faces[face_indices])
@@ -2193,6 +2249,8 @@ def _fit_component(
             normals,
             distance_tolerance,
             normal_tolerance_degrees,
+            np.asarray(mesh.triangles[face_indices]),
+            allow_transition_slivers=allow_transition_slivers,
         )
         if "cylinder" in allowed_kinds
         else None,
@@ -2385,7 +2443,16 @@ def _analytic_inlier_faces(
         radial = relative - np.outer(axial, axis)
         lengths = np.linalg.norm(radial, axis=1)
         tangent = math.tan(float(parameters["semi_angle"]))
-        residuals = np.abs(lengths - np.abs(axial) * tangent)
+        point_relative = (
+            np.asarray(mesh.vertices[mesh.faces[face_indices]], dtype=float)
+            - np.asarray(parameters["apex"], dtype=float)
+        )
+        point_axial = np.einsum("fvi,i->fv", point_relative, axis)
+        point_radial = point_relative - point_axial[:, :, None] * axis
+        residuals = np.max(
+            np.abs(np.linalg.norm(point_radial, axis=2) - np.abs(point_axial) * tangent),
+            axis=1,
+        )
         expected = radial / np.maximum(lengths[:, None], 1e-15)
         expected -= np.sign(axial)[:, None] * tangent * axis
         expected /= np.maximum(np.linalg.norm(expected, axis=1)[:, None], 1e-15)
@@ -2439,6 +2506,8 @@ def _extract_local_analytic_regions(
     distance_tolerance: float,
     normal_tolerance_degrees: float,
     minimum_area: float,
+    *,
+    allowed_kinds: tuple[str, ...] = ("cylinder",),
 ) -> tuple[list[tuple[_AnalyticFit, np.ndarray]], list[np.ndarray]]:
     """Detect tangent primitives by deterministic local-sample consensus."""
 
@@ -2477,7 +2546,12 @@ def _extract_local_analytic_regions(
             # Multi-scale neighborhoods keep small cylindrical islands from
             # being drowned by hundreds of adjacent fillet triangles, while
             # retaining the larger samples needed for sparse broad cylinders.
-            for maximum_faces in (64, 160, 400):
+            neighborhood_sizes = (
+                (12, 24, 48)
+                if "cone" in allowed_kinds or len(remaining) < 160
+                else (64, 160, 400)
+            )
+            for maximum_faces in neighborhood_sizes:
                 queue = [seed]
                 visited = {seed}
                 cursor = 0
@@ -2541,7 +2615,7 @@ def _extract_local_analytic_regions(
                 distance_tolerance * 2,
                 normal_tolerance_degrees * 1.25,
                 torus_max_nfev=30,
-                allowed_kinds=("cylinder",),
+                allowed_kinds=allowed_kinds,
             )
             if fit is None:
                 continue
@@ -2572,7 +2646,7 @@ def _extract_local_analytic_regions(
                     distance_tolerance,
                     normal_tolerance_degrees,
                     torus_max_nfev=45,
-                    allowed_kinds=("cylinder",),
+                    allowed_kinds=allowed_kinds,
                 )
                 if refined is None and fit.kind == "cylinder":
                     axis = np.asarray(fit.parameters["axis"], dtype=float)
@@ -2769,6 +2843,10 @@ def _extrusion_profile_cylinder_regions(
                 distance_tolerance,
                 normal_tolerance_degrees,
                 allowed_kinds=("cylinder",),
+                # A circular profile and a normal-derived axis independently
+                # support this fit. Broad local fits and profile-only seeded
+                # fits retain the stricter triangle-count consensus.
+                allow_transition_slivers=True,
             )
             if refined is None:
                 refined = _validated_seeded_cylinder_fit(
@@ -4982,6 +5060,84 @@ def detect_surface_graph(
                     axial = (target_points - target.origin) @ target.axis
                     target.start, target.end = float(np.min(axial)), float(np.max(axial))
             face_patch_ids[residual.face_indices] = target.patch_id
+        freeform_patches = retained_freeforms
+        for index, patch in enumerate(freeform_patches, start=1):
+            patch.patch_id = f"freeform-{index:03d}"
+            face_patch_ids[patch.face_indices] = patch.patch_id
+
+    # Chamfered slots join two cones to tangent planes. Their combined normal
+    # field has a constant axial component, but no single apex fits the whole
+    # region. Seed smaller cone neighborhoods before promoting residual planes.
+    if freeform_patches:
+        retained_freeforms = []
+        for original in freeform_patches:
+            indices = original.face_indices
+            if not 20 <= len(indices) <= 256:
+                retained_freeforms.append(original)
+                continue
+            normals = np.asarray(mesh.face_normals[indices])
+            mean_normal = np.mean(normals, axis=0)
+            _, singular, directions = np.linalg.svd(normals - mean_normal, full_matrices=False)
+            if (
+                singular[0] <= 1e-12 or singular[1] / singular[0] < 0.04
+                or singular[2] / max(singular[1], 1e-12) > 0.05
+                or not 0.05 < abs(float(mean_normal @ directions[-1])) < 0.98
+            ):
+                retained_freeforms.append(original)
+                continue
+            detected, residuals = _extract_local_analytic_regions(
+                data, indices, tolerance, normal_tolerance_degrees,
+                max(minimum_area * 0.25, original.area * 0.01),
+                allowed_kinds=("cone",),
+            )
+            if not detected:
+                retained_freeforms.append(original)
+                continue
+            cones = [
+                _make_analytic_patch(mesh, fit, component, len(recognized["cone"]) + offset)
+                for offset, (fit, component) in enumerate(detected, 1)
+            ]
+            _regularize_axis_relations(
+                mesh, planar_patches, cones, tolerance, normal_tolerance_degrees,
+            )
+            remaining = set(int(i) for group in residuals for i in group)
+            for cone in cones:
+                if remaining:
+                    fit = _AnalyticFit(
+                        kind="cone", parameters={
+                            "axis": cone.axis, "apex": cone.apex,
+                            "semi_angle": cone.semi_angle,
+                        }, rms_error=cone.rms_error, max_error=cone.max_error,
+                        normal_error_degrees=cone.normal_error_degrees, score=0,
+                    )
+                    inliers = _analytic_inlier_faces(
+                        fit, mesh, np.asarray(sorted(remaining)),
+                        tolerance, normal_tolerance_degrees,
+                    )
+                    mask = np.zeros(len(mesh.faces), dtype=bool)
+                    mask[np.r_[cone.face_indices, inliers]] = True
+                    grown = next(
+                        group for group in _smooth_components(mesh, mask, 30.0)
+                        if cone.face_indices[0] in group
+                    )
+                    cone.face_indices = grown
+                    cone.vertex_indices = np.unique(mesh.faces[grown])
+                    cone.area = float(np.sum(mesh.area_faces[grown]))
+                    cone.boundary_loops = _boundary_loops(mesh, grown)
+                    remaining.difference_update(int(i) for i in grown)
+                recognized["cone"].append(cone)
+                face_patch_ids[cone.face_indices] = cone.patch_id
+            mask = np.zeros(len(mesh.faces), dtype=bool)
+            if remaining:
+                mask[np.asarray(sorted(remaining))] = True
+            residuals = _smooth_components(mesh, mask, 30.0)
+            for component in residuals:
+                retained_freeforms.append(FreeformPatch(
+                    patch_id="pending", face_indices=component,
+                    vertex_indices=np.unique(mesh.faces[component]),
+                    area=float(np.sum(mesh.area_faces[component])),
+                    boundary_loops=_boundary_loops(mesh, component),
+                ))
         freeform_patches = retained_freeforms
         for index, patch in enumerate(freeform_patches, start=1):
             patch.patch_id = f"freeform-{index:03d}"

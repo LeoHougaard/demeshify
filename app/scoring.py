@@ -7,7 +7,14 @@ import cadquery as cq
 import numpy as np
 import point_cloud_utils as pcu
 import trimesh
+from OCP.BRep import BRep_Tool
+from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from OCP.BRepTools import BRepTools_WireExplorer
+from OCP.GeomAbs import GeomAbs_Line, GeomAbs_Plane
+from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED, TopAbs_WIRE
+from OCP.TopExp import TopExp_Explorer
+from OCP.TopoDS import TopoDS
 
 from .cad import export_plan
 from .mesh import MeshData, surface_samples
@@ -31,6 +38,47 @@ def _load_candidate(path: Path) -> trimesh.Trimesh:
 
 
 def _step_mesh(shape: cq.Shape, tolerance: float) -> trimesh.Trimesh:
+    vertices, triangles, normals = [], [], []
+    explorer = TopExp_Explorer(shape.wrapped, TopAbs_FACE)
+    while explorer.More():
+        face = TopoDS.Face_s(explorer.Current())
+        surface = BRepAdaptor_Surface(face)
+        wires = TopExp_Explorer(face, TopAbs_WIRE)
+        if surface.GetType() != GeomAbs_Plane or not wires.More():
+            break
+        wire = TopoDS.Wire_s(wires.Current())
+        wires.Next()
+        if wires.More():
+            break
+        edges = BRepTools_WireExplorer(wire, face)
+        points = []
+        while edges.More():
+            if BRepAdaptor_Curve(edges.Current()).GetType() != GeomAbs_Line:
+                break
+            point = BRep_Tool.Pnt_s(edges.CurrentVertex())
+            points.append((point.X(), point.Y(), point.Z()))
+            edges.Next()
+        if edges.More() or len(points) != 3:
+            break
+        offset = len(vertices)
+        vertices.extend(points)
+        triangles.append((offset, offset + 1, offset + 2))
+        normal = surface.Plane().Axis().Direction()
+        sign = -1 if face.Orientation() == TopAbs_REVERSED else 1
+        normals.append((sign * normal.X(), sign * normal.Y(), sign * normal.Z()))
+        explorer.Next()
+    else:
+        if triangles:
+            # Exact triangles read from the delivered STEP, not its preview.
+            # Raw topology traversal avoids remeshing and wrapper allocation
+            # for tens of thousands of already triangular planar faces.
+            vertices = np.asarray(vertices)
+            triangles = np.asarray(triangles)
+            corners = vertices[triangles]
+            cross = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+            reversed_faces = np.einsum("ij,ij->i", cross, normals) < 0
+            triangles[reversed_faces] = triangles[reversed_faces, ::-1]
+            return trimesh.Trimesh(vertices=vertices, faces=triangles, process=True)
     # CadQuery's mesh helper uses relative deflection. Verification tolerances
     # are millimetres, so create an absolute-deflection mesh before extracting it.
     mesher = BRepMesh_IncrementalMesh(shape.wrapped, tolerance, False, 0.04, False)
@@ -127,8 +175,21 @@ def score_exported_shape(
     )
     target_points = surface_samples(data.mesh)
     candidate_points = surface_samples(candidate_mesh)
-    candidate_to_target = _point_mesh_distances(data.mesh, candidate_points)
-    target_to_candidate = _point_mesh_distances(candidate_mesh, target_points)
+    # Query each mesh once so dense inputs build their spatial index once.
+    # Preserve the same area samples and local probes, keeping their statistics
+    # separate after the shared distance query.
+    candidate_probes = (
+        np.vstack((candidate_points, _local_samples(candidate_mesh)))
+        if verify_step_geometry else candidate_points
+    )
+    target_probes = (
+        np.vstack((target_points, _local_samples(data.mesh)))
+        if verify_step_geometry else target_points
+    )
+    candidate_distances = _point_mesh_distances(data.mesh, candidate_probes)
+    target_distances = _point_mesh_distances(candidate_mesh, target_probes)
+    candidate_to_target = candidate_distances[:len(candidate_points)]
+    target_to_candidate = target_distances[:len(target_points)]
     distances = np.concatenate((candidate_to_target, target_to_candidate))
 
     rms = float(np.sqrt(np.mean(distances**2)))
@@ -137,8 +198,8 @@ def score_exported_shape(
     local_max = None
     if verify_step_geometry:
         local_max = max(
-            float(np.max(_point_mesh_distances(candidate_mesh, _local_samples(data.mesh)))),
-            float(np.max(_point_mesh_distances(data.mesh, _local_samples(candidate_mesh)))),
+            float(np.max(target_distances[len(target_points):])),
+            float(np.max(candidate_distances[len(candidate_points):])),
         )
     candidate_is_watertight = bool(candidate_mesh.is_watertight)
     volume_comparable = bool(

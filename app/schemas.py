@@ -592,6 +592,8 @@ class SurfaceBRepReport(SchemaModel):
     faceted_patch_count: int = 0
     faceted_face_count: int = 0
     source_mesh_fallback: bool = False
+    simplified_fallback: bool = False
+    fallback_geometry_verified: bool = False
 
 
 class ReconstructionReport(SchemaModel):

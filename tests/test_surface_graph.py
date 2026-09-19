@@ -13,7 +13,10 @@ from app.mesh import load_mesh
 from app.surface_graph import (
     PlanarPatch,
     _edge_chains,
+    _extract_local_analytic_regions,
+    _fit_component,
     _regularize_plane_relations,
+    _validated_seeded_cylinder_fit,
     detect_surface_graph,
 )
 
@@ -193,6 +196,59 @@ def test_surface_graph_separates_tangent_prism_fillets(tmp_path: Path) -> None:
     assert detect_surface_graph(data) is graph
 
 
+@pytest.mark.parametrize("width,height,radius", [(20, 36, 0.5), (10, 8, 1.5)])
+def test_sparse_flat_walls_between_small_fillets_do_not_become_bowed_cylinders(
+    tmp_path, width, height, radius,
+):
+    stl_path = tmp_path / "thin-filleted-plate.stl"
+    model = cq.Workplane("XY").box(width, height, 1.6).edges("|Z").fillet(radius)
+    cq.exporters.export(model, str(stl_path), tolerance=0.02, angularTolerance=0.06)
+    data = load_mesh(stl_path, stl_path.name, "mm")
+
+    graph = detect_surface_graph(data)
+
+    assert len(graph.planar_patches) == 6
+    assert len(graph.cylindrical_patches) == 4
+    assert all(patch.radius == pytest.approx(radius, abs=0.001)
+               for patch in graph.cylindrical_patches)
+    _assert_complete_partition(graph, len(data.mesh.faces))
+
+
+def test_tiny_transition_strip_does_not_hide_a_supported_cylinder() -> None:
+    radius = 40.0
+    angles = np.linspace(0, math.radians(20), 12)
+    profile = radius * np.column_stack((np.cos(angles), np.sin(angles)))
+    tangent = math.radians(115)
+    profile = np.vstack((profile, profile[-1] + 0.02 * np.array([
+        math.cos(tangent), math.sin(tangent),
+    ])))
+    vertices = np.array([[x, y, z] for x, y in profile for z in (0.0, 4.0)])
+    faces = []
+    for index in range(len(profile) - 1):
+        first = 2 * index
+        faces.extend(((first, first + 2, first + 3), (first, first + 3, first + 1)))
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    seeded = _validated_seeded_cylinder_fit(
+        mesh, np.arange(len(faces)), np.array([0.0, 0.0, 1.0]),
+        np.zeros(3), radius, 0.01, 8.0,
+    )
+    assert seeded is None
+    data = _mesh_data(mesh)
+    assert _fit_component(
+        data, np.arange(len(faces)), 0.01, 8.0, allowed_kinds=("cylinder",),
+    ) is None
+    fit = _fit_component(
+        data, np.arange(len(faces)), 0.01, 8.0, allowed_kinds=("cylinder",),
+        allow_transition_slivers=True,
+    )
+
+    assert fit is not None
+    assert fit.kind == "cylinder"
+    assert fit.parameters["radius"] == pytest.approx(radius, rel=0.001)
+    assert fit.max_error < 0.01
+
+
 def test_surface_graph_retains_nonanalytic_surface_as_freeform() -> None:
     mesh = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
     mesh.apply_scale([7.0, 4.0, 2.0])
@@ -203,6 +259,57 @@ def test_surface_graph_retains_nonanalytic_surface_as_freeform() -> None:
     assert not graph.spherical_patches
     assert not graph.toroidal_patches
     _assert_complete_partition(graph, len(mesh.faces))
+
+
+def test_shallow_cone_with_distant_apex_does_not_abort_fitting() -> None:
+    angles = np.linspace(0, 2 * math.pi, 97)[:-1]
+    vertices = np.array([
+        [(5 + 0.02 * z) * math.cos(angle),
+         (5 + 0.02 * z) * math.sin(angle), z]
+        for angle in angles for z in (0.0, 1.0)
+    ])
+    faces = []
+    for index in range(len(angles)):
+        first, following = 2 * index, 2 * ((index + 1) % len(angles))
+        faces.extend(((first, following, following + 1),
+                      (first, following + 1, first + 1)))
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    fit = _fit_component(_mesh_data(mesh), np.arange(len(faces)), 0.001, 5.0,
+                         allowed_kinds=("cone",))
+
+    assert fit is not None
+    assert fit.kind == "cone"
+    assert fit.parameters["apex"][2] == pytest.approx(-250.0, abs=0.01)
+    assert fit.max_error < 0.001
+
+
+def test_local_sampling_separates_two_sparse_tangent_cylinders() -> None:
+    # Two quarter-circle bends joined by a straight wall. Each bend contains
+    # fewer triangles than the old minimum neighborhood of 64.
+    angles = np.linspace(0, math.pi / 2, 16)
+    first = np.column_stack((5 * np.cos(angles), 5 * np.sin(angles)))
+    second = np.column_stack((-20 + 5 * np.cos(angles + math.pi / 2),
+                              5 * np.sin(angles + math.pi / 2)))
+    profile = np.vstack((first, second))
+    vertices = np.array([[x, y, z] for x, y in profile for z in (0., 4.)])
+    faces = []
+    for index in range(len(profile) - 1):
+        start = 2 * index
+        faces.extend(((start, start + 2, start + 3),
+                      (start, start + 3, start + 1)))
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    detected, residuals = _extract_local_analytic_regions(
+        _mesh_data(mesh), np.arange(len(faces)), 0.001, 5.0, 0.01,
+    )
+
+    assert len(detected) == 2
+    assert all(fit.kind == "cylinder" for fit, _ in detected)
+    assert all(fit.parameters["radius"] == pytest.approx(5.0, abs=0.001)
+               for fit, _ in detected)
+    assert sum(len(indices) for _, indices in detected) == 60
+    assert sum(len(indices) for indices in residuals) == 2
 
 
 def test_plane_relations_use_tolerance_gated_exact_fraction_snap() -> None:

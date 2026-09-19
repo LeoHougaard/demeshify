@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.jobs import run_bounded_process  # noqa: E402
+from app.storage import atomic_write_text  # noqa: E402
 from app.surface_reconstruction import reconstruct_surfaces  # noqa: E402
 from app.verification import acceptance_threshold, passes_geometry_gate  # noqa: E402
 from tools.analyze_surface_failures import (  # noqa: E402
@@ -29,6 +30,7 @@ from tools.analyze_surface_failures import (  # noqa: E402
 )
 
 ANALYTIC_CURVED_TYPES = {"CYLINDER", "CONE", "SPHERE", "TORUS"}
+VERIFICATION_TIMEOUT_SECONDS = 120
 
 
 def case_has_analytic_curves(case: dict[str, object]) -> bool:
@@ -234,6 +236,14 @@ def benchmark_summary(
         bool(result.get("geometric_accepted")) for result in results
     )
     clean_analytic = sum(bool(result.get("clean_analytic")) for result in results)
+    verified_nonfaceted = sum(
+        result.get("status") == "complete"
+        and bool(result.get("geometric_accepted"))
+        and result.get("faceted_fallback") is False
+        and result.get("source_mesh_fallback") is False
+        and result.get("faceted_face_count") == 0
+        for result in results
+    )
     free_edges = [
         int(result["free_edge_count"])
         for result in results
@@ -247,6 +257,7 @@ def benchmark_summary(
         "watertight_rate": closed / max(total, 1),
         "accepted_rate": accepted / max(total, 1),
         "geometric_accepted_rate": geometric_accepted / max(total, 1),
+        "verified_nonfaceted_rate": verified_nonfaceted / max(total, 1),
         "clean_analytic_rate": clean_analytic / max(total, 1),
         "total_free_edges": sum(free_edges),
         "maximum_free_edges": max(free_edges, default=0),
@@ -260,6 +271,7 @@ def benchmark_case(
     case: dict[str, object],
     manifest_parent: Path,
     artifacts_root: Path | None = None,
+    conversion_timeout: float | None = None,
 ) -> dict[str, object]:
     source = manifest_parent / str(case["stl"])
     ground_truth = case.get("ground_truth", {})
@@ -267,11 +279,17 @@ def benchmark_case(
         working = Path(temporary)
         input_path = working / "input.stl"
         shutil.copy2(source, input_path)
+        conversion_started = time.perf_counter()
         report = reconstruct_surfaces(
             "surfacebench",
             input_path,
             source.name,
+            str(case.get("input_units", "mm")),
         )
+        conversion_seconds = time.perf_counter() - conversion_started
+        if conversion_timeout is not None and conversion_seconds > conversion_timeout:
+            raise TimeoutError(f"Conversion exceeded {conversion_timeout:g} seconds")
+        verification_started = time.perf_counter()
         step_path = working / "reconstruction.step"
         step_roundtrip_valid = False
         step_roundtrip_solids = 0
@@ -336,6 +354,8 @@ def benchmark_case(
                 else "unknown"
             ),
             "triangles": report.mesh.triangle_count,
+            "input_units": report.mesh.input_units,
+            "dimensions_mm": report.mesh.dimensions_mm,
             "status": report.status,
             "elapsed_seconds": report.elapsed_seconds,
             "recognized_surface_count": (
@@ -404,6 +424,13 @@ def benchmark_case(
                 json.dumps(result, indent=2),
                 encoding="utf-8",
             )
+        verification_seconds = time.perf_counter() - verification_started
+        if verification_seconds > VERIFICATION_TIMEOUT_SECONDS:
+            raise TimeoutError(
+                f"Independent verification exceeded {VERIFICATION_TIMEOUT_SECONDS} seconds"
+            )
+        result["conversion_wall_seconds"] = conversion_seconds
+        result["verification_wall_seconds"] = verification_seconds
         return result
 
 
@@ -412,11 +439,12 @@ def _worker(
     identifier: str,
     output_path: Path,
     artifacts_root: Path | None = None,
+    conversion_timeout: float | None = None,
 ) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     case = next(case for case in manifest["cases"] if str(case["id"]) == identifier)
     try:
-        result = benchmark_case(case, manifest_path.parent, artifacts_root)
+        result = benchmark_case(case, manifest_path.parent, artifacts_root, conversion_timeout)
     except Exception as exc:
         ground_truth = case.get("ground_truth", {})
         result = {
@@ -431,7 +459,7 @@ def _worker(
                 if isinstance(ground_truth, dict)
                 else "unknown"
             ),
-            "status": "crashed",
+            "status": "timeout" if isinstance(exc, TimeoutError) else "crashed",
             "error": f"{type(exc).__name__}: {exc}",
             "geometric_accepted": False,
             "clean_analytic": False,
@@ -463,6 +491,7 @@ def _bounded_case(
     command = [
         sys.executable, str(Path(__file__).resolve()), str(manifest_path.resolve()),
         "--worker-id", identifier, "--worker-output", str(cache_path.resolve()),
+        "--conversion-timeout", str(timeout),
     ]
     if artifacts_root is not None:
         command.extend(["--artifacts-root", str(artifacts_root.resolve())])
@@ -470,7 +499,7 @@ def _bounded_case(
     failure = None
     try:
         returncode = run_bounded_process(
-            command, cwd=PROJECT_ROOT, timeout=timeout,
+            command, cwd=PROJECT_ROOT, timeout=timeout + VERIFICATION_TIMEOUT_SECONDS,
             stdout_path=cache_path.with_suffix(".stdout.log"),
             stderr_path=cache_path.with_suffix(".stderr.log"),
         )
@@ -483,7 +512,7 @@ def _bounded_case(
             )
         result = json.loads(cache_path.read_text(encoding="utf-8"))
     except subprocess.TimeoutExpired:
-        failure = ("timeout", f"Exceeded {timeout} seconds")
+        failure = ("timeout", f"Exceeded {timeout} seconds plus independent verification allowance")
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         failure = ("crashed", (getattr(exc, "stderr", None) or str(exc))[-4000:])
     if failure:
@@ -508,7 +537,8 @@ def _write_output(
     wall_seconds: float | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    atomic_write_text(
+        path,
         json.dumps(
             {
                 "summary": benchmark_summary(results, wall_seconds),
@@ -516,7 +546,6 @@ def _write_output(
             },
             indent=2,
         ),
-        encoding="utf-8",
     )
     failures = analyze_results(results, path.name)
     failure_json = path.with_name(f"{path.stem}_failures.json")
@@ -543,13 +572,17 @@ def main() -> None:
         default=0,
         help="Skip cases above this source triangle count (0 keeps all cases).",
     )
-    parser.add_argument("--case-timeout", type=int, default=180)
+    parser.add_argument(
+        "--case-timeout", type=int, default=180,
+        help="Conversion deadline; independent verification has a separate 120-second allowance.",
+    )
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--curved-only", action="store_true")
     parser.add_argument("--artifacts-root", type=Path)
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--worker-id", help=argparse.SUPPRESS)
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--conversion-timeout", type=float, help=argparse.SUPPRESS)
     arguments = parser.parse_args()
 
     if arguments.worker_id:
@@ -560,6 +593,7 @@ def main() -> None:
             arguments.worker_id,
             arguments.worker_output,
             arguments.artifacts_root,
+            arguments.conversion_timeout,
         )
         return
 

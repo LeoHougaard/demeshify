@@ -1551,6 +1551,46 @@ def _bounded_periodic_face(
     return None
 
 
+def _spherical_cap_face(
+    model: _SurfaceModel,
+    mesh: object,
+    tolerance: float,
+) -> TopoDS_Face | None:
+    """Recover a sphere cut by one circular rim without crossing its UV pole."""
+    patch = model.patch
+    if not isinstance(patch, SphericalPatch) or len(patch.boundary_loops) != 1:
+        return None
+    loop = np.asarray(patch.boundary_loops[0], dtype=float)
+    if len(loop) < 4 or np.linalg.norm(loop[0] - loop[-1]) > tolerance:
+        return None
+    _, _, basis = np.linalg.svd(loop - np.mean(loop, axis=0), full_matrices=False)
+    axis = basis[-1]
+    rim_heights = (loop - patch.center) @ axis
+    height = float(np.mean(rim_heights))
+    if float(np.ptp(rim_heights)) > tolerance:
+        return None
+    if _angular_coverage(loop, patch.center, axis) < math.radians(330):
+        return None
+    axial = (np.asarray(mesh.vertices[patch.vertex_indices]) - patch.center) @ axis
+    if float(np.median(axial)) < height:
+        axis, height, axial = -axis, -height, -axial
+    if float(np.min(axial)) < height - tolerance or abs(height) >= patch.radius:
+        return None
+    area = 2 * math.pi * patch.radius * (patch.radius - height)
+    if abs(area / max(patch.area, tolerance**2) - 1) > 0.02:
+        return None
+    # Align the pole with the measured rim normal. Its boundary is then a
+    # latitude circle, with a seam and degenerate pole edge supplied by OCCT.
+    sphere = gp_Sphere(gp_Ax3(_point(patch.center), _direction(axis)), patch.radius)
+    maker = BRepBuilderAPI_MakeFace(
+        sphere, 0.0, 2 * math.pi, math.asin(height / patch.radius), math.pi / 2,
+    )
+    if not maker.IsDone():
+        return None
+    face = _orient_face(maker.Face(), patch, mesh)
+    return face if _usable_face(face, tolerance) else None
+
+
 def _split_periodic_face(
     model: _SurfaceModel,
     periodic_face: TopoDS_Face,
@@ -2048,7 +2088,25 @@ def _analytic_face(
             model.patch.area,
             tolerance**2,
         )
-        if 0.8 <= area_ratio <= 1.2:
+        # Full angular coverage does not imply a rectangular parameter domain.
+        # A bridge may interrupt a cylinder halfway along its height. Broad
+        # area agreement would fill that opening and create separate solids.
+        follows_rims = False
+        if isinstance(model.patch, CylindricalPatch) and edges:
+            patch = model.patch
+            axial = np.asarray(mesh.vertices[patch.vertex_indices]) @ patch.axis
+            ends = np.array([np.min(axial), np.max(axial)])
+            follows_rims = all(
+                edge.closed and min(
+                    float(np.max(np.abs(edge.points @ patch.axis - end)))
+                    for end in ends
+                ) <= tolerance * 5
+                for edge in edges
+            )
+        # Tiny strips from a tangent fillet can perturb an otherwise complete
+        # circular rim. Retain the band when every trim stays at an end rim;
+        # an opening through its middle still requires explicit trimming.
+        if 0.98 <= area_ratio <= 1.02 or (follows_rims and 0.8 <= area_ratio <= 1.2):
             return periodic
     try:
         support = BRepBuilderAPI_MakeFace(model.surface, tolerance).Face()
@@ -4181,6 +4239,7 @@ def surface_graph_json(
 def _disjoint_component_brep(
     data: MeshData,
     progress_callback: Callable[[str], None] | None,
+    trimming_tolerance_scale: float = 1.0,
 ) -> SurfaceBRepResult | None:
     components = trimesh.graph.connected_components(
         data.mesh.face_adjacency, nodes=np.arange(len(data.mesh.faces)), min_len=1
@@ -4210,7 +4269,9 @@ def _disjoint_component_brep(
         if progress_callback:
             progress_callback(f"surface_component_start index={index} triangles={len(mesh.faces)}")
         local = replace(data, mesh=mesh, section_cache={})
-        result = _build_surface_brep_single(local, progress_callback)
+        result = _build_surface_brep_single(
+            local, progress_callback, trimming_tolerance_scale,
+        )
         prefix = f"body-{index + 1}:"
         for patch in result.graph.patches:
             patch.patch_id = prefix + patch.patch_id
@@ -4256,12 +4317,14 @@ def _disjoint_component_brep(
 def build_surface_brep(
     data: MeshData,
     progress_callback: Callable[[str], None] | None = None,
+    *,
+    trimming_tolerance_scale: float = 1.0,
 ) -> SurfaceBRepResult:
     result = None
     if isinstance(data, MeshData) and data.mesh.body_count > 1 and data.mesh.is_watertight:
-        result = _disjoint_component_brep(data, progress_callback)
+        result = _disjoint_component_brep(data, progress_callback, trimming_tolerance_scale)
     if result is None:
-        result = _build_surface_brep_single(data, progress_callback)
+        result = _build_surface_brep_single(data, progress_callback, trimming_tolerance_scale)
     result.graph.source_face_indices = getattr(data, "source_face_indices", None)
     return result
 
@@ -4269,6 +4332,7 @@ def build_surface_brep(
 def _build_surface_brep_single(
     data: MeshData,
     progress_callback: Callable[[str], None] | None = None,
+    trimming_tolerance_scale: float = 1.0,
 ) -> SurfaceBRepResult:
     graph = detect_surface_graph(data)
     if progress_callback is not None:
@@ -4284,7 +4348,7 @@ def _build_surface_brep_single(
             f"revolutions={len(graph.revolution_patches)} "
             f"freeforms={len(graph.freeform_patches)}"
         )
-    tolerance = max(data.diagonal * 0.0006, 2e-7)
+    tolerance = max(data.diagonal * 0.0006 * trimming_tolerance_scale, 2e-7)
     models: dict[str, _SurfaceModel] = {}
     for patch in graph.patches:
         try:
@@ -4419,6 +4483,11 @@ def _build_surface_brep_single(
             if face is None:
                 try:
                     face = _uv_boundary_face(model, data.mesh, tolerance)
+                except Exception:
+                    face = None
+            if face is None and isinstance(patch, SphericalPatch):
+                try:
+                    face = _spherical_cap_face(model, data.mesh, tolerance)
                 except Exception:
                     face = None
             if face is not None and _usable_face(face, tolerance):
@@ -4961,7 +5030,12 @@ def export_surface_brep(
 ) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     step_path = directory / "reconstruction.step"
-    cq.exporters.export(result.shape, str(step_path))
+    # Planar triangle carriers need only their spatial edges. Redundant surface
+    # parameter curves inflate dense fallback files and slow their round trip.
+    cq.exporters.export(
+        result.shape, str(step_path),
+        opt={"write_pcurves": not result.source_mesh_fallback},
+    )
     if result.closed and verify_roundtrip:
         try:
             roundtrip = cq.importers.importStep(str(step_path)).val()

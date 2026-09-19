@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import cadquery as cq
@@ -79,6 +80,23 @@ def test_build_surface_brep_preserves_elementary_surface_types(
     assert result.free_edge_count == 0
     assert {face.geomType() for face in result.shape.Faces()} == expected_types
     assert not result.warnings
+
+
+@pytest.mark.parametrize("cut_height", [-7, 7])
+def test_spherical_cap_retains_curved_surface_across_rotated_pole(tmp_path, cut_height):
+    sphere = cq.Workplane("XY").sphere(10)
+    cutter = cq.Workplane("XY").box(40, 40, 40).translate((0, 0, cut_height + 20))
+    source = sphere.cut(cutter).rotate((0, 0, 0), (1, 2, 0), 63).val()
+    path = tmp_path / "spherical-cap.stl"
+    source.exportStl(str(path), tolerance=0.005, angularTolerance=0.08, relative=False)
+    data = load_mesh(path, path.name)
+
+    result = build_surface_brep(data)
+
+    assert result.valid and result.solid_count == 1 and result.free_edge_count == 0
+    assert result.faceted_face_count == 0
+    assert {face.geomType() for face in result.shape.Faces()} == {"PLANE", "SPHERE"}
+    assert abs(result.shape.Volume() / source.Volume() - 1) < 0.001
 
 
 def test_intersected_fillets_create_ten_analytic_trimmed_faces() -> None:
@@ -530,6 +548,47 @@ def test_microscopic_closed_sewing_gap_is_capped_below_global_tolerance() -> Non
     assert cq.Face(gap_faces[0]).Area() == pytest.approx(5e-7)
 
 
+def test_chamfered_slot_recovers_conical_ends_and_tangent_planes(tmp_path):
+    source = cq.Workplane("XY").slot2D(10, 4).extrude(3).faces(">Z").edges().chamfer(0.5)
+    path = tmp_path / "slot.stl"
+    cq.exporters.export(source, str(path), tolerance=0.01, angularTolerance=0.2)
+    data = load_mesh(path, path.name)
+
+    result = build_surface_brep(data)
+    export_surface_brep(result, tmp_path, data.source_path)
+    score = surface_reconstruction.score_exported_shape(data, tmp_path)
+
+    assert result.closed and result.solid_count == 1
+    assert result.surface_counts["cone"] == 2
+    assert result.surface_counts["plane"] == 6
+    assert result.point_fitted_face_count == 0
+    assert not result.faceted_fallback
+    assert score.valid_solid and score.component_count_match
+    assert score.local_max_mm < 0.01
+    assert score.volume_error_percent < 0.1
+
+
+def test_full_angle_cylinders_keep_bridge_cutouts_in_their_sides(tmp_path):
+    left = cq.Workplane("XY").center(-6, 0).circle(3).circle(1.5).extrude(4)
+    right = cq.Workplane("XY").center(6, 0).circle(3).circle(1.5).extrude(4)
+    bridge = cq.Workplane("XY").box(8, 2, 2).translate((0, 0, 2))
+    source = left.union(right).union(bridge)
+    path = tmp_path / "input.stl"
+    cq.exporters.export(source, str(path), tolerance=0.01, angularTolerance=0.06)
+    data = load_mesh(path, path.name)
+
+    result = build_surface_brep(data)
+    export_surface_brep(result, tmp_path, data.source_path)
+    score = surface_reconstruction.score_exported_shape(data, tmp_path)
+
+    assert result.closed and result.solid_count == 1
+    assert result.point_fitted_face_count == 0
+    assert not result.faceted_fallback
+    assert score.valid_solid and score.component_count_match
+    assert score.local_max_mm < 0.01
+    assert score.volume_error_percent < 0.1
+
+
 def test_source_topology_faceted_fallback_is_a_valid_step_solid(tmp_path) -> None:
     mesh = trimesh.creation.icosphere(subdivisions=2, radius=4)
     data = _mesh_data(mesh)
@@ -617,6 +676,104 @@ def test_source_topology_faceted_fallback_keeps_single_body_fast_path(
 
     assert result.valid
     assert result.solid_count == 1
+
+
+@pytest.mark.parametrize("recovery_scale,attempts", [(1.0, 1), (0.8, 2)])
+def test_dense_fallback_verifies_original_mesh_and_preserves_input_units(
+    tmp_path, monkeypatch, recovery_scale, attempts,
+):
+    source = trimesh.creation.box(extents=(0.7, 0.5, 0.3))
+    dense = source
+    for _ in range(6):
+        dense = dense.subdivide()
+    path = tmp_path / "input.stl"
+    dense.export(path)
+    reduced = source.copy()
+    reduced.apply_scale(25.4)
+    budgets = []
+
+    def decimate(_vertices, _faces, budget):
+        budgets.append(budget)
+        scale = recovery_scale if len(budgets) == 1 else 1.0
+        return reduced.vertices * scale, reduced.faces, None, None
+
+    monkeypatch.setattr(
+        surface_reconstruction.pcu, "decimate_triangle_mesh",
+        decimate,
+    )
+    original_score = surface_reconstruction.score_exported_shape
+
+    def score_original(data, directory, **kwargs):
+        assert len(data.mesh.faces) == len(dense.faces)
+        assert data.report.unit_scale == 25.4
+        return original_score(data, directory, **kwargs)
+
+    monkeypatch.setattr(surface_reconstruction, "score_exported_shape", score_original)
+    report = surface_reconstruction._reconstruct_faceted_only(
+        "dense-recovery", path, path.name, "in", "test recovery", None,
+    )
+
+    assert report.status == "best_effort"
+    assert report.surface.simplified_fallback
+    assert report.surface.faceted_fallback
+    assert report.surface.fallback_geometry_verified
+    assert len(budgets) == attempts
+    preview = trimesh.load(tmp_path / "reconstruction.stl", force="mesh")
+    assert preview.extents == pytest.approx(reduced.extents, abs=1e-5)
+
+
+def test_finer_dense_retry_recovers_detail_from_original_mesh(tmp_path, monkeypatch):
+    source = trimesh.creation.box(extents=(7, 5, 0.1))
+    dense = source
+    for _ in range(7):
+        dense = dense.subdivide()
+    path = tmp_path / "input.stl"
+    dense.export(path)
+    calls = []
+
+    def decimate(vertices, faces, budget):
+        calls.append((len(faces), budget))
+        # The staged approximation has lost thickness. The finer retry can
+        # preserve it only if it sees the original dense geometry again.
+        scale = 1.0 if budget == 60_000 else 0.8
+        return source.vertices * scale, source.faces, None, None
+
+    monkeypatch.setattr(surface_reconstruction.pcu, "decimate_triangle_mesh", decimate)
+    report = surface_reconstruction._reconstruct_faceted_only(
+        "thin-recovery", path, path.name, "mm", "test recovery", None,
+    )
+
+    assert calls == [(len(dense.faces), 48_000), (len(dense.faces), 60_000)]
+    assert report.surface.fallback_geometry_verified
+    assert report.surface.simplified_fallback
+    assert report.score.volume_error_percent < 0.001
+
+
+@pytest.mark.parametrize("refined_scale,accepted", [(1.0, True), (0.5, False)])
+def test_fine_trimming_retry_only_adopts_a_geometrically_verified_solid(
+    tmp_path, monkeypatch, refined_scale, accepted,
+):
+    path = tmp_path / "input.stl"
+    trimesh.creation.box(extents=(7, 5, 3)).export(path)
+    base = build_surface_brep(load_mesh(path, path.name))
+    scales = []
+
+    def build(_data, _update, *, trimming_tolerance_scale=1.0):
+        scales.append(trimming_tolerance_scale)
+        if len(scales) == 1:
+            return replace(base, closed=False, solid_count=0, warnings=[])
+        return replace(base, shape=base.shape.scale(refined_scale), warnings=[])
+
+    monkeypatch.setattr(surface_reconstruction, "build_surface_brep", build)
+    monkeypatch.setattr(surface_reconstruction, "recover_prismatic_solid", lambda *_: None)
+    report = surface_reconstruction._reconstruct_surfaces_direct("retry", path, path.name)
+
+    assert scales == [1.0, 0.1]
+    assert (report.status == "complete") is accepted
+    # A valid but undersized retry must never overwrite the original artifact.
+    delivered = cq.importers.importStep(str(tmp_path / "reconstruction.step")).val()
+    assert delivered.Volume() == pytest.approx(105.0)
+    assert report.score.volume_error_percent < 0.01
 
 
 def test_native_worker_failure_is_reported_as_faceted_best_effort(

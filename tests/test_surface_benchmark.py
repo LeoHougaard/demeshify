@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import tools.benchmark_surface_corpus as benchmark_module
 from tools.benchmark_surface_corpus import (
     _write_output,
@@ -61,6 +63,7 @@ def test_faceted_geometric_match_is_not_an_analytic_success() -> None:
     )
 
     assert summary["geometric_accepted_rate"] == 1.0
+    assert summary["verified_nonfaceted_rate"] == 0.0
     assert summary["clean_analytic_rate"] == 0.0
     assert summary["accepted_rate"] == 0.0
 
@@ -236,6 +239,21 @@ def test_benchmark_without_reference_records_unknown_quality(tmp_path):
     assert result["minimum_analytic_area_recall"] is None
     assert not result["clean_analytic"]
     assert not result["accepted"]
+    assert benchmark_summary([result])["verified_nonfaceted_rate"] == 1.0
+    assert benchmark_summary([result])["accepted_rate"] == 0.0
+
+
+def test_benchmark_converts_declared_metre_units_to_millimetres(tmp_path):
+    import trimesh
+
+    trimesh.creation.box(extents=(0.01, 0.01, 0.01)).export(tmp_path / "metres.stl")
+    result = benchmark_module.benchmark_case(
+        {"id": "metres", "stl": "metres.stl", "input_units": "m"}, tmp_path,
+    )
+
+    assert result["geometric_accepted"]
+    assert result["dimensions_mm"] == pytest.approx((10, 10, 10), abs=1e-5)
+    assert result["output_face_type_areas_mm2"]["PLANE"] == pytest.approx(600, abs=1e-3)
 
 
 def test_resume_reuses_only_matching_results_and_survives_bad_worker_json(tmp_path, monkeypatch):
@@ -247,6 +265,8 @@ def test_resume_reuses_only_matching_results_and_survives_bad_worker_json(tmp_pa
     calls = []
 
     def worker(command, **kwargs):
+        assert kwargs["timeout"] == 240 + benchmark_module.VERIFICATION_TIMEOUT_SECONDS
+        assert command[command.index("--conversion-timeout") + 1] == "240"
         calls.append(command)
         path = Path(command[command.index("--worker-output") + 1])
         path.write_text(
@@ -266,3 +286,32 @@ def test_resume_reuses_only_matching_results_and_survives_bad_worker_json(tmp_pa
     assert len(calls) == 2
     assert failed["status"] == "crashed"
     assert not failed["accepted"]
+
+
+def test_audit_allowance_cannot_accept_an_overdue_conversion(tmp_path, monkeypatch):
+    source = tmp_path / "input.stl"
+    source.write_bytes(b"mock input")
+    clock = iter((0.0, 241.0))
+    monkeypatch.setattr(benchmark_module, "time", SimpleNamespace(perf_counter=lambda: next(clock)))
+    monkeypatch.setattr(benchmark_module, "reconstruct_surfaces", lambda *_: None)
+
+    with pytest.raises(TimeoutError, match="Conversion exceeded 240 seconds"):
+        benchmark_module.benchmark_case(
+            {"id": "late", "stl": "input.stl"}, tmp_path, conversion_timeout=240,
+        )
+
+
+def test_reference_audit_has_its_own_deadline(tmp_path, monkeypatch):
+    import trimesh
+
+    trimesh.creation.box().export(tmp_path / "box.stl")
+    clock = iter((0.0, 239.0, 239.0, 249.0))
+    monkeypatch.setattr(benchmark_module, "time", SimpleNamespace(perf_counter=lambda: next(clock)))
+
+    result = benchmark_module.benchmark_case(
+        {"id": "box", "stl": "box.stl"}, tmp_path, conversion_timeout=240,
+    )
+
+    assert result["geometric_accepted"]
+    assert result["conversion_wall_seconds"] == 239
+    assert result["verification_wall_seconds"] == 10

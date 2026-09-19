@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
 
-from .mesh import load_mesh, mesh_warnings
+import numpy as np
+import point_cloud_utils as pcu
+import trimesh
+
+from .mesh import MeshData, load_mesh, mesh_warnings
+from .prismatic_recovery import recover_prismatic_solid
 from .schemas import ReconstructionReport, SurfaceBRepReport
-from .scoring import score_exported_shape
+from .scoring import _local_samples, _point_mesh_distances, score_exported_shape
 from .storage import atomic_write_text
 from .surface_brep import build_faceted_brep, build_surface_brep, export_surface_brep
 from .verification import acceptance_threshold, passes_geometry_gate, verification_warnings
@@ -81,6 +88,12 @@ def _reconstruct_surfaces_direct(
         f"mesh_loaded triangles={data.report.triangle_count} "
         f"watertight={data.report.watertight}"
     )
+    recovered = recover_prismatic_solid(data, run_id, stl_path.parent)
+    if recovered is not None:
+        recovered.elapsed_seconds = time.perf_counter() - started
+        atomic_write_text(stl_path.parent / "report.json", recovered.model_dump_json(indent=2))
+        update("surface_reconstruction_complete preview=reconstruction.stl")
+        return recovered
     update("surface_detection_start")
     result = build_surface_brep(data, update)
     threshold = _acceptance_threshold(data.diagonal)
@@ -99,6 +112,32 @@ def _reconstruct_surfaces_direct(
     update("surface_verification_start preview=reconstruction.stl")
     score = score_exported_shape(data, stl_path.parent, require_solid=False)
     passed = _passes_surface_gate(result, score, threshold)
+
+    if (
+        not passed and data.report.watertight and data.report.body_count == 1
+        and len(data.mesh.faces) < 20_000 and not result.graph.freeform_patches
+        and time.perf_counter() - started < 60
+    ):
+        # Broad trim tolerances can collapse a small shoulder or hole boundary.
+        # Retry only failed constructions; existing accepted models are retained.
+        # The worker's process deadline also bounds this optional attempt.
+        update("surface_fine_trimming_start")
+        with tempfile.TemporaryDirectory(dir=stl_path.parent, prefix="fine-trim-") as temporary:
+            working = Path(temporary)
+            try:
+                refined = build_surface_brep(data, update, trimming_tolerance_scale=0.1)
+                export_surface_brep(
+                    refined, working, data.source_path,
+                    source_unit_scale=data.report.unit_scale,
+                )
+                refined_score = score_exported_shape(data, working, require_solid=False)
+                if _passes_surface_gate(refined, refined_score, threshold):
+                    for name in ("reconstruction.step", "reconstruction.stl", "surface_graph.json"):
+                        shutil.copy2(working / name, stl_path.parent / name)
+                    result, score, passed = refined, refined_score, True
+                    result.warnings.append("Recovered the solid with a finer trimming tolerance.")
+            except Exception:
+                pass
 
     warnings = [*mesh_warnings(data), *result.warnings]
     warnings.extend(verification_warnings(score, threshold))
@@ -170,14 +209,73 @@ def _reconstruct_faceted_only(
 
     update("faceted_recovery_started")
     data = load_mesh(stl_path, original_name, input_units)
-    result = build_faceted_brep(data, reason=reason)
-    export_surface_brep(
-        result,
-        stl_path.parent,
-        data.source_path,
-        source_unit_scale=data.report.unit_scale,
-        verify_roundtrip=False,
-    )
+    recovery_data = data
+    if data.report.watertight and len(data.mesh.faces) > 20_000:
+        update("faceted_recovery_simplifying")
+        try:
+            source_samples = _local_samples(data.mesh)
+            reduction_vertices = np.asarray(data.mesh.vertices)
+            reduction_faces = np.asarray(data.mesh.faces, dtype=np.int32)
+            budgets = (12_000, 24_000, 48_000, 60_000)
+            staging_budget = 48_000
+            if len(reduction_faces) > staging_budget * 4:
+                # Collapse the millions of finest edges once. Each budget then
+                # starts from the same intermediate, while all acceptance
+                # checks still use the original full-resolution input.
+                reduction_vertices, reduction_faces, _, _ = pcu.decimate_triangle_mesh(
+                    reduction_vertices, reduction_faces, staging_budget,
+                )
+            for budget in budgets:
+                if budget >= len(data.mesh.faces):
+                    break
+                if budget > staging_budget:
+                    # Very thin parts can still lose more than 2% volume at
+                    # 48,000 faces. Retry from the original mesh: a coarser
+                    # intermediate cannot recover the discarded detail.
+                    vertices, faces, _, _ = pcu.decimate_triangle_mesh(
+                        np.asarray(data.mesh.vertices),
+                        np.asarray(data.mesh.faces, dtype=np.int32), budget,
+                    )
+                elif budget < len(reduction_faces):
+                    vertices, faces, _, _ = pcu.decimate_triangle_mesh(
+                        reduction_vertices, reduction_faces, budget,
+                    )
+                else:
+                    vertices, faces = reduction_vertices, reduction_faces
+                mesh = trimesh.Trimesh(vertices, faces, process=True)
+                if (
+                    not mesh.is_watertight or not mesh.is_winding_consistent
+                    or mesh.body_count != data.report.body_count
+                    or abs(mesh.volume - data.mesh.volume) > abs(data.mesh.volume) * 0.02
+                ):
+                    continue
+                deviation = max(
+                    float(np.max(_point_mesh_distances(mesh, source_samples))),
+                    float(np.max(_point_mesh_distances(data.mesh, _local_samples(mesh)))),
+                )
+                if deviation <= _acceptance_threshold(data.diagonal):
+                    recovery_data = MeshData(mesh, data.report, data.source_path)
+                    break
+        except (RuntimeError, ValueError):
+            pass
+    simplified = recovery_data is not data
+    with tempfile.TemporaryDirectory(dir=stl_path.parent, prefix="faceted-") as temporary:
+        source_scale = data.report.unit_scale
+        if simplified:
+            recovery_data.source_path = Path(temporary) / "input-mm.stl"
+            recovery_data.mesh.export(recovery_data.source_path)
+            source_scale = 1.0
+        result = build_faceted_brep(recovery_data, reason=reason)
+        if simplified:
+            result.warnings = [
+                f"Built a simplified faceted STEP with {result.face_count:,} faces "
+                f"from {data.report.triangle_count:,} source triangles because {reason}. "
+                "Verification compares the STEP with the full-resolution input mesh."
+            ]
+        export_surface_brep(
+            result, stl_path.parent, recovery_data.source_path,
+            source_unit_scale=source_scale, verify_roundtrip=False,
+        )
     score = score_exported_shape(data, stl_path.parent, require_solid=False)
     passed = _passes_surface_gate(
         result,
@@ -199,6 +297,10 @@ def _reconstruct_faceted_only(
         faceted_patch_count=1,
         faceted_face_count=result.faceted_face_count,
         source_mesh_fallback=True,
+        simplified_fallback=simplified,
+        fallback_geometry_verified=bool(
+            result.closed and passes_geometry_gate(score, _acceptance_threshold(data.diagonal))
+        ),
     )
     report = ReconstructionReport(
         id=run_id,
