@@ -71,7 +71,10 @@ The API supervises the complete conversion or feature edit in a separate
 process with a 240-second total deadline, including recovery, export, and
 verification. Closed bodies with disjoint bounding boxes use their own fitting scale. Input
 cleanup removes duplicate and zero-area triangles without moving vertices;
-the report exposes remaining open and non-manifold edges.
+the report exposes remaining open and non-manifold edges. Non-finite input
+coordinates are rejected before cleanup. Fully enclosed closed shells form
+cavities according to containment depth; islands inside those cavities remain
+separate solids. Containment is checked against the surfaces, not bounds alone.
 
 The feature-history engine detects extrusions, steps, pockets, bosses, holes,
 countersinks, oriented cylinders, revolutions, lofts, fillets, chamfers, arcs,
@@ -82,7 +85,7 @@ verification.
 ## Reading the result
 
 `complete` means the delivered STEP was re-imported and passed solid validity,
-sampled surface deviation, local deviation, component-count, and volume checks.
+sampled surface deviation, local deviation, shell-count, solid-count, and volume checks.
 Verification tessellates that STEP with absolute millimetre deflection; preview
 STL files cannot establish a successful conversion. `best_effort` means CAD
 surface recovery is incomplete or a geometry check failed. The report explains

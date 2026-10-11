@@ -35,7 +35,8 @@ def verification_warnings(score: ScoreReport, threshold: float) -> list[str]:
         warnings.append(
             "Verification: the input has "
             f"{score.source_component_count} connected surface components, but the STEP "
-            f"contains {score.step_shell_count} shells."
+            f"contains {score.step_shell_count} shells; expected "
+            f"{score.source_solid_count} solids, found {score.step_solid_count}."
         )
     maximum = max(score.chamfer_max_mm, score.local_max_mm or 0.0)
     if maximum > threshold:

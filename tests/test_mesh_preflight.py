@@ -6,6 +6,21 @@ from app.mesh import load_mesh, mesh_warnings
 from app.surface_brep import build_surface_brep, surface_graph_json
 
 
+@pytest.mark.parametrize("coordinate", [np.nan, np.inf, -np.inf])
+def test_preflight_rejects_nonfinite_raw_stl_coordinates(tmp_path, coordinate):
+    box = trimesh.creation.box(extents=(10, 10, 10))
+    mesh = trimesh.Trimesh(
+        vertices=np.vstack((box.vertices, [[coordinate, 0, 0], [20, 0, 0], [20, 1, 1]])),
+        faces=np.vstack((box.faces, [[8, 9, 10]])),
+        process=False,
+    )
+    path = tmp_path / "nonfinite.stl"
+    mesh.export(path)
+
+    with pytest.raises(ValueError, match="non-finite coordinates"):
+        load_mesh(path, path.name)
+
+
 def test_preflight_removes_only_duplicate_and_zero_area_faces(tmp_path):
     source = trimesh.creation.box(extents=(10, 8, 6))
     mesh = trimesh.Trimesh(

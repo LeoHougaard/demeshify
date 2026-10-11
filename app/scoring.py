@@ -240,11 +240,14 @@ def score_exported_shape(
         step_geometry_verified=verify_step_geometry,
         component_count_match=(
             data.report.body_count == len(step_shape.Shells())
+            and (data.report.solid_count is None or data.report.solid_count == len(solids))
             if data.mesh.is_watertight and verify_step_geometry
             else None
         ),
         source_component_count=data.report.body_count,
         step_shell_count=len(step_shape.Shells()),
+        source_solid_count=data.report.solid_count,
+        step_solid_count=len(solids),
         verification_tessellation_mm=tessellation if verify_step_geometry else None,
         local_max_mm=local_max,
     )

@@ -546,6 +546,8 @@ class MeshReport(SchemaModel):
     vertex_count: int
     watertight: bool
     body_count: int
+    solid_count: int | None = None
+    cavity_shell_count: int = 0
     dimensions_mm: Point3D
     volume_mm3: float | None
     surface_area_mm2: float
@@ -572,6 +574,8 @@ class ScoreReport(SchemaModel):
     component_count_match: bool | None = None
     source_component_count: int | None = None
     step_shell_count: int | None = None
+    source_solid_count: int | None = None
+    step_solid_count: int | None = None
     verification_tessellation_mm: float | None = None
     local_max_mm: float | None = None
 

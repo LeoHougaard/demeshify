@@ -95,7 +95,7 @@ from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString
 
-from .mesh import MeshData
+from .mesh import MeshData, closed_shell_topology, containment_parents, shell_depths
 from .surface_graph import (
     ConicalPatch,
     CylindricalPatch,
@@ -3637,22 +3637,32 @@ def build_faceted_brep(
     # Preserve the original linear carrier path for the overwhelmingly common
     # one-body case: rebuilding a 75k-face adjacency graph here can push an
     # otherwise completed dense recovery past its outer benchmark budget.
-    components = (
-        [range(len(faces))]
-        if mesh.body_count == 1
-        else trimesh.graph.connected_components(
-            np.asarray(mesh.face_adjacency, dtype=np.int64),
-            nodes=np.arange(len(faces), dtype=np.int64),
-        )
-    )
-    solids: list[TopoDS_Solid] = []
+    if mesh.body_count == 1:
+        components, parents = [range(len(faces))], [-1]
+    elif data.shell_face_indices is not None and data.shell_parents is not None:
+        components, parents = data.shell_face_indices, data.shell_parents
+    else:
+        components, parents = closed_shell_topology(mesh)
+    shells = []
     for component in components:
         shell = TopoDS_Shell()
         builder.MakeShell(shell)
         for face_index in component:
             builder.Add(shell, faces[int(face_index)])
         shell.Closed(True)
+        shells.append(shell)
+    solids: list[TopoDS_Solid] = []
+    for index, depth in enumerate(shell_depths(parents)):
+        if depth % 2:
+            continue
+        shell = shells[index]
         solid_maker = BRepBuilderAPI_MakeSolid(shell)
+        # A cavity is a reversed inner shell of its enclosing solid, rather
+        # than an independent positive-volume body. Islands inside cavities
+        # (even containment depth) remain separate solids.
+        for child, parent in enumerate(parents):
+            if parent == index:
+                solid_maker.Add(shells[child])
         if not solid_maker.IsDone():
             raise ValueError("Could not construct a solid from source mesh topology")
         solid = solid_maker.Solid()
@@ -4268,7 +4278,9 @@ def _disjoint_component_brep(
     for index, (face_ids, vertex_ids, mesh) in enumerate(parts):
         if progress_callback:
             progress_callback(f"surface_component_start index={index} triangles={len(mesh.faces)}")
-        local = replace(data, mesh=mesh, section_cache={})
+        local = replace(
+            data, mesh=mesh, section_cache={}, shell_face_indices=None, shell_parents=None,
+        )
         result = _build_surface_brep_single(
             local, progress_callback, trimming_tolerance_scale,
         )
@@ -4314,6 +4326,43 @@ def _disjoint_component_brep(
     )
 
 
+def _nest_closed_solids(solids: list[cq.Solid], tolerance: float) -> cq.Shape:
+    """Reassemble closed fitted shells as solids with enclosed voids."""
+    solids = [
+        cq.Solid(solid.wrapped.Reversed()) if solid.Volume() < 0 else solid
+        for solid in solids
+    ]
+    bounds = []
+    for solid in solids:
+        box = solid.BoundingBox()
+        bounds.append([[box.xmin, box.ymin, box.zmin], [box.xmax, box.ymax, box.zmax]])
+
+    def contains(parent: int, child: int) -> bool:
+        points = [vertex.toTuple() for vertex in solids[child].Vertices()]
+        # Closed curved faces can have very few topological vertices. Sample
+        # their actual surfaces as well, rather than a face's mass centroid.
+        vertices, _ = solids[child].tessellate(max(tolerance, 1e-7))
+        points.extend(vertex.toTuple() for vertex in vertices)
+        return bool(points) and all(solids[parent].isInside(point, tolerance) for point in points)
+
+    parents = containment_parents(
+        np.asarray(bounds), [abs(solid.Volume()) for solid in solids], contains,
+    )
+    assembled = []
+    for index, depth in enumerate(shell_depths(parents)):
+        if depth % 2:
+            continue
+        maker = BRepBuilderAPI_MakeSolid(solids[index].Shells()[0].wrapped)
+        for child, parent in enumerate(parents):
+            if parent == index:
+                maker.Add(TopoDS.Shell_s(solids[child].Shells()[0].wrapped.Reversed()))
+        shape = cq.Shape(maker.Solid())
+        if not shape.isValid() or shape.Volume() <= 0:
+            raise ValueError("Enclosed fitted shells did not produce a valid hollow solid")
+        assembled.append(shape)
+    return assembled[0] if len(assembled) == 1 else cq.Compound.makeCompound(assembled)
+
+
 def build_surface_brep(
     data: MeshData,
     progress_callback: Callable[[str], None] | None = None,
@@ -4325,6 +4374,16 @@ def build_surface_brep(
         result = _disjoint_component_brep(data, progress_callback, trimming_tolerance_scale)
     if result is None:
         result = _build_surface_brep_single(data, progress_callback, trimming_tolerance_scale)
+    if (
+        result.closed
+        and getattr(getattr(data, "report", None), "cavity_shell_count", 0)
+        and len(result.shape.Solids()) > 1
+    ):
+        result.shape = _nest_closed_solids(result.shape.Solids(), result.sewing_tolerance)
+        result.joined_shape = result.shape
+        result.solid_count = len(result.shape.Solids())
+        result.face_count = len(result.shape.Faces())
+        result.valid = bool(result.shape.isValid())
     result.graph.source_face_indices = getattr(data, "source_face_indices", None)
     return result
 

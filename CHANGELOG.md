@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Preserve enclosed STL cavities and islands when normalizing mesh orientation and
+  assembling analytic or faceted STEP solids. Verification now checks both shell
+  and solid counts, so nested positive-volume bodies cannot pass as a hollow part.
+- Reject NaN and infinite STL vertices before mesh processing can alter them,
+  while keeping cleanup overlays tied to original input triangle numbers.
+
 - Exposed STL export units and output dimensions before conversion, with a
   metre-unit suggestion for tiny imports and clearer upload connection errors.
 - Recovered small tangent cylinders using smaller local fitting samples and
