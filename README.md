@@ -71,6 +71,9 @@ The API supervises the complete conversion or feature edit in a separate
 process with a 240-second total deadline, including recovery, export, and
 verification. Disjoint closed bodies and enclosed cavity shells use their own fitting scale. Input
 cleanup removes duplicate and zero-area triangles without moving vertices;
+exact collinear boundary subdivisions exposed by that cleanup can be resolved
+using existing vertices only, while preserving surface area, volume and original
+triangle numbers. Cleanup does not fill openings or snap nearby vertices together;
 the report exposes remaining open and non-manifold edges. Non-finite input
 coordinates are rejected before cleanup. Fully enclosed closed shells form
 cavities according to containment depth; islands inside those cavities remain

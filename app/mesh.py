@@ -27,6 +27,7 @@ class MeshData:
     source_face_indices: np.ndarray | None = None
     shell_face_indices: list[np.ndarray] | None = None
     shell_parents: list[int] | None = None
+    boundary_subdivisions: int = 0
 
     @property
     def diagonal(self) -> float:
@@ -86,6 +87,70 @@ def closed_shell_topology(mesh: trimesh.Trimesh) -> tuple[list[np.ndarray], list
     return components, parents
 
 
+def resolve_boundary_subdivisions(
+    mesh: trimesh.Trimesh, source_face_indices: np.ndarray,
+) -> tuple[trimesh.Trimesh, np.ndarray, int]:
+    """Resolve exact collinear T junctions without adding or moving surface geometry."""
+
+    incidence = np.bincount(mesh.edges_unique_inverse, minlength=len(mesh.edges_unique))
+    boundary_ids = np.flatnonzero(incidence == 1)
+    if not len(boundary_ids) or np.any(incidence > 2):
+        return mesh, source_face_indices, 0
+    boundary_vertices = np.unique(mesh.edges_unique[boundary_ids])
+    # Cleanup must remain bounded for malformed uploads with many open edges.
+    if len(boundary_ids) * len(boundary_vertices) > 1_000_000:
+        return mesh, source_face_indices, 0
+
+    points = mesh.vertices[boundary_vertices]
+    subdivisions = {}
+    for edge_id in boundary_ids:
+        a, b = (int(index) for index in mesh.edges_unique[edge_id])
+        delta = mesh.vertices[b] - mesh.vertices[a]
+        offsets = points - mesh.vertices[a]
+        axis = int(np.argmax(np.abs(delta)))
+        parameter = offsets[:, axis] / delta[axis]
+        # Exact collinearity only: a nearby hole or crack must never be snapped shut.
+        collinear = np.all(np.cross(offsets, delta) == 0, axis=1)
+        inside = np.flatnonzero(collinear & (parameter > 0) & (parameter < 1))
+        if len(inside):
+            subdivisions[(a, b)] = boundary_vertices[
+                inside[np.argsort(parameter[inside])]
+            ].tolist()
+    if not subdivisions:
+        return mesh, source_face_indices, 0
+
+    faces, provenance = [], []
+    for original, source_id in zip(mesh.faces, source_face_indices, strict=True):
+        triangles = [original.tolist()]
+        for position in range(3):
+            a, b = int(original[position]), int(original[(position + 1) % 3])
+            inserted = subdivisions.get((min(a, b), max(a, b)))
+            if not inserted:
+                continue
+            inserted = inserted if a < b else inserted[::-1]
+            for index, triangle in enumerate(triangles):
+                if a in triangle and b in triangle:
+                    third = next(vertex for vertex in triangle if vertex not in (a, b))
+                    chain = [a, *inserted, b]
+                    triangles[index:index + 1] = [
+                        [left, right, third]
+                        for left, right in zip(chain[:-1], chain[1:], strict=True)
+                    ]
+                    break
+        faces.extend(triangles)
+        provenance.extend([int(source_id)] * len(triangles))
+    repaired = trimesh.Trimesh(vertices=mesh.vertices.copy(), faces=faces, process=False)
+    if not (
+        repaired.is_watertight and repaired.is_winding_consistent
+        and repaired.body_count == mesh.body_count
+        and np.all(repaired.area_faces > 0)
+        and np.isclose(repaired.area, mesh.area, rtol=1e-12, atol=0)
+        and np.isclose(repaired.volume, mesh.volume, rtol=1e-12, atol=0)
+    ):
+        return mesh, source_face_indices, 0
+    return repaired, np.asarray(provenance, dtype=np.int64), len(faces) - len(mesh.faces)
+
+
 def load_mesh(path: Path, file_name: str, input_units: str = "mm") -> MeshData:
     if input_units not in UNIT_SCALE:
         raise ValueError(f"Unsupported input unit: {input_units}")
@@ -122,6 +187,11 @@ def load_mesh(path: Path, file_name: str, input_units: str = "mm") -> MeshData:
     if len(mesh.faces) == 0:
         raise ValueError("The STL contains no non-degenerate triangles")
     mesh.remove_unreferenced_vertices()
+    subdivisions = 0
+    if removed_degenerate:
+        mesh, source_face_indices, subdivisions = resolve_boundary_subdivisions(
+            mesh, source_face_indices,
+        )
     mesh.fix_normals(multibody=True)
     shell_faces = None
     shell_parents = None
@@ -161,6 +231,7 @@ def load_mesh(path: Path, file_name: str, input_units: str = "mm") -> MeshData:
     return MeshData(
         mesh=mesh, report=report, source_path=path, source_face_indices=source_face_indices,
         shell_face_indices=shell_faces, shell_parents=shell_parents,
+        boundary_subdivisions=subdivisions,
     )
 
 
@@ -172,6 +243,11 @@ def mesh_warnings(data: MeshData) -> list[str]:
         warnings.append(
             f"Removed {report.removed_degenerate_triangles} zero-area and "
             f"{report.removed_duplicate_triangles} duplicate triangles without moving vertices."
+        )
+    if data.boundary_subdivisions:
+        warnings.append(
+            f"Resolved {data.boundary_subdivisions} collinear boundary subdivisions "
+            "without moving vertices or filling openings."
         )
     if report.boundary_edge_count or report.nonmanifold_edge_count:
         warnings.append(
