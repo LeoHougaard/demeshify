@@ -103,6 +103,34 @@ def test_near_collinear_gap_is_not_snapped_shut(tmp_path: Path):
     assert data.report.removed_degenerate_triangles == 1
 
 
+@pytest.mark.parametrize("offset", [
+    0.0, 1e-16, 1e-17, float(np.nextafter(np.float32(0), np.float32(1))),
+])
+def test_subtraction_cancellation_does_not_close_off_edge_gap(tmp_path: Path, offset: float):
+    mesh = junction_box(2)
+    mesh.vertices[:, 0] += mesh.vertices[:, 2]
+    mesh.vertices[-1, 2] += offset
+    a, _, b = mesh.faces[-1]
+    mesh.faces[-1] = [a, a, b]
+    path = tmp_path / "sheared-gap.stl"
+    mesh.export(path)
+    raw = trimesh.load(path, process=False, force="mesh")
+    # Binary STL retains this offset, although subtraction from the endpoints
+    # loses it before the floating-point cross product is evaluated.
+    point = raw.vertices[np.argmin(np.linalg.norm(raw.vertices - mesh.vertices[-1], axis=1))]
+    assert point[2] == float(np.float32(offset))
+    np.testing.assert_array_equal(
+        np.cross(point - mesh.vertices[a], mesh.vertices[b] - mesh.vertices[a]),
+        np.zeros(3),
+    )
+    data = load_mesh(path, path.name)
+    assert data.report.watertight == (offset == 0)
+    assert data.boundary_subdivisions == (2 if offset == 0 else 0)
+    if offset:
+        assert data.report.boundary_edge_count > 0
+        assert data.report.volume_mm3 is None
+
+
 def test_touching_nonmanifold_solids_remain_unaccepted(tmp_path: Path):
     first = trimesh.creation.box(extents=(10, 10, 10))
     second = first.copy()

@@ -4,6 +4,7 @@
 
 - Resolve exact collinear boundary subdivisions exposed by zero-area STL cleanup,
   retaining the original vertices, surface area, volume and triangle provenance.
+  Confirm collinearity exactly on stored coordinates despite subtraction cancellation.
   Actual openings and non-manifold edges remain unaccepted.
 - Verify all STEP transfer roots and reject geometry outside the delivered solids,
   including stray edges and vertices. Corpus topology metrics also include every root.

@@ -73,7 +73,8 @@ verification. Disjoint closed bodies and enclosed cavity shells use their own fi
 cleanup removes duplicate and zero-area triangles without moving vertices;
 exact collinear boundary subdivisions exposed by that cleanup can be resolved
 using existing vertices only, while preserving surface area, volume and original
-triangle numbers. Cleanup does not fill openings or snap nearby vertices together;
+triangle numbers. Collinearity is checked exactly on the stored coordinates to
+avoid floating-point cancellation. Cleanup does not fill openings or snap nearby vertices together;
 the report exposes remaining open and non-manifold edges. Non-finite input
 coordinates are rejected before cleanup. Fully enclosed closed shells form
 cavities according to containment depth; islands inside those cavities remain

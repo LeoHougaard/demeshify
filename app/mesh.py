@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -103,19 +104,42 @@ def resolve_boundary_subdivisions(
 
     points = mesh.vertices[boundary_vertices]
     subdivisions = {}
+    exact_vertices = {}
+
+    def exact_vertex(index: int) -> tuple[Fraction, ...]:
+        if index not in exact_vertices:
+            exact_vertices[index] = tuple(Fraction(float(value)) for value in mesh.vertices[index])
+        return exact_vertices[index]
+
     for edge_id in boundary_ids:
         a, b = (int(index) for index in mesh.edges_unique[edge_id])
         delta = mesh.vertices[b] - mesh.vertices[a]
         offsets = points - mesh.vertices[a]
         axis = int(np.argmax(np.abs(delta)))
         parameter = offsets[:, axis] / delta[axis]
-        # Exact collinearity only: a nearby hole or crack must never be snapped shut.
+        # Float arithmetic screens candidates cheaply, but subtraction can erase
+        # a retained off-edge offset. Confirm using the original binary values.
         collinear = np.all(np.cross(offsets, delta) == 0, axis=1)
         inside = np.flatnonzero(collinear & (parameter > 0) & (parameter < 1))
         if len(inside):
-            subdivisions[(a, b)] = boundary_vertices[
-                inside[np.argsort(parameter[inside])]
-            ].tolist()
+            start, end = exact_vertex(a), exact_vertex(b)
+            exact_delta = tuple(right - left for left, right in zip(start, end, strict=True))
+            confirmed = []
+            for candidate in inside:
+                vertex_id = int(boundary_vertices[candidate])
+                point = exact_vertex(vertex_id)
+                exact_offset = tuple(
+                    value - origin for value, origin in zip(point, start, strict=True)
+                )
+                exact_parameter = exact_offset[axis] / exact_delta[axis]
+                if 0 < exact_parameter < 1 and all(
+                    exact_offset[dimension] * exact_delta[axis]
+                    == exact_offset[axis] * exact_delta[dimension]
+                    for dimension in range(3) if dimension != axis
+                ):
+                    confirmed.append((exact_parameter, vertex_id))
+            if confirmed:
+                subdivisions[(a, b)] = [vertex_id for _, vertex_id in sorted(confirmed)]
     if not subdivisions:
         return mesh, source_face_indices, 0
 
