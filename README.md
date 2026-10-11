@@ -69,7 +69,7 @@ deadline.
 
 The API supervises the complete conversion or feature edit in a separate
 process with a 240-second total deadline, including recovery, export, and
-verification. Closed bodies with disjoint bounding boxes use their own fitting scale. Input
+verification. Disjoint closed bodies and enclosed cavity shells use their own fitting scale. Input
 cleanup removes duplicate and zero-area triangles without moving vertices;
 the report exposes remaining open and non-manifold edges. Non-finite input
 coordinates are rejected before cleanup. Fully enclosed closed shells form

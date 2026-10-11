@@ -5,6 +5,8 @@
 - Preserve enclosed STL cavities and islands when normalizing mesh orientation and
   assembling analytic or faceted STEP solids. Verification now checks both shell
   and solid counts, so nested positive-volume bodies cannot pass as a hollow part.
+- Fit enclosed shells independently before joining them into hollow solids,
+  retaining analytic curved cavities and using each shell's own fitting scale.
 - Reject NaN and infinite STL vertices before mesh processing can alter them,
   while keeping cleanup overlays tied to original input triangle numbers.
 

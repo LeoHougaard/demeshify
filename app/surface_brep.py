@@ -3639,7 +3639,10 @@ def build_faceted_brep(
     # otherwise completed dense recovery past its outer benchmark budget.
     if mesh.body_count == 1:
         components, parents = [range(len(faces))], [-1]
-    elif data.shell_face_indices is not None and data.shell_parents is not None:
+    elif (
+        getattr(data, "shell_face_indices", None) is not None
+        and getattr(data, "shell_parents", None) is not None
+    ):
         components, parents = data.shell_face_indices, data.shell_parents
     else:
         components, parents = closed_shell_topology(mesh)
@@ -4246,7 +4249,7 @@ def surface_graph_json(
     }
 
 
-def _disjoint_component_brep(
+def _closed_component_brep(
     data: MeshData,
     progress_callback: Callable[[str], None] | None,
     trimming_tolerance_scale: float = 1.0,
@@ -4264,13 +4267,24 @@ def _disjoint_component_brep(
             process=False,
         )
         parts.append((face_ids, vertex_ids, mesh))
-    # Overlapping bounds may describe nested cavity shells. Preserve the joint
-    # path for those inputs rather than assuming that every shell is a body.
+    parents = data.shell_parents or [-1] * len(parts)
+
+    def is_ancestor(parent: int, child: int) -> bool:
+        while parents[child] != -1:
+            child = parents[child]
+            if child == parent:
+                return True
+        return False
+
+    # Fit disjoint bodies and classified enclosed shells independently. The
+    # joint path remains necessary when overlapping bounds do not correspond
+    # to containment: those surfaces can be parts of one intersecting assembly.
     for index, (_, _, first) in enumerate(parts):
-        for _, _, second in parts[index + 1:]:
+        for other_index in range(index + 1, len(parts)):
+            second = parts[other_index][2]
             if not np.any(
                 (first.bounds[1] < second.bounds[0]) | (second.bounds[1] < first.bounds[0])
-            ):
+            ) and not (is_ancestor(index, other_index) or is_ancestor(other_index, index)):
                 return None
 
     combined = SurfaceGraph(face_patch_ids=np.full(len(data.mesh.faces), "", dtype=object))
@@ -4278,6 +4292,8 @@ def _disjoint_component_brep(
     for index, (face_ids, vertex_ids, mesh) in enumerate(parts):
         if progress_callback:
             progress_callback(f"surface_component_start index={index} triangles={len(mesh.faces)}")
+        if mesh.volume < 0:
+            mesh.invert()
         local = replace(
             data, mesh=mesh, section_cache={}, shell_face_indices=None, shell_parents=None,
         )
@@ -4328,6 +4344,11 @@ def _disjoint_component_brep(
 
 def _nest_closed_solids(solids: list[cq.Solid], tolerance: float) -> cq.Shape:
     """Reassemble closed fitted shells as solids with enclosed voids."""
+    # Already assembled hollow solids must keep every inner shell. The general
+    # sewing path normally emits one solid per shell, but callers can also
+    # provide valid multi-shell solids alongside separate bodies.
+    if any(len(solid.Shells()) != 1 for solid in solids):
+        return cq.Compound.makeCompound(solids)
     solids = [
         cq.Solid(solid.wrapped.Reversed()) if solid.Volume() < 0 else solid
         for solid in solids
@@ -4371,7 +4392,7 @@ def build_surface_brep(
 ) -> SurfaceBRepResult:
     result = None
     if isinstance(data, MeshData) and data.mesh.body_count > 1 and data.mesh.is_watertight:
-        result = _disjoint_component_brep(data, progress_callback, trimming_tolerance_scale)
+        result = _closed_component_brep(data, progress_callback, trimming_tolerance_scale)
     if result is None:
         result = _build_surface_brep_single(data, progress_callback, trimming_tolerance_scale)
     if (
