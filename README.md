@@ -86,6 +86,8 @@ verification.
 
 `complete` means the delivered STEP was re-imported and passed solid validity,
 sampled surface deviation, local deviation, shell-count, solid-count, and volume checks.
+These checks include every STEP transfer root and reject standalone shells, faces,
+wires, edges, or vertices outside the solids.
 Verification tessellates that STEP with absolute millimetre deflection; preview
 STL files cannot establish a successful conversion. `best_effort` means CAD
 surface recovery is incomplete or a geometry check failed. The report explains

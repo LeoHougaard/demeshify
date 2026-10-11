@@ -19,6 +19,7 @@ from OCP.TopoDS import TopoDS
 from .cad import export_plan
 from .mesh import MeshData, surface_samples
 from .schemas import ReconstructionPlan, ScoreReport
+from .step import load_step_shape, unowned_geometry_counts
 
 
 @dataclass(slots=True)
@@ -158,14 +159,16 @@ def score_exported_shape(
 ) -> ScoreReport:
     """Measure the delivered STEP. Preview-only scoring is restricted to search."""
 
-    step_shape = cq.importers.importStep(str(directory / "reconstruction.step")).val()
+    step_shape = load_step_shape(directory / "reconstruction.step")
     solids = step_shape.Solids()
+    unowned = unowned_geometry_counts(step_shape)
     valid_brep = bool(step_shape.isValid() and step_shape.Faces())
     valid_solid = bool(
         valid_brep
         and solids
         and all(solid.isValid() for solid in solids)
         and sum(len(solid.Faces()) for solid in solids) == len(step_shape.Faces())
+        and not unowned
     )
     tessellation = max(min(data.diagonal * 0.00005, 0.01), 1e-7)
     candidate_mesh = (
@@ -248,6 +251,7 @@ def score_exported_shape(
         step_shell_count=len(step_shape.Shells()),
         source_solid_count=data.report.solid_count,
         step_solid_count=len(solids),
+        unowned_geometry_counts=unowned,
         verification_tessellation_mm=tessellation if verify_step_geometry else None,
         local_max_mm=local_max,
     )

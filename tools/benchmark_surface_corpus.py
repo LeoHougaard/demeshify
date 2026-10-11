@@ -14,13 +14,12 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import cadquery as cq
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.jobs import run_bounded_process  # noqa: E402
+from app.step import load_step_shape  # noqa: E402
 from app.storage import atomic_write_text  # noqa: E402
 from app.surface_reconstruction import reconstruct_surfaces  # noqa: E402
 from app.verification import acceptance_threshold, passes_geometry_gate  # noqa: E402
@@ -47,7 +46,7 @@ def case_has_analytic_curves(case: dict[str, object]) -> bool:
 
 
 def step_surface_metrics(path: Path) -> dict[str, object]:
-    imported = cq.importers.importStep(str(path)).val()
+    imported = load_step_shape(path)
     face_counts: Counter[str] = Counter()
     face_areas: Counter[str] = Counter()
     edge_counts: Counter[str] = Counter()

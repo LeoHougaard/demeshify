@@ -96,6 +96,7 @@ from scipy.spatial import cKDTree
 from shapely.geometry import LineString
 
 from .mesh import MeshData, closed_shell_topology, containment_parents, shell_depths
+from .step import load_step_shape, unowned_geometry_counts
 from .surface_graph import (
     ConicalPatch,
     CylindricalPatch,
@@ -5118,8 +5119,13 @@ def export_surface_brep(
     )
     if result.closed and verify_roundtrip:
         try:
-            roundtrip = cq.importers.importStep(str(step_path)).val()
-            exchange_valid = bool(roundtrip.isValid() and roundtrip.Solids())
+            roundtrip = load_step_shape(step_path)
+            exchange_valid = bool(
+                roundtrip.isValid()
+                and roundtrip.Solids()
+                and len(roundtrip.Solids()) == result.solid_count
+                and not unowned_geometry_counts(roundtrip)
+            )
         except Exception:
             exchange_valid = False
         if not exchange_valid:

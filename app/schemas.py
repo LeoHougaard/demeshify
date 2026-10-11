@@ -576,6 +576,7 @@ class ScoreReport(SchemaModel):
     step_shell_count: int | None = None
     source_solid_count: int | None = None
     step_solid_count: int | None = None
+    unowned_geometry_counts: dict[str, int] = Field(default_factory=dict)
     verification_tessellation_mm: float | None = None
     local_max_mm: float | None = None
 

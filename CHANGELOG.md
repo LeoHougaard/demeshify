@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Verify all STEP transfer roots and reject geometry outside the delivered solids,
+  including stray edges and vertices. Corpus topology metrics also include every root.
 - Preserve enclosed STL cavities and islands when normalizing mesh orientation and
   assembling analytic or faceted STEP solids. Verification now checks both shell
   and solid counts, so nested positive-volume bodies cannot pass as a hollow part.
