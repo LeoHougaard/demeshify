@@ -1900,7 +1900,13 @@ def _freeform_charts(
     normals = np.asarray(mesh.face_normals, dtype=float)
     local_limit = math.cos(math.radians(smooth_angle_degrees))
     has_internal_crease = False
-    for raw_first, raw_second in np.asarray(mesh.face_adjacency, dtype=np.int64):
+    face_adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    chart_membership = np.zeros(len(mesh.faces), dtype=bool)
+    chart_membership[face_indices] = True
+    internal_adjacency = face_adjacency[
+        chart_membership[face_adjacency[:, 0]] & chart_membership[face_adjacency[:, 1]]
+    ]
+    for raw_first, raw_second in internal_adjacency:
         first, second = int(raw_first), int(raw_second)
         if first not in selected or second not in selected:
             continue
@@ -4989,7 +4995,13 @@ def detect_surface_graph(
                 continue
             residual_set = set(int(value) for value in residual.face_indices)
             neighbor_ids: set[str] = set()
-            for raw_first, raw_second in np.asarray(mesh.face_adjacency, dtype=np.int64):
+            adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+            residual_membership = np.zeros(len(mesh.faces), dtype=bool)
+            residual_membership[residual.face_indices] = True
+            crossing_adjacency = adjacency[
+                residual_membership[adjacency[:, 0]] != residual_membership[adjacency[:, 1]]
+            ]
+            for raw_first, raw_second in crossing_adjacency:
                 first, second = int(raw_first), int(raw_second)
                 if first in residual_set and second not in residual_set:
                     neighbor_ids.add(str(face_patch_ids[second]))
