@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Constrain unusually long extrusion-profile spans with additional chord anchors,
+  retaining original nodes and fitting tolerances to prevent between-node spline bowing.
 - Recover sparse closed planar models from their shared source topology when
   fitted boundaries fail, merging coplanar triangles into connected plane faces.
   Final STEP validity, geometry, volume and component checks remain required.

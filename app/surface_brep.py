@@ -3066,6 +3066,31 @@ def _faceted_residual_faces(
     return result
 
 
+def _profile_chord_anchors(profile: np.ndarray, maximum_points: int = 128) -> np.ndarray:
+    """Constrain unusually long profile spans while retaining their original nodes."""
+
+    available = maximum_points - len(profile)
+    if len(profile) < 2 or available <= 0:
+        return profile
+    lengths = np.linalg.norm(np.diff(profile, axis=0), axis=1)
+    positive = lengths[lengths > 0]
+    total = float(np.sum(lengths))
+    if (
+        not len(positive) or not math.isfinite(total)
+        or float(np.max(positive)) <= float(np.median(positive)) * 4
+    ):
+        return profile
+    maximum_gap = total / min(32, available)
+    segments = np.maximum(1, np.ceil(lengths / maximum_gap).astype(int))
+    if int(np.sum(segments - 1)) > available:
+        return profile
+    anchored = [profile[0]]
+    for start, end, count in zip(profile[:-1], profile[1:], segments, strict=True):
+        anchored.extend(start + (end - start) * fraction / count for fraction in range(1, count))
+        anchored.append(end)
+    return np.asarray(anchored)
+
+
 def _linear_extrusion_face(
     patch: LinearExtrusionPatch,
     edges: list[_TrimEdge],
@@ -3083,6 +3108,7 @@ def _linear_extrusion_face(
     closed = bool(np.linalg.norm(profile[0] - profile[-1]) <= tolerance * 3)
     if closed and np.linalg.norm(profile[0] - profile[-1]) > 1e-12:
         profile = np.vstack((profile, profile[0]))
+    profile = _profile_chord_anchors(profile, maximum_points)
     array = TColgp_Array1OfPnt(1, len(profile))
     for index, point in enumerate(profile, start=1):
         array.SetValue(index, _point(point))
