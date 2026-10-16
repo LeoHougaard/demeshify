@@ -115,6 +115,9 @@ port private unless you change its visibility.
 The [October 16 reliability validation](docs/reliability-validation-2026-10-16.md)
 records the full test suite, exact boundary-repair checks, STEP integrity tests
 and ten selected conversions with their remaining limits.
+The subsequent [reconstruction improvements](docs/reconstruction-improvements-2026-10-16.md)
+recover connected planar faces and constrain sparse extrusion profiles, with a
+matched ten-case comparison and 237 passing tests.
 
 The September 17 release test evaluated 500 distinct mechanical-part STLs.
 497 passed the delivered-STEP geometry checks (99.4%); 382 also passed strict
