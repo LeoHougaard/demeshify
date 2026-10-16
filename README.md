@@ -112,6 +112,10 @@ port private unless you change its visibility.
 
 ## Current beta limits
 
+The [October 16 reliability validation](docs/reliability-validation-2026-10-16.md)
+records the full test suite, exact boundary-repair checks, STEP integrity tests
+and ten selected conversions with their remaining limits.
+
 The September 17 release test evaluated 500 distinct mechanical-part STLs.
 497 passed the delivered-STEP geometry checks (99.4%); 382 also passed strict
 CAD-surface recovery checks without triangle fallbacks (76.4%). Another 17
