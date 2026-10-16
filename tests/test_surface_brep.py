@@ -766,6 +766,8 @@ def test_fine_trimming_retry_only_adopts_a_geometrically_verified_solid(
 
     monkeypatch.setattr(surface_reconstruction, "build_surface_brep", build)
     monkeypatch.setattr(surface_reconstruction, "recover_prismatic_solid", lambda *_: None)
+    # Isolate this trim-retry contract from the independent source-plane recovery.
+    monkeypatch.setattr(surface_reconstruction, "build_planar_topology_brep", lambda *_: None)
     report = surface_reconstruction._reconstruct_surfaces_direct("retry", path, path.name)
 
     assert scales == [1.0, 0.1]

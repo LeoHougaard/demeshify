@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Recover sparse closed planar models from their shared source topology when
+  fitted boundaries fail, merging coplanar triangles into connected plane faces.
+  Final STEP validity, geometry, volume and component checks remain required.
 - Resolve exact collinear boundary subdivisions exposed by zero-area STL cleanup,
   retaining the original vertices, surface area, volume and triangle provenance.
   Confirm collinearity exactly on stored coordinates despite subtraction cancellation.

@@ -18,7 +18,12 @@ from .prismatic_recovery import recover_prismatic_solid
 from .schemas import ReconstructionReport, SurfaceBRepReport
 from .scoring import _local_samples, _point_mesh_distances, score_exported_shape
 from .storage import atomic_write_text
-from .surface_brep import build_faceted_brep, build_surface_brep, export_surface_brep
+from .surface_brep import (
+    build_faceted_brep,
+    build_planar_topology_brep,
+    build_surface_brep,
+    export_surface_brep,
+)
 from .verification import acceptance_threshold, passes_geometry_gate, verification_warnings
 
 
@@ -136,6 +141,32 @@ def _reconstruct_surfaces_direct(
                         shutil.copy2(working / name, stl_path.parent / name)
                     result, score, passed = refined, refined_score, True
                     result.warnings.append("Recovered the solid with a finer trimming tolerance.")
+            except Exception:
+                pass
+
+    if not passed and time.perf_counter() - started < 60:
+        # Independent fitted boundaries can lose the topology of a thin planar
+        # profile. Merge coplanar source faces instead, and adopt that candidate
+        # only after the same delivered-STEP checks used for every other model.
+        with tempfile.TemporaryDirectory(
+            dir=stl_path.parent, prefix="planar-topology-",
+        ) as temporary:
+            working = Path(temporary)
+            try:
+                planar = build_planar_topology_brep(data, result.graph)
+                if planar is not None:
+                    update("surface_planar_topology_verification_start")
+                    export_surface_brep(
+                        planar, working, data.source_path,
+                        source_unit_scale=data.report.unit_scale,
+                    )
+                    planar_score = score_exported_shape(data, working, require_solid=False)
+                    if _passes_surface_gate(planar, planar_score, threshold):
+                        for name in (
+                            "reconstruction.step", "reconstruction.stl", "surface_graph.json",
+                        ):
+                            shutil.copy2(working / name, stl_path.parent / name)
+                        result, score, passed = planar, planar_score, True
             except Exception:
                 pass
 

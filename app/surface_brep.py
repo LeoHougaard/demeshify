@@ -72,6 +72,7 @@ from OCP.ShapeFix import (
     ShapeFix_Solid,
     ShapeFix_Wire,
 )
+from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
 from OCP.TColgp import (
     TColgp_Array1OfPnt,
     TColgp_Array2OfPnt,
@@ -3718,6 +3719,51 @@ def build_faceted_brep(
         faceted_face_count=len(faces),
         faceted_patch_ids=list(visualization_faceted_patch_ids or []),
         source_mesh_fallback=True,
+    )
+
+
+def build_planar_topology_brep(
+    data: MeshData, graph: SurfaceGraph,
+) -> SurfaceBRepResult | None:
+    """Recover connected planar faces without refitting their source boundaries."""
+
+    # Only sparse, entirely planar, closed single-shell models take this path.
+    # The carrier and native domain merge must fit inside the existing worker
+    # deadline; curved patches and dense triangle fallbacks keep their own paths.
+    if (
+        not graph.planar_patches
+        or len(graph.planar_patches) != len(graph.patches)
+        or len(data.mesh.faces) > 2_000
+        or data.mesh.body_count != 1
+        or not data.mesh.is_watertight
+        or not data.mesh.is_winding_consistent
+    ):
+        return None
+    carrier = build_faceted_brep(data, graph)
+    merger = ShapeUpgrade_UnifySameDomain(carrier.shape.wrapped, True, True, False)
+    merger.SetLinearTolerance(carrier.sewing_tolerance)
+    merger.SetAngularTolerance(1e-8)
+    merger.Build()
+    shape = cq.Shape(merger.Shape())
+    faces = shape.Faces()
+    if (
+        not shape.isValid()
+        or len(shape.Solids()) != 1
+        or len(faces) >= carrier.face_count
+        or any(face.geomType() != "PLANE" for face in faces)
+        or not np.isclose(shape.Area(), carrier.shape.Area(), rtol=1e-9, atol=0)
+        or not np.isclose(shape.Volume(), carrier.shape.Volume(), rtol=1e-9, atol=0)
+    ):
+        return None
+    return SurfaceBRepResult(
+        shape=shape, graph=graph, surface_counts=carrier.surface_counts,
+        face_count=len(faces), solid_count=1, free_edge_count=0,
+        sewing_tolerance=carrier.sewing_tolerance, valid=True, closed=True,
+        topology_vertex_count=len(shape.Vertices()), topology_edge_count=len(shape.Edges()),
+        warnings=[
+            f"Recovered {len(faces)} connected planar faces by merging coplanar "
+            "source triangles without refitting their boundaries."
+        ],
     )
 
 
