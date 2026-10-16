@@ -118,6 +118,9 @@ and ten selected conversions with their remaining limits.
 The subsequent [reconstruction improvements](docs/reconstruction-improvements-2026-10-16.md)
 recover connected planar faces and constrain sparse extrusion profiles, with a
 matched ten-case comparison and 237 passing tests.
+The [dense recognition and full corpus validation](docs/dense-recognition-validation-2026-10-16.md)
+records 240 passing tests, 498/500 geometry passes and 384/500 strict CAD passes,
+with no historical pass lost.
 
 The September 17 release test evaluated 500 distinct mechanical-part STLs.
 497 passed the delivered-STEP geometry checks (99.4%); 382 also passed strict
