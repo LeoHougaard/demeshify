@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections import defaultdict
 from pathlib import Path
 
@@ -18,7 +18,13 @@ sys.path.insert(0, str(ROOT))
 from app.jobs import reconstruct_in_worker, run_bounded_process  # noqa: E402
 from app.storage import atomic_write_text  # noqa: E402
 from tools import benchmark_surface_corpus as benchmark  # noqa: E402
-from tools.build_multires_corpus import digest  # noqa: E402
+from tools.evaluation_identity import (  # noqa: E402
+    cached_result,
+    case_identity,
+    digest,
+    runtime_identity,
+    source_identity,
+)
 from tools.process_resources import sampled_resources  # noqa: E402
 
 
@@ -106,6 +112,8 @@ def summary(results: list[dict], expected: list[dict]) -> dict:
     return {
         'expected_cases': len(expected), 'evaluated_cases': len(results),
         'complete': len(results) == len(expected),
+        'fresh_cases': sum(not r.get('reused', False) for r in results),
+        'reused_cases': sum(bool(r.get('reused')) for r in results),
         'strict_case_passes': sum(bool(r.get('accepted')) for r in results),
         'strict_case_rate': (sum(bool(r.get('accepted')) for r in results) / len(results)
                              if results else None),
@@ -125,6 +133,10 @@ def main() -> None:
     parser.add_argument('--split', choices=['development', 'validation', 'holdout'])
     parser.add_argument('--worker-id', help=argparse.SUPPRESS)
     parser.add_argument('--artifacts', type=Path)
+    parser.add_argument('--case-cache', type=Path,
+                        help='Shared immutable case results (default: beside output)')
+    parser.add_argument('--fresh', action='store_true',
+                        help='Skip shared results; still resume completed cases in this run')
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text())
     cases = [c for c in manifest['cases'] if not args.split or c['split'] == args.split]
@@ -142,16 +154,25 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     cache = args.output.parent / f'{args.output.stem}_cases'
     cache.mkdir(exist_ok=True)
-    source_paths = [*sorted((ROOT / 'app').glob('*.py')), *sorted((ROOT / 'tools').glob('*.py'))]
-    source_hashes = {str(p.relative_to(ROOT)): digest(p) for p in source_paths}
-    run_contract = {'source_sha256': source_hashes, 'manifest_sha256': digest(args.manifest),
+    source_hashes = source_identity(ROOT)
+    runtime = runtime_identity()
+    revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    shared_cache = args.case_cache or args.output.parent / 'multires-case-cache'
+    shared_cache.mkdir(parents=True, exist_ok=True)
+    run_contract = {'schema': 2, 'source_sha256': source_hashes, 'runtime': runtime,
+                    'manifest_sha256': digest(args.manifest), 'fresh': args.fresh,
                     'split': args.split, 'conversion_timeout': 240, 'case_timeout': 360,
-                    'revision': subprocess.check_output(
-                        ['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()}
+                    'case_cache': str(shared_cache.resolve())}
     contract_path = args.output.with_suffix('.contract.json')
     if contract_path.exists() and json.loads(contract_path.read_text()) != run_contract:
         raise ValueError('Evaluation contract changed; preserve evidence and use a new output path')
     atomic_write_text(contract_path, json.dumps(run_contract, indent=2))
+    # Commits containing only documentation/acquisition work must not prevent
+    # resuming a frozen evaluation. Retain each invocation's actual revision.
+    launches_path = args.output.with_suffix('.launches.json')
+    launches = json.loads(launches_path.read_text()) if launches_path.exists() else []
+    launches.append({'revision': revision, 'started_unix_seconds': time.time()})
+    atomic_write_text(launches_path, json.dumps(launches, indent=2))
     results = []
     for case in cases:
         if shutil.disk_usage(args.output.parent).free < 15 * 1024**3:
@@ -159,36 +180,59 @@ def main() -> None:
         for key, expected in (('stl', 'input_sha256'), ('source_step', 'source_sha256')):
             if digest(Path(case[key])) != case[expected]:
                 raise ValueError(f'Frozen geometry changed for {case["id"]}')
-        identity = benchmark.evaluation_fingerprint(case, args.manifest, 240)
-        fingerprint = hashlib.sha256(
-            (identity + json.dumps(source_hashes, sort_keys=True)).encode()).hexdigest()
+        fingerprint = case_identity(case, source_hashes, runtime)
         path = cache / f'{case["id"]}.json'
-        result = json.loads(path.read_text()) if path.exists() else {}
-        reused = result.get('evaluation_fingerprint') == fingerprint
+        shared_path = shared_cache / f'{fingerprint}.json'
+        result = cached_result(path, fingerprint)
+        reused_from = 'this_run' if result is not None else None
+        if result is None and not args.fresh:
+            result = cached_result(shared_path, fingerprint)
+            if result is not None:
+                reused_from = 'shared_cache'
+                atomic_write_text(path, json.dumps(result, indent=2))
+        reused = result is not None
         if not reused:
             started = time.perf_counter()
+            attempt = cache / f'{case["id"]}.{uuid.uuid4().hex}.worker.json'
             command = [sys.executable, str(Path(__file__).resolve()), str(args.manifest.resolve()),
-                       '--output', str(path.resolve()), '--worker-id', case['id']]
+                       '--output', str(attempt.resolve()), '--worker-id', case['id']]
             if args.artifacts:
                 command += ['--artifacts', str(args.artifacts.resolve())]
+            resources = {}
             try:
                 with sampled_resources() as resources:
                     code = run_bounded_process(
-                        command, cwd=ROOT, timeout=360, stdout_path=path.with_suffix('.stdout.log'),
-                        stderr_path=path.with_suffix('.stderr.log'))
+                        command, cwd=ROOT, timeout=360,
+                        stdout_path=attempt.with_suffix('.stdout.log'),
+                        stderr_path=attempt.with_suffix('.stderr.log'))
                 if code:
                     raise RuntimeError(f'Grader exited {code}')
-                result = json.loads(path.read_text())
-            except (subprocess.TimeoutExpired, RuntimeError) as exc:
-                result = {'id': case['id'], 'accepted': False, 'status': 'timeout_or_crash',
-                          'error': str(exc)}
+                result = json.loads(attempt.read_text())
+            except (subprocess.TimeoutExpired, RuntimeError, json.JSONDecodeError, OSError) as exc:
+                result = {'id': case['id'], 'accepted': False,
+                          'status': 'timeout' if isinstance(exc, subprocess.TimeoutExpired)
+                          else 'crash', 'error': str(exc)}
+            # A child output is not a certified cache record. Check the frozen
+            # code/runtime/inputs before publishing it; interrupted attempts and
+            # their diagnostics remain separate and never block a clean resume.
+            if source_identity(ROOT) != source_hashes or runtime_identity() != runtime:
+                raise RuntimeError('Code or runtime changed during evaluation; attempt preserved')
+            if any(digest(Path(case[key])) != case[expected] for key, expected in (
+                ('stl', 'input_sha256'), ('source_step', 'source_sha256'),
+            )):
+                raise RuntimeError('Frozen geometry changed during evaluation; attempt preserved')
             result.update(case_wall_seconds=time.perf_counter() - started,
-                          evaluation_fingerprint=fingerprint)
+                          evaluation_fingerprint=fingerprint, conversion_revision=revision,
+                          worker_attempt=str(attempt.resolve()))
             result.update(resources)
             result.update({k: case[k] for k in ('source_model_id', 'split', 'preset')})
-            path.write_text(json.dumps(result, indent=2))
-        results.append({**result, 'reused': reused})
-        if any(digest(ROOT / name) != expected for name, expected in source_hashes.items()):
+            if args.artifacts and (args.artifacts / case['id']).is_dir():
+                result['artifact_location'] = str((args.artifacts / case['id']).resolve())
+            atomic_write_text(path, json.dumps(result, indent=2))
+            if not shared_path.exists():
+                atomic_write_text(shared_path, json.dumps(result, indent=2))
+        results.append({**result, 'reused': reused, 'reused_from': reused_from})
+        if source_identity(ROOT) != source_hashes:
             raise RuntimeError('Source changed during evaluation; do not combine results')
         aggregate = summary(results, cases)
         atomic_write_text(args.output.with_suffix('.summary.json'), json.dumps(aggregate, indent=2))
@@ -196,7 +240,7 @@ def main() -> None:
         # tens of megabytes 10,000 times; complete snapshots every 100 cases.
         if len(results) == 1 or len(results) % 100 == 0 or len(results) == len(cases):
             atomic_write_text(args.output, json.dumps({
-                'summary': aggregate, 'results': results}, indent=2))
+                'summary': aggregate, 'revision': revision, 'results': results}, indent=2))
         print(f'[{len(results)}/{len(cases)}] {case["id"]}: '
               f'{result["status"]}, strict={result["accepted"]}, reused={reused}', flush=True)
 
