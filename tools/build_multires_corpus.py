@@ -111,16 +111,24 @@ def materialize(source: Path, directory: Path, provenance: dict) -> dict:
 
 
 def main() -> None:
+    import ast
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('input', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--models', type=int, default=1000)
+    parser.add_argument('--batch-models', type=int,
+                        help='Stop after this many newly accepted models; retain full target')
+    parser.add_argument('--resume-controller-from',
+                        help='Verify a prior Git revision before upgrading its controller contract')
     parser.add_argument('--source-url', required=True)
     parser.add_argument('--license-file', type=Path, required=True)
     parser.add_argument('--source-license', required=True)
     parser.add_argument('--known-manifest', type=Path, action='append', default=[])
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.models < 1 or (args.batch_models is not None and args.batch_models < 1):
+        parser.error('Model target and batch limit must be positive')
     args.output.mkdir(parents=True, exist_ok=True)
     provenance = {'source_url': args.source_url, 'source_license': args.source_license,
                   'license_sha256': digest(args.license_file),
@@ -143,16 +151,61 @@ def main() -> None:
                 'materializer_sha256': digest(Path(__file__)),
                 'known_manifest_sha256': [digest(p) for p in args.known_manifest]}
     contract_path = args.output / 'contract.json'
-    if contract_path.exists() and json.loads(contract_path.read_text()) != json.loads(
-        json.dumps(contract)
-    ):
-        raise ValueError('Frozen export contract changed; use a new output directory')
+    if contract_path.exists():
+        previous = json.loads(contract_path.read_text())
+        current = json.loads(json.dumps(contract))
+        if previous != current:
+            if not args.resume_controller_from:
+                raise ValueError('Frozen export contract changed; use a new output directory')
+            prior_source = subprocess.check_output(
+                ['git', 'show', f'{args.resume_controller_from}:tools/build_multires_corpus.py'],
+                cwd=ROOT,
+            )
+            if hashlib.sha256(prior_source).hexdigest() != previous['materializer_sha256']:
+                raise ValueError('Prior revision does not match the frozen materializer')
+
+            def export_semantics(source):
+                tree = ast.parse(source)
+                controller = next(n for n in tree.body
+                                  if isinstance(n, ast.FunctionDef) and n.name == 'main')
+                outside = [n for n in tree.body if n is not controller]
+                worker = [n for n in controller.body if (
+                    isinstance(n, ast.Assign) and any(
+                        isinstance(t, ast.Name) and t.id == 'provenance' for t in n.targets)
+                ) or (isinstance(n, ast.If) and isinstance(n.test, ast.Attribute)
+                      and n.test.attr == 'worker')]
+                if len(worker) != 2:
+                    raise ValueError('Cannot identify unchanged export worker')
+                return ast.dump(ast.Module(body=outside + worker, type_ignores=[]))
+
+            if export_semantics(prior_source) != export_semantics(Path(__file__).read_bytes()):
+                raise ValueError('Export semantics changed; controller-only resume refused')
+            if {k: v for k, v in previous.items() if k != 'materializer_sha256'} != {
+                k: v for k, v in current.items() if k != 'materializer_sha256'
+            }:
+                raise ValueError('Frozen fixture settings or provenance changed')
+            history = args.output / 'contract-history'
+            history.mkdir(exist_ok=True)
+            save(history / f'{previous["materializer_sha256"]}.json', previous)
+            save(history / f'{current["materializer_sha256"]}-migration.json', {
+                'previous_contract': previous, 'new_contract': current,
+                'verified_prior_revision': args.resume_controller_from,
+                'verification': 'Identical non-controller AST, provenance and worker branch',
+            })
     save(contract_path, contract)
     sources = sorted(args.input.glob('*.st*p'), key=lambda p: hashlib.sha256(
         p.stem.encode()).hexdigest())
     records_dir = args.output / 'records'
     records_dir.mkdir(exist_ok=True)
+    manifest_path = args.output / 'manifest.json'
+    previous_models = ({c['source_model_id'] for c in json.loads(
+        manifest_path.read_text())['cases']} if manifest_path.exists() else set())
+    if len(previous_models) > args.models:
+        raise ValueError('Target would discard previously accepted sources')
     accepted, excluded, file_hashes, signatures = [], [], set(), set()
+    accepted_models = set()
+    new_accepted = 0
+    batch_complete = False
     for index, source in enumerate(sources):
         if len(accepted) == args.models:
             break
@@ -164,7 +217,10 @@ def main() -> None:
             continue
         file_hashes.add(source_hash)
         record_path = records_dir / f'{source_hash}.json'
-        if record_path.exists():
+        cached = record_path.exists()
+        if not cached and batch_complete:
+            continue
+        if cached:
             record = json.loads(record_path.read_text())
             if record.get('status') == 'usable' and any(
                 not Path(c['stl']).is_file() or digest(Path(c['stl'])) != c['input_sha256']
@@ -201,14 +257,31 @@ def main() -> None:
                     case['split'] = 'development'
                     case['historically_exposed'] = True
             accepted.append(record)
+            accepted_models.add(record['cases'][0]['source_model_id'])
+            if not cached:
+                new_accepted += 1
         manifest = {'contract': contract, 'requested_models': args.models,
                     'source_model_count': len(accepted), 'case_count': len(accepted) * 10,
                     'complete': len(accepted) == args.models,
+                    'batch_new_models': new_accepted, 'batch_limit_models': args.batch_models,
                     'cases': [c for r in accepted for c in r['cases']], 'exclusions': excluded}
-        save(args.output / 'manifest.json', manifest)
+        # Replaying cached records must not temporarily shrink the durable
+        # manifest if the controller is interrupted before reaching its prefix.
+        if previous_models <= accepted_models:
+            save(manifest_path, manifest)
         print(f'[{index + 1}/{len(sources)}] {len(accepted)}/{args.models} usable models; '
               f'{len(excluded)} excluded', flush=True)
-    if len(accepted) != args.models:
+        if args.batch_models is not None and new_accepted >= args.batch_models:
+            batch_complete = True
+            if previous_models <= accepted_models:
+                break
+    if not previous_models <= accepted_models:
+        raise ValueError('Previously accepted sources disappeared; original manifest preserved')
+    if batch_complete:
+        print(f'Batch complete: {new_accepted} new models; full corpus '
+              f'{len(accepted)}/{args.models} (complete={len(accepted) == args.models})',
+              flush=True)
+    elif len(accepted) != args.models:
         raise RuntimeError('Insufficient usable distinct sources; manifest is explicitly partial')
 
 

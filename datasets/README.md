@@ -42,7 +42,7 @@ new holdout. Do not treat this filename convention as universal for other data.
 
 ```powershell
 python tools/build_multires_corpus.py path/to/breps/step `
-  --output benchmarks/multires-1000 --models 1000 `
+  --output benchmarks/multires-1000 --models 1000 --batch-models 25 `
   --source-url https://github.com/AutodeskAILab/Fusion360GalleryDataset `
   --source-license "Fusion 360 Gallery Dataset License (non-commercial research)" `
   --license-file path/to/LICENSE.md --known-manifest path/to/previous-manifest.json
@@ -57,6 +57,17 @@ conservative geometric signature collisions and repeated preset meshes remain
 in an exclusion ledger and are replaced from later sources. Partial acquisition
 is explicitly marked incomplete. Excluding unchanged planar tessellations biases
 this corpus toward curved shapes; retain planar regression anchors separately.
+
+`--batch-models` limits **newly accepted** sources in one invocation, excluding
+cached sources and fixture failures. It exits successfully at the batch boundary
+while retaining the full 1,000-source target and an explicit incomplete manifest.
+Omit it to continue until the target or a real resource limit. Cached replay
+preserves the previous larger manifest until all its sources have been verified.
+The existing frozen exporter can adopt this controller-only change with
+`--resume-controller-from 85beea1`: it verifies the prior Git file against the
+frozen hash, unchanged non-controller/worker syntax and unchanged settings and
+provenance, then retains the original contract and migration proof. Changed
+geometry/export code requires a separate corpus; the option cannot approve it.
 
 The evaluator launches conversion with a neutral STL only and reads reference
 geometry afterward. It adds reference deviation, dimensions, exact CAD volume
