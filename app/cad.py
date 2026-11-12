@@ -653,20 +653,15 @@ def export_plan(
     normalize_plan(plan)
     result = build_plan(plan)
     cq.exporters.export(result, str(directory / "reconstruction.step"))
-    if high_quality_stl:
-        cq.exporters.export(
-            result,
-            str(directory / "reconstruction.stl"),
-            tolerance=0.01,
-            angularTolerance=0.04,
-        )
-    else:
-        cq.exporters.export(
-            result,
-            str(directory / "reconstruction.stl"),
-            tolerance=0.02,
-            angularTolerance=0.1,
-        )
+    preview_shape = cq.Compound.makeCompound(result.vals())
+    if not preview_shape.exportStl(
+        str(directory / "reconstruction.stl"),
+        tolerance=0.01 if high_quality_stl else 0.02,
+        angularTolerance=0.04 if high_quality_stl else 0.1,
+        relative=True,
+        parallel=False,
+    ):
+        raise ValueError("Could not write reconstructed STL preview")
     (directory / "reconstruction.py").write_text(plan_to_source(plan), encoding="utf-8")
     (directory / "plan.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
     return result

@@ -5376,12 +5376,14 @@ def export_surface_brep(
     ):
         shutil.copy2(source_stl_path, reconstruction_stl)
     else:
-        cq.exporters.export(
-            result.shape,
+        if not result.shape.exportStl(
             str(reconstruction_stl),
             tolerance=max(min(result.sewing_tolerance * 0.5, 0.01), 1e-7),
             angularTolerance=0.04,
-        )
+            relative=True,
+            parallel=False,
+        ):
+            raise ValueError("Could not write reconstructed STL preview")
     (directory / "surface_graph.json").write_text(
         json.dumps(
             surface_graph_json(

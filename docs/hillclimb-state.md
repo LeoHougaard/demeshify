@@ -130,8 +130,11 @@ fine export and reduced conversion time 109.46 to 40.93 seconds, with greater
 sampled memory (2.01 to 2.81 GB). The affected source reaches 8/10, still failing
 all-ten acceptance. Its hole's Euler signature and five visual sections match
 the reference. Fragmented trim chains remain: the delivered STEP has 1,011
-edges. Share complete periodic rims next, and make STL preview export explicitly
-serial as a separate resource change. Acquisition reached 99/990 usable inputs;
+edges. Share complete periodic rims next. The separate V12 resource correction
+makes STL preview export explicitly serial while preserving the recovered
+case's exact STEP data and 119,174-triangle preview geometry, all three matched
+strict controls and both disconnected-body CAD export modes. See
+`docs/serial-preview-export-2026-11-12.md`. Acquisition reached 99/990 usable inputs;
 20 additional licensed KiCad STEP downloads are not counted until qualified.
 
 Expand checks after a
