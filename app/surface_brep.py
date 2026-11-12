@@ -1093,37 +1093,98 @@ def _shared_trim_edges(
         for adjacency in graph.adjacency
         for points in adjacency.boundary_curves
     ]
+    endpoints, canonical_vertices = _canonical_vertices(records, models, tolerance)
     overrides: dict[int, _TrimEdge] = {}
     for patch_id, face in (annular_faces or {}).items():
         borders = [(index, second if first == patch_id else first, points)
                    for index, (first, second, points) in enumerate(records)
                    if patch_id in (first, second)]
-        closed_edges = [edge.wrapped for edge in cq.Face(face).Edges()
-                        if BRep_Tool.IsClosed_s(edge.wrapped)]
-        if len(borders) != 2 or len(closed_edges) != 2:
+        face_edges = cq.Face(face).Edges()
+        patch = graph.patch(patch_id)
+        open_band = bool(
+            isinstance(patch, LinearExtrusionPatch) and len(face_edges) == 4
+            and np.linalg.norm(patch.profile_points[0] - patch.profile_points[-1]) > 1e-7
+        )
+        eligible_edges = [edge.wrapped for edge in face_edges
+                          if open_band or BRep_Tool.IsClosed_s(edge.wrapped)]
+        expected_borders = 4 if open_band else 2
+        if len(borders) != expected_borders or len(eligible_edges) != expected_borders:
             continue
+        if open_band:
+            vertices = cq.Face(face).Vertices()
+            if len(vertices) != 4:
+                continue
+            reshaper = BRepTools_ReShape()
+            for vertex in vertices:
+                point = np.asarray(vertex.toTuple())
+                matches = []
+                for index, _, points in borders:
+                    limit = max(float(np.linalg.norm(np.ptp(points, axis=0))) * 1e-4, 1e-7)
+                    for endpoint in (0, 1):
+                        canonical = endpoints.get((index, endpoint))
+                        source_point = points[0 if endpoint == 0 else -1]
+                        if (canonical is not None and np.linalg.norm(point - source_point) <= limit
+                                and np.linalg.norm(point - canonical.point) <= limit):
+                            matches.append((np.linalg.norm(point - canonical.point), canonical))
+                if not matches:
+                    break
+                _, canonical = min(matches, key=lambda item: item[0])
+                reshaper.Replace(
+                    vertex.wrapped, canonical.vertex.Oriented(vertex.wrapped.Orientation()),
+                )
+            else:
+                replaced = reshaper.Apply(face)
+                if replaced.ShapeType() != TopAbs_FACE:
+                    continue
+                face = TopoDS.Face_s(replaced)
+                if not _usable_face(face, tolerance):
+                    continue
+                eligible_edges = [edge.wrapped for edge in cq.Face(face).Edges()]
+            if not matches:
+                continue
         proposed: dict[int, _TrimEdge] = {}
-        available = list(closed_edges)
+        available = list(eligible_edges)
         for index, neighbor_id, points in borders:
             neighbor = models.get(neighbor_id)
             if neighbor is None or not isinstance(neighbor.patch, PlanarPatch):
                 break
-            if len(points) < 5 or np.linalg.norm(points[0] - points[-1]) > 1e-7:
+            if len(points) < (2 if open_band else 5):
+                break
+            if not open_band and np.linalg.norm(points[0] - points[-1]) > 1e-7:
                 break
             candidates = []
             for edge in available:
-                curve = BRepAdaptor_Curve(edge).Curve().Curve()
+                local_limit = max(float(np.linalg.norm(np.ptp(points, axis=0))) * 1e-4, 1e-7)
+                if open_band:
+                    ends = [np.asarray(vertex.toTuple()) for vertex in cq.Edge(edge).Vertices()]
+                    # An infinite supporting curve is insufficient: this must
+                    # be the same complete finite border, in either direction.
+                    if len(ends) != 2 or min(
+                        max(np.linalg.norm(points[0] - ends[0]),
+                            np.linalg.norm(points[-1] - ends[1])),
+                        max(np.linalg.norm(points[0] - ends[1]),
+                            np.linalg.norm(points[-1] - ends[0])),
+                    ) > local_limit:
+                        continue
+                adaptor = BRepAdaptor_Curve(edge)
+                curve = adaptor.Curve().Curve()
                 error, parameters = _project_parameters(points, curve)
                 if not len(parameters):
                     continue
                 samples = np.asarray([point.toTuple() for point in cq.Edge(edge).sample(64)[0]])
                 plane_error = np.max(np.abs(
                     (samples - neighbor.patch.origin) @ neighbor.patch.normal))
-                local_limit = max(float(np.linalg.norm(np.ptp(points, axis=0))) * 1e-4, 1e-7)
                 if error <= local_limit and plane_error <= local_limit:
                     try:
                         for point in points:
-                            projection = GeomAPI_ProjectPointOnCurve(_point(point), curve)
+                            projection = (
+                                GeomAPI_ProjectPointOnCurve(
+                                    _point(point), curve,
+                                    adaptor.FirstParameter(), adaptor.LastParameter(),
+                                ) if open_band else GeomAPI_ProjectPointOnCurve(
+                                    _point(point), curve,
+                                )
+                            )
                             if (not projection.NbPoints()
                                     or projection.LowerDistance() > local_limit):
                                 break
@@ -1136,9 +1197,10 @@ def _shared_trim_edges(
             _, edge = min(candidates, key=lambda item: item[0])
             proposed[index] = _TrimEdge(edge, points, points.copy())
             available = [item for item in available if not item.IsSame(edge)]
-        if len(proposed) == 2:
+        if len(proposed) == expected_borders:
             overrides.update(proposed)
-    endpoints, canonical_vertices = _canonical_vertices(records, models, tolerance)
+            if open_band:
+                annular_faces[patch_id] = face
     vertex_occurrences = Counter(id(vertex) for vertex in endpoints.values())
     canonical_edge_count = 0
     for record_index, (first_id, second_id, points) in enumerate(records):
@@ -3218,6 +3280,36 @@ def _profile_chord_anchors(profile: np.ndarray, maximum_points: int = 128) -> np
     return np.asarray(anchored)
 
 
+def _merged_planar_patch_face(
+    faces: list[TopoDS_Face], source_points: np.ndarray, tolerance: float,
+) -> TopoDS_Face | None:
+    """Recover one complete plane from connected coplanar source triangles."""
+    if not 2 <= len(faces) <= 1500:
+        return None
+    try:
+        compound = cq.Compound.makeCompound([cq.Face(face) for face in faces])
+        copied = BRepBuilderAPI_Copy(compound.wrapped).Shape()
+        merger = ShapeUpgrade_UnifySameDomain(copied, True, True, False)
+        merger.SetLinearTolerance(1e-7)
+        merger.SetAngularTolerance(1e-8)
+        merger.Build()
+        merged = cq.Shape(merger.Shape()).Faces()
+        if len(merged) != 1 or merged[0].geomType() != "PLANE":
+            return None
+        face = merged[0]
+        if (not _usable_face(face.wrapped, tolerance * 0.01)
+                or not np.isclose(face.Area(), compound.Area(), rtol=1e-9, atol=0)):
+            return None
+        normal = np.asarray(face.normalAt().toTuple())
+        origin = np.asarray(face.Center().toTuple())
+        if float(np.max(np.abs((source_points - origin) @ normal))) > 1e-7:
+            return None
+        return face.wrapped
+    except Exception:
+        return None
+
+
+
 def _linear_extrusion_face(
     patch: LinearExtrusionPatch,
     edges: list[_TrimEdge],
@@ -4661,8 +4753,9 @@ def _build_surface_brep_single(
     annular_faces: dict[str, TopoDS_Face] = {}
     for patch in graph.extrusion_patches:
         profile = np.asarray(patch.profile_points, dtype=float)
-        if (not 0 < len(patch.vertex_indices) <= 1500 or not 5 <= len(profile) <= 500
-                or np.linalg.norm(profile[0] - profile[-1]) > 1e-7):
+        if not 0 < len(patch.vertex_indices) <= 1500 or not 4 <= len(profile) <= 500:
+            continue
+        if len(profile) == 4 and np.linalg.norm(profile[0] - profile[-1]) <= 1e-7:
             continue
         direction_length = float(np.linalg.norm(patch.direction))
         if (not math.isfinite(direction_length) or direction_length <= 1e-12
@@ -4773,7 +4866,7 @@ def _build_surface_brep_single(
             progress_callback(f"surface_face_start patch={patch.patch_id} kind={patch.kind}")
         annular = annular_faces.get(patch.patch_id)
         shared = trim_edges.get(patch.patch_id, [])
-        if annular is not None and len(shared) == 2 and all(
+        if annular is not None and len(shared) in (2, 4) and all(
             any(edge.edge.IsSame(candidate.wrapped) for candidate in cq.Face(annular).Edges())
             for edge in shared
         ):
@@ -4898,7 +4991,30 @@ def _build_surface_brep_single(
                     and _usable_face(planar_face, tolerance * 0.01)
                     for planar_face in planar_faces
                 ):
+                    merged = _merged_planar_patch_face(
+                        planar_faces,
+                        np.asarray(data.mesh.vertices[patch.vertex_indices]), tolerance,
+                    )
+                    if merged is not None:
+                        faces.append(merged)
+                        if progress_callback is not None:
+                            progress_callback(
+                                f"surface_planar_patch_merged patch={patch.patch_id} "
+                                f"faces={len(planar_faces)}"
+                            )
+                        continue
                     faces.extend(planar_faces)
+                    # Retaining source triangles is still a fallback, even
+                    # when every triangle lies on a recognized plane. Keep
+                    # strict acceptance and the inspection overlay truthful.
+                    faceted_face_count += len(planar_faces)
+                    faceted_patch_count += 1
+                    faceted_patch_ids.append(patch.patch_id)
+                    if progress_callback is not None:
+                        progress_callback(
+                            f"surface_face_faceted patch={patch.patch_id} kind=plane "
+                            f"faces={len(planar_faces)}"
+                        )
                     continue
             analytic_failures.append(patch.kind)
             if isinstance(patch, ToroidalPatch):
@@ -5092,7 +5208,7 @@ def _build_surface_brep_single(
         )
     if faceted_patch_count:
         warnings.append(
-            f"Retained {faceted_patch_count} unfitted residual "
+            f"Retained {faceted_patch_count} surface "
             f"region{'s' if faceted_patch_count != 1 else ''} as "
             f"{faceted_face_count} B-rep facets. Analytic boundary conformance "
             "was used where topologically safe; tiny transition facets kept "

@@ -1,5 +1,25 @@
 # Demeshify hill climb
 
+## Latest qualification, November 12
+
+V21 is locally qualified: truthful planar fallback reporting, complete planar
+patch recovery and canonical open-extrusion junctions. Source SHA-256 is
+`299ef8c7f98f5e8e8ee7f1b600513f7cb7c67a94ecb8eb247a40fdb229d8499e`.
+The corrected V15 baseline is 12/20 strict, rather than its historically reported
+13/20: one coarse output had 132 unreported source facets. V21 genuinely recovers
+that case as 19 CAD faces and zero retained facets, giving 13/20 with no lost pass
+and 20/20 geometry across five designs. Nine separate validation cases and three
+private geometry controls retain their outcomes; all 303 tests and Ruff pass.
+Both inspected target STEP files retain the reference's through-hole topology.
+The tiny coarse hole remains polygonal. See
+[the matched evidence and commands](canonical-planar-recovery-2026-11-12.md).
+
+The composed corpus is 359 sources / 3,590 inputs, explicitly partial, with a
+further bounded acquisition batch underway. The full 1,000-source / 10,000-input
+baseline, production OS isolation and additional cross-model hill climbing
+remain unfinished. Earlier sections below preserve the experiment history;
+their old strict counts and smaller fixture totals are superseded by this note.
+
 ## Contract and current best
 
 Started November 12, 2026 from reliability branch

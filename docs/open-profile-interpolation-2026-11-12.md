@@ -1,5 +1,12 @@
 # Local open-profile interpolation
 
+Later reporting correction: the 13/20 and ten-of-ten counts below are historical
+reported-gate results. The coarse q01 output retained 132 planar source facets
+without reporting them. With truthful counters, V15 passes 12/20 and nine of
+that source's ten exports. See
+[complete planar recovery](canonical-planar-recovery-2026-11-12.md) for the actual
+repair, corrected matched comparison and remaining fidelity limitations.
+
 ## Failure and experiment
 
 The frozen coarse development export `5b7f2dd6f8dee0946745-q01` was rejected
