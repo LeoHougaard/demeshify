@@ -7,8 +7,9 @@ Started November 12, 2026 from reliability branch
 The registered annular-boundary candidate V9 is merged in PR #2. Its exact
 head `1f4d35d` and main merge `724953f` both passed repository CI. The denser
 interior extension V10 is merged in PR #3; both `a510c2c` and main `0bd4001`
-passed CI. Periodic closed extrusion fitting V11 is now the strongest locally
-verified candidate; see `docs/periodic-extrusion-recovery-2026-11-12.md`.
+passed CI. Periodic closed extrusion fitting V11 and serial preview export V12
+are merged in PR #4; exact head `3d0edf6` and main merge `ac5e266` passed CI.
+See `docs/periodic-extrusion-recovery-2026-11-12.md`.
 Development strict recovery improves from 8 to 11 of 20 cases, without losing
 a prior pass. Nine separate validation cases and three private geometry
 controls retain their outcomes; the full 263-test local suite passes.
@@ -136,6 +137,29 @@ case's exact STEP data and 119,174-triangle preview geometry, all three matched
 strict controls and both disconnected-body CAD export modes. See
 `docs/serial-preview-export-2026-11-12.md`. Acquisition reached 99/990 usable inputs;
 20 additional licensed KiCad STEP downloads are not counted until qualified.
+
+The next bounded primary batch has reached 199 sources / 1,990 inputs. Five
+licensed public KiCad sources add 50 qualified exports, including a two-solid
+model. The composed, globally deduplicated partial corpus is **204 sources /
+2,040 inputs**, explicitly incomplete. The predeclared final quotas are 980
+Fusion sources plus 20 KiCad sources. The acquisition and composition tools
+are merged in PR #5; head `ee9838f` and main merge `b83d60f` passed CI. Seven
+further licensed public replacements have been acquired but do not count
+until native qualification. Family groups were declared before conversion.
+
+V13 reuses complete periodic extrusion rims on both planar caps and checks
+every boundary node before replacing a trim chain. Its matched development
+20 retain 11 strict / 20 geometry passes, validation nine retain nine strict
+passes and private three retain three geometry passes / two smooth outputs.
+The fine target drops from 1,011 to 497 delivered STEP edges with unchanged
+maximum deviations; its volume error increases slightly within the same gate.
+All 276 tests and Ruff pass. Independent STEP reopening retains the reference's
+single-solid tunnel topology. V13 is locally promoted for trim complexity and
+targeted resource gains; repository head and merge CI remain to qualify. See
+`docs/shared-extrusion-rims-2026-11-12.md`. The two unresolved exports retain
+their original failures: the coarser one has a 1.34 mm fitted-geometry error;
+the middle-fine one fails STEP round-trip validity after a residual C0 fill.
+Inspect their actual trimmed geometry next, independently of the source CAD.
 
 Expand checks after a
 candidate earns them: targeted failure plus passing controls, all ten variants
