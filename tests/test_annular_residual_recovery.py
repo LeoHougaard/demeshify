@@ -6,14 +6,14 @@ from app.surface_brep import _closed_loop_loft_face, _shared_trim_edges, _surfac
 from app.surface_graph import FreeformPatch, PlanarPatch, SurfaceAdjacency, SurfaceGraph
 
 
-def annular_patch(bow=0.0, radial_scale=1.0, height_scale=1.0):
+def annular_patch(bow=0.0, radial_scale=1.0, height_scale=1.0, layers=3):
     angle = np.linspace(0, 2 * np.pi, 48, endpoint=False)
     profile = radial_scale * np.column_stack((np.cos(angle), np.zeros(48), 0.6 * np.sin(angle)))
-    rings = [profile * scale + (0, height * height_scale, 0)
-             for scale, height in ((1, 0), (1.1 + bow, 0.5), (1.2, 1))]
+    rings = [profile * (1 + 0.2 * t + bow * np.sin(np.pi * t))
+             + (0, t * height_scale, 0) for t in np.linspace(0, 1, layers)]
     vertices = np.vstack(rings)
     faces = []
-    for row in range(2):
+    for row in range(layers - 1):
         for column in range(48):
             following = (column + 1) % 48
             a, b = row * 48 + column, row * 48 + following
@@ -65,6 +65,14 @@ def test_annular_loft_is_independent_of_boundary_loop_start_and_winding():
 
 def test_annular_loft_rejects_unsupported_interior_bulge():
     patch, mesh = annular_patch(bow=0.2)
+    assert _closed_loop_loft_face(patch, mesh, 0.003) is None
+
+
+def test_dense_interior_retains_boundary_fit_and_checks_all_support_nodes():
+    patch, mesh = annular_patch(layers=22)
+    assert len(patch.vertex_indices) > 500
+    assert _closed_loop_loft_face(patch, mesh, 0.003) is not None
+    mesh.vertices[48 * 11] *= 1.5
     assert _closed_loop_loft_face(patch, mesh, 0.003) is None
 
 

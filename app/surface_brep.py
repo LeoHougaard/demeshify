@@ -2921,7 +2921,8 @@ def _closed_loop_loft_face(
     patch: FreeformPatch, mesh: object, tolerance: float,
 ) -> TopoDS_Face | None:
     """Fit an annular residual from its two loops, checking every support node."""
-    if len(patch.boundary_loops) != 2 or len(patch.vertex_indices) > 500:
+    if (len(patch.boundary_loops) != 2 or len(patch.vertex_indices) > 1500
+            or sum(len(loop) for loop in patch.boundary_loops) > 502):
         return None
     loops = [np.asarray(loop, dtype=float) for loop in patch.boundary_loops]
     if any(len(loop) < 5 or np.linalg.norm(loop[0] - loop[-1]) > 1e-7 for loop in loops):
@@ -4629,7 +4630,8 @@ def _build_surface_brep_single(
             models[patch.patch_id] = model
     annular_faces: dict[str, TopoDS_Face] = {}
     for patch in graph.freeform_patches:
-        if len(patch.boundary_loops) != 2 or len(patch.vertex_indices) > 500:
+        if (len(patch.boundary_loops) != 2 or len(patch.vertex_indices) > 1500
+                or sum(len(loop) for loop in patch.boundary_loops) > 502):
             continue
         if _graph_bspline_face_impl(patch, [], data.mesh, tolerance) is not None:
             continue
