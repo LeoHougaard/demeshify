@@ -3229,6 +3229,12 @@ def _linear_extrusion_face(
     profile = np.asarray(patch.profile_points, dtype=float)
     if len(profile) < 4:
         return None
+    if np.linalg.norm(profile[0] - profile[-1]) > 1e-7:
+        # A zero-length span carries no geometry but can destabilize the global
+        # spline approximation. Keep all distinct nodes, including close bends.
+        keep = np.r_[True, np.linalg.norm(np.diff(profile, axis=0), axis=1) > 1e-12]
+        if np.count_nonzero(keep) >= 4:
+            profile = profile[keep]
     periodic_profile = bool(
         len(profile) <= 500 and np.linalg.norm(profile[0] - profile[-1]) <= 1e-7
     )
@@ -3249,14 +3255,15 @@ def _linear_extrusion_face(
     # two slightly different B-splines fitted to the same STL node chain.
     curve_tolerance = max(tolerance * 0.5, curve_scale * 1e-5, 1e-8)
     try:
-        if periodic_profile:
-            periodic_points = TColgp_HArray1OfPnt(1, len(profile) - 1)
-            for index, point in enumerate(profile[:-1], start=1):
-                periodic_points.SetValue(index, _point(point))
+        if periodic_profile or not closed:
+            interpolation_nodes = profile[:-1] if periodic_profile else profile
+            interpolation_points = TColgp_HArray1OfPnt(1, len(interpolation_nodes))
+            for index, point in enumerate(interpolation_nodes, start=1):
+                interpolation_points.SetValue(index, _point(point))
             lengths = np.linalg.norm(np.diff(profile, axis=0), axis=1)
             positive = lengths[lengths > 1e-12]
             fit_tolerance = min(curve_tolerance, max(float(np.min(positive)) * 0.02, 1e-8))
-            fit = GeomAPI_Interpolate(periodic_points, True, fit_tolerance)
+            fit = GeomAPI_Interpolate(interpolation_points, periodic_profile, fit_tolerance)
             fit.Perform()
         else:
             fit = GeomAPI_PointsToBSpline(

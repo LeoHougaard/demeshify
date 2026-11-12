@@ -10,9 +10,13 @@ interior extension V10 is merged in PR #3; both `a510c2c` and main `0bd4001`
 passed CI. Periodic closed extrusion fitting V11 and serial preview export V12
 are merged in PR #4; exact head `3d0edf6` and main merge `ac5e266` passed CI.
 See `docs/periodic-extrusion-recovery-2026-11-12.md`.
-Development strict recovery improves from 8 to 11 of 20 cases, without losing
-a prior pass. Nine separate validation cases and three private geometry
-controls retain their outcomes; the full 263-test local suite passes.
+V13 shared periodic rims are merged in PR #6, head `6ead82d`, main `06232b9`;
+both passed CI. V15 local open-profile interpolation is the strongest locally
+verified reconstruction candidate, improving the original development strict
+count from 8 to 13 of 20 cases without losing a prior pass. Nine separate
+validation cases and three private geometry controls retain their outcomes;
+all 287 local tests pass. See `docs/open-profile-interpolation-2026-11-12.md`
+for exact source, unchanged gates and remaining surface-quality limitations.
 The October
 498/500 geometry, 384/500 strict CAD and 406/500 non-faceted results are
 historical, not a fresh baseline. Existing source and private geometry remain
@@ -155,11 +159,35 @@ The fine target drops from 1,011 to 497 delivered STEP edges with unchanged
 maximum deviations; its volume error increases slightly within the same gate.
 All 276 tests and Ruff pass. Independent STEP reopening retains the reference's
 single-solid tunnel topology. V13 is locally promoted for trim complexity and
-targeted resource gains; repository head and merge CI remain to qualify. See
+targeted resource gains; exact head `6ead82d` and merge `06232b9` passed CI. See
 `docs/shared-extrusion-rims-2026-11-12.md`. The two unresolved exports retain
 their original failures: the coarser one has a 1.34 mm fitted-geometry error;
 the middle-fine one fails STEP round-trip validity after a residual C0 fill.
 Inspect their actual trimmed geometry next, independently of the source CAD.
+
+V14's repeated-node removal alone repaired the coarse spline fit, but failed
+the unchanged 0.12 mm reference dimension gate and was not promoted for strict
+recovery. V15's local open interpolation also recovers the remaining invalid
+middle-fine export. The matched 20 improve 11 to 13 strict, geometry remains
+20/20, and the affected source improves eight to ten accepted exports. This
+is one fully evaluated source among five development designs, not a full-corpus
+model rate. Coarse planar caps remain fragmented and the small coarse hole is
+visibly polygonal; full original smooth-feature semantics are not established.
+Independent STEP reopening and sections preserve the tunnel for both recoveries.
+
+The current composed fixture snapshot has **304 distinct sources / 3,040 STL
+inputs**, explicitly partial, after a clean 100-new-source primary batch.
+Progressive evaluation now reuses identical cases with frozen code/runtime/input
+identity and keeps raw attempts separate from certified cache records. The
+controller milestone is merged in PR #7; head `09489ca` and main `271cdc6`
+passed CI. See `docs/progressive-evaluation-cache-2026-11-12.md`.
+
+A task-specific per-user/per-app Windows AppContainer profile and native
+file-access probe have been established. Access grants were limited to its
+new job folder, with no changes to existing app permissions or global settings.
+The probe can write its job and cannot read the grader sentinel. Actual Python
+conversion and native STEP-denial proof remain unverified; do not claim the full
+reference-isolation requirement is complete yet.
 
 Expand checks after a
 candidate earns them: targeted failure plus passing controls, all ten variants
