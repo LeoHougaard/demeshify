@@ -105,6 +105,64 @@ and below normal Windows priority, with a 15 GiB free-disk floor. Memory reports
 are one-second sampled sums of process-tree working sets, not physical RAM peaks.
 Generated geometry, records, reference paths and private anchors stay out of Git.
 
+## Mixed licensed collections
+
+`tools/acquire_kicad_step.py` downloads actual STEP assets from the KiCad
+library at `b8b3cfdfad88ba66f21002b3de51dc6f7d55ba5a`, verifies the pinned Git
+blob and SHA256, and resumes from verified files. The repository declares
+[CC-BY-SA 4.0 with the KiCad library exception](https://github.com/KiCad/kicad-packages3D/blob/b8b3cfdfad88ba66f21002b3de51dc6f7d55ba5a/LICENSE.md).
+The license, intact STEP headers, attribution and source index stay beside the
+local assets. The initial 20-file selection's headers were checked; the two
+explicit per-file license notices agree with the repository license. Review
+headers of additional assets before materializing them. No geometry is
+redistributed by this repository.
+
+The first twenty downloads are fixed category quotas selected alphabetically
+before conversion outcomes. Related component families are declared before
+export/evaluation. Additional replacement categories require an explicit shared
+family label. Downloads alone are not usable fixtures: invalid references,
+failed/non-distinct exports and duplicate geometry remain acquisition exclusions.
+
+```powershell
+python tools/acquire_kicad_step.py --output benchmarks/kicad-step-b8b3cfdf
+python tools/build_multires_corpus.py benchmarks/kicad-step-b8b3cfdf/raw `
+  --output benchmarks/kicad-step-b8b3cfdf/fixtures --models 40 --batch-models 5 `
+  --source-url https://github.com/KiCad/kicad-packages3D/tree/b8b3cfdfad88ba66f21002b3de51dc6f7d55ba5a `
+  --source-license "CC-BY-SA-4.0 with KiCad library exception" `
+  --license-file benchmarks/kicad-step-b8b3cfdf/LICENSE.md
+python tools/assemble_multires_corpus.py `
+  --collection benchmarks/multires-1000/manifest.json 980 `
+  --collection benchmarks/kicad-step-b8b3cfdf/fixtures/manifest.json 20 `
+  --source-index benchmarks/kicad-step-b8b3cfdf/source-index.json `
+  --output benchmarks/multires-combined/partial.json
+```
+
+The raw collection targets are acquisition buffers. The composed target is
+exactly **980 + 20 = 1,000 sources**, with ten inputs per source. Additional
+licensed replacements are necessary until the quotas survive fixture checks
+and cross-collection deduplication. This predeclared mix adds electromechanical
+parts and multiple-solid coverage while retaining Fusion Gallery's mechanical
+geometry. It still has collection and small-component sampling biases.
+
+`assemble_multires_corpus.py` preserves the input bytes/settings, applies source
+index provenance/family splits to all ten variants, validates hashes against
+the materialization record, and excludes duplicate bytes or conservative
+volume/area/principal-inertia signatures (relative tolerance 1e-6). Signature
+collisions may exclude different designs; this is not a certificate of arbitrary
+geometric inequivalence. Historical development families remain development.
+Each source has exactly ten distinct presets and mesh geometries; no family
+crosses splits. Multiple tessellations are not independent designs.
+
+The command saves exact input-manifest and source-index snapshots and refuses
+to overwrite an existing composed output. Choose a new output path for another
+partial checkpoint. Add `--freeze` only for the final 1,000-source composition:
+it refuses incomplete quotas. Run the baseline against that immutable file.
+The reviewed mixed checkpoint contains 204 sources / 2,040 actual STL inputs,
+including a two-solid component, and is explicitly incomplete. Acquiring or
+grading a partial checkpoint never satisfies the full 10,000-case requirement.
+Use the composed manifest for evaluation: its indexed family declarations
+replace filename conventions for the non-Fusion collections before conversion.
+
 ## Pinned open-source assemblies
 
 `materialize_assembly_corpus.py` builds a strict corpus when a project publishes
