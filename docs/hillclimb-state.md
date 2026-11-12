@@ -70,7 +70,7 @@ runtime; original full-run evidence must never be overwritten by a candidate.
 - `benchmarks/multires-smoke/`: one genuine public source and ten distinct
   exports; first full-pipeline smoke evaluation completed with 10/10 strict
   and reference geometry passes. One source model is not a corpus rate.
-- `benchmarks/multires-1000/`: full 1,000-source acquisition/export is running
+- `benchmarks/multires-1000/`: full 1,000-source acquisition/export is resumable
   serially. Source byte hashes, signature exclusions, preset meshes and split
   membership are retained locally. Neither 1,000 sources nor the 10,000-case
   baseline is complete yet. No reconstruction gain is claimed.
@@ -81,8 +81,25 @@ runtime; original full-run evidence must never be overwritten by a candidate.
 
 ## Next work
 
-Finish and harden the tiny workflow, freeze the complete 1,000-source cohort,
-materialize all 10,000 fixtures, and establish the real serial baseline.
+Leo explicitly steered this on November 12: balance acquisition, speed and
+reconstruction improvements progressively; do not wait for all inputs or run
+all 10,000 before starting improvements. Acquisition was stopped with completed
+records preserved so it no longer occupies the sole local evaluation slot.
+
+`tools/select_multires_cohort.py` freezes a development-only inner cohort from
+complete source bundles. It balances solid-count/surface-type strata and picks
+lower triangle cost within each stratum, without looking at solve outcomes.
+`benchmarks/multires-1000/inner-six.json` contains six source models and three
+presets (coarse, middle, fine), 18 cases. This is selected development evidence,
+not an unbiased corpus estimate. Personal difficult anchors remain additional
+regressions. Other resolutions of the same sources are not independent holdout.
+
+Run matched inner-cohort baselines and candidates now. Expand checks after a
+candidate earns them: targeted failure plus passing controls, all ten variants
+of affected development sources, then broader validation and justified full
+corpus evaluation. Resume fixture acquisition in separate serial batches
+between experiments, preserving the 1,000-source / 10,000-case objective.
+Never call partial or cached results a new complete baseline.
 Keep known personal-model segmentation, periodic trimming, fragmented fillets,
 and dense profile breakpoint retention as diagnostic categories. Change one
 shared cause at a time, evaluate matched development cases and existing

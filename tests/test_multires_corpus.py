@@ -4,6 +4,7 @@ import trimesh
 
 from tools.benchmark_multires_corpus import summary
 from tools.build_multires_corpus import PRESETS, mesh_digest
+from tools.select_multires_cohort import select_cases
 
 
 def test_ten_export_presets_tighten_both_geometric_constraints():
@@ -89,3 +90,27 @@ def test_reference_grader_rejects_displaced_and_extra_geometry(
                                tmp_path / 'manifest.json', None)
     assert result['accepted'] is accepted
     assert result['reference_geometry_accepted'] is accepted
+
+
+def test_inner_cohort_keeps_holdout_out_and_balances_surface_strata():
+    def source(identifier, split, kinds, triangles):
+        return [{'source_model_id': identifier, 'split': split, 'preset': f'q{i:02d}',
+                 'triangles': triangles + i,
+                 'ground_truth': {'solid_count': 1, 'brep_face_type_counts': kinds}}
+                for i in range(10)]
+
+    cases = (source('expensive-cylinder', 'development', {'CYLINDER': 1}, 1000)
+             + source('cheap-cylinder', 'development', {'CYLINDER': 1}, 100)
+             + source('cone', 'development', {'CONE': 1}, 400)
+             + source('holdout', 'holdout', {'TORUS': 1}, 10))
+    selected = select_cases(cases, 2, {'q00', 'q05', 'q09'})
+    assert len(selected) == 6
+    assert {c['source_model_id'] for c in selected} == {'cheap-cylinder', 'cone'}
+    assert all(c['split'] == 'development' for c in selected)
+    assert {c['preset'] for c in selected} == {'q00', 'q05', 'q09'}
+
+
+def test_inner_cohort_rejects_incomplete_source_instead_of_hiding_missing_exports():
+    cases = [{'source_model_id': 'a', 'split': 'development', 'preset': 'q00'}]
+    with pytest.raises(ValueError, match='all ten'):
+        select_cases(cases, 1, {'q00'})
