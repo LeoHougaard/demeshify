@@ -4,9 +4,13 @@
 
 Started November 12, 2026 from reliability branch
 `codex/stl-reliability-20261011`, `fb6c6f23ff3e53d7f0b86450b64299e4a17400a4`.
-The registered annular-boundary candidate (V9) is locally qualified for a
-source milestone; see `docs/annular-recovery-2026-11-12.md`. It improves one
-strict reconstruction without losing a prior pass in 20 matched public cases.
+The registered annular-boundary candidate V9 is merged in PR #2. Its exact
+head `1f4d35d` and main merge `724953f` both passed repository CI. The denser
+interior extension V10 is the strongest locally verified candidate; see
+`docs/dense-annular-recovery-2026-11-12.md`. Development strict recovery now
+improves from 8 to 10 of 20 cases, without losing a prior pass. Nine separate
+validation cases and three private geometry controls retain their outcomes;
+the full 262-test local suite passes.
 The October
 498/500 geometry, 384/500 strict CAD and 406/500 non-faceted results are
 historical, not a fresh baseline. Existing source and private geometry remain
@@ -107,6 +111,17 @@ The affected source improves 5/10 to 6/10 exports; its all-ten source-model
 success remains false. Three private development anchors retain their prior
 geometry outcomes, including two non-faceted successes. No holdout tuning or
 gate/budget changes occurred. Failed V1 through V8 evidence remains local.
+
+V10 separates boundary interpolation complexity from interior projection work,
+retaining every support-node check within the existing graph fitter's support
+bound. It recovers another development export previously represented by 1,246
+facets. The affected source reaches 7/10 strict exports and still fails all-ten
+source-model acceptance. The small through-hole was visually checked at five
+depths. See the V10 report for unchanged gates, measured error/time/memory and
+exact source hash. Acquisition's clean five-model batch reached 74/740 fixtures;
+continue toward 1,000/10,000 in bounded batches between experiments. The next
+observed category is zero-free-edge invalid trim shells, not another blanket
+increase in fitting bounds. Inspect actual faces and shared curves first.
 
 Expand checks after a
 candidate earns them: targeted failure plus passing controls, all ten variants
