@@ -5,8 +5,10 @@ import numpy as np
 import pytest
 import trimesh
 
+import app.scoring as scoring
 from app.mesh import load_mesh
 from app.scoring import _step_mesh, score_exported_shape
+from app.surface_brep import build_faceted_brep, export_surface_brep
 from app.surface_reconstruction import (
     _acceptance_threshold,
     _passes_surface_gate,
@@ -81,6 +83,27 @@ def test_verification_mesh_deflection_is_absolute_on_large_curved_faces():
     side_centers = mesh.triangles_center[np.abs(mesh.face_normals[:, 2]) < 0.5]
     radial_error = 100 - np.linalg.norm(side_centers[:, :2], axis=1)
     assert np.max(radial_error) <= tolerance * 1.1
+
+
+def test_dense_triangular_step_is_verified_from_its_exact_faces(tmp_path, monkeypatch):
+    source = tmp_path / "input.stl"
+    original = trimesh.creation.icosphere(subdivisions=3, radius=4)
+    original.export(source)
+    data = load_mesh(source, source.name)
+    result = build_faceted_brep(data, reason="verification test")
+    export_surface_brep(result, tmp_path, source, verify_roundtrip=False)
+    shape = cq.importers.importStep(str(tmp_path / "reconstruction.step")).val()
+
+    def unnecessary_remesh(*_args, **_kwargs):
+        raise AssertionError("exact STEP triangles should not be remeshed")
+
+    monkeypatch.setattr(scoring, "BRepMesh_IncrementalMesh", unnecessary_remesh)
+    measured = _step_mesh(shape, 0.001)
+
+    assert measured.is_watertight
+    assert len(measured.faces) == len(data.mesh.faces)
+    assert measured.volume == pytest.approx(data.mesh.volume, abs=1e-7)
+    assert np.max(scoring._point_mesh_distances(data.mesh, measured.vertices)) < 1e-8
 
 
 @pytest.mark.parametrize("size", [0.02, 0.002])

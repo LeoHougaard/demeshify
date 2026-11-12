@@ -52,7 +52,7 @@ def test_job_retains_native_error_output_and_exit_code(tmp_path):
 def test_feature_conversion_and_revision_edit_use_isolated_worker(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "RUNS", tmp_path)
     source = trimesh.creation.box(extents=(10, 8, 6)).export(file_type="stl")
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/reconstruct",
             files={"file": ("box.stl", source, "model/stl")},

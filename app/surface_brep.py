@@ -72,6 +72,7 @@ from OCP.ShapeFix import (
     ShapeFix_Solid,
     ShapeFix_Wire,
 )
+from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
 from OCP.TColgp import (
     TColgp_Array1OfPnt,
     TColgp_Array2OfPnt,
@@ -95,7 +96,8 @@ from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString
 
-from .mesh import MeshData
+from .mesh import MeshData, closed_shell_topology, containment_parents, shell_depths
+from .step import load_step_shape, unowned_geometry_counts
 from .surface_graph import (
     ConicalPatch,
     CylindricalPatch,
@@ -1551,6 +1553,46 @@ def _bounded_periodic_face(
     return None
 
 
+def _spherical_cap_face(
+    model: _SurfaceModel,
+    mesh: object,
+    tolerance: float,
+) -> TopoDS_Face | None:
+    """Recover a sphere cut by one circular rim without crossing its UV pole."""
+    patch = model.patch
+    if not isinstance(patch, SphericalPatch) or len(patch.boundary_loops) != 1:
+        return None
+    loop = np.asarray(patch.boundary_loops[0], dtype=float)
+    if len(loop) < 4 or np.linalg.norm(loop[0] - loop[-1]) > tolerance:
+        return None
+    _, _, basis = np.linalg.svd(loop - np.mean(loop, axis=0), full_matrices=False)
+    axis = basis[-1]
+    rim_heights = (loop - patch.center) @ axis
+    height = float(np.mean(rim_heights))
+    if float(np.ptp(rim_heights)) > tolerance:
+        return None
+    if _angular_coverage(loop, patch.center, axis) < math.radians(330):
+        return None
+    axial = (np.asarray(mesh.vertices[patch.vertex_indices]) - patch.center) @ axis
+    if float(np.median(axial)) < height:
+        axis, height, axial = -axis, -height, -axial
+    if float(np.min(axial)) < height - tolerance or abs(height) >= patch.radius:
+        return None
+    area = 2 * math.pi * patch.radius * (patch.radius - height)
+    if abs(area / max(patch.area, tolerance**2) - 1) > 0.02:
+        return None
+    # Align the pole with the measured rim normal. Its boundary is then a
+    # latitude circle, with a seam and degenerate pole edge supplied by OCCT.
+    sphere = gp_Sphere(gp_Ax3(_point(patch.center), _direction(axis)), patch.radius)
+    maker = BRepBuilderAPI_MakeFace(
+        sphere, 0.0, 2 * math.pi, math.asin(height / patch.radius), math.pi / 2,
+    )
+    if not maker.IsDone():
+        return None
+    face = _orient_face(maker.Face(), patch, mesh)
+    return face if _usable_face(face, tolerance) else None
+
+
 def _split_periodic_face(
     model: _SurfaceModel,
     periodic_face: TopoDS_Face,
@@ -2048,7 +2090,25 @@ def _analytic_face(
             model.patch.area,
             tolerance**2,
         )
-        if 0.8 <= area_ratio <= 1.2:
+        # Full angular coverage does not imply a rectangular parameter domain.
+        # A bridge may interrupt a cylinder halfway along its height. Broad
+        # area agreement would fill that opening and create separate solids.
+        follows_rims = False
+        if isinstance(model.patch, CylindricalPatch) and edges:
+            patch = model.patch
+            axial = np.asarray(mesh.vertices[patch.vertex_indices]) @ patch.axis
+            ends = np.array([np.min(axial), np.max(axial)])
+            follows_rims = all(
+                edge.closed and min(
+                    float(np.max(np.abs(edge.points @ patch.axis - end)))
+                    for end in ends
+                ) <= tolerance * 5
+                for edge in edges
+            )
+        # Tiny strips from a tangent fillet can perturb an otherwise complete
+        # circular rim. Retain the band when every trim stays at an end rim;
+        # an opening through its middle still requires explicit trimming.
+        if 0.98 <= area_ratio <= 1.02 or (follows_rims and 0.8 <= area_ratio <= 1.2):
             return periodic
     try:
         support = BRepBuilderAPI_MakeFace(model.surface, tolerance).Face()
@@ -3006,6 +3066,31 @@ def _faceted_residual_faces(
     return result
 
 
+def _profile_chord_anchors(profile: np.ndarray, maximum_points: int = 128) -> np.ndarray:
+    """Constrain unusually long profile spans while retaining their original nodes."""
+
+    available = maximum_points - len(profile)
+    if len(profile) < 2 or available <= 0:
+        return profile
+    lengths = np.linalg.norm(np.diff(profile, axis=0), axis=1)
+    positive = lengths[lengths > 0]
+    total = float(np.sum(lengths))
+    if (
+        not len(positive) or not math.isfinite(total)
+        or float(np.max(positive)) <= float(np.median(positive)) * 4
+    ):
+        return profile
+    maximum_gap = total / min(32, available)
+    segments = np.maximum(1, np.ceil(lengths / maximum_gap).astype(int))
+    if int(np.sum(segments - 1)) > available:
+        return profile
+    anchored = [profile[0]]
+    for start, end, count in zip(profile[:-1], profile[1:], segments, strict=True):
+        anchored.extend(start + (end - start) * fraction / count for fraction in range(1, count))
+        anchored.append(end)
+    return np.asarray(anchored)
+
+
 def _linear_extrusion_face(
     patch: LinearExtrusionPatch,
     edges: list[_TrimEdge],
@@ -3023,6 +3108,7 @@ def _linear_extrusion_face(
     closed = bool(np.linalg.norm(profile[0] - profile[-1]) <= tolerance * 3)
     if closed and np.linalg.norm(profile[0] - profile[-1]) > 1e-12:
         profile = np.vstack((profile, profile[0]))
+    profile = _profile_chord_anchors(profile, maximum_points)
     array = TColgp_Array1OfPnt(1, len(profile))
     for index, point in enumerate(profile, start=1):
         array.SetValue(index, _point(point))
@@ -3579,22 +3665,35 @@ def build_faceted_brep(
     # Preserve the original linear carrier path for the overwhelmingly common
     # one-body case: rebuilding a 75k-face adjacency graph here can push an
     # otherwise completed dense recovery past its outer benchmark budget.
-    components = (
-        [range(len(faces))]
-        if mesh.body_count == 1
-        else trimesh.graph.connected_components(
-            np.asarray(mesh.face_adjacency, dtype=np.int64),
-            nodes=np.arange(len(faces), dtype=np.int64),
-        )
-    )
-    solids: list[TopoDS_Solid] = []
+    if mesh.body_count == 1:
+        components, parents = [range(len(faces))], [-1]
+    elif (
+        getattr(data, "shell_face_indices", None) is not None
+        and getattr(data, "shell_parents", None) is not None
+    ):
+        components, parents = data.shell_face_indices, data.shell_parents
+    else:
+        components, parents = closed_shell_topology(mesh)
+    shells = []
     for component in components:
         shell = TopoDS_Shell()
         builder.MakeShell(shell)
         for face_index in component:
             builder.Add(shell, faces[int(face_index)])
         shell.Closed(True)
+        shells.append(shell)
+    solids: list[TopoDS_Solid] = []
+    for index, depth in enumerate(shell_depths(parents)):
+        if depth % 2:
+            continue
+        shell = shells[index]
         solid_maker = BRepBuilderAPI_MakeSolid(shell)
+        # A cavity is a reversed inner shell of its enclosing solid, rather
+        # than an independent positive-volume body. Islands inside cavities
+        # (even containment depth) remain separate solids.
+        for child, parent in enumerate(parents):
+            if parent == index:
+                solid_maker.Add(shells[child])
         if not solid_maker.IsDone():
             raise ValueError("Could not construct a solid from source mesh topology")
         solid = solid_maker.Solid()
@@ -3646,6 +3745,51 @@ def build_faceted_brep(
         faceted_face_count=len(faces),
         faceted_patch_ids=list(visualization_faceted_patch_ids or []),
         source_mesh_fallback=True,
+    )
+
+
+def build_planar_topology_brep(
+    data: MeshData, graph: SurfaceGraph,
+) -> SurfaceBRepResult | None:
+    """Recover connected planar faces without refitting their source boundaries."""
+
+    # Only sparse, entirely planar, closed single-shell models take this path.
+    # The carrier and native domain merge must fit inside the existing worker
+    # deadline; curved patches and dense triangle fallbacks keep their own paths.
+    if (
+        not graph.planar_patches
+        or len(graph.planar_patches) != len(graph.patches)
+        or len(data.mesh.faces) > 2_000
+        or data.mesh.body_count != 1
+        or not data.mesh.is_watertight
+        or not data.mesh.is_winding_consistent
+    ):
+        return None
+    carrier = build_faceted_brep(data, graph)
+    merger = ShapeUpgrade_UnifySameDomain(carrier.shape.wrapped, True, True, False)
+    merger.SetLinearTolerance(carrier.sewing_tolerance)
+    merger.SetAngularTolerance(1e-8)
+    merger.Build()
+    shape = cq.Shape(merger.Shape())
+    faces = shape.Faces()
+    if (
+        not shape.isValid()
+        or len(shape.Solids()) != 1
+        or len(faces) >= carrier.face_count
+        or any(face.geomType() != "PLANE" for face in faces)
+        or not np.isclose(shape.Area(), carrier.shape.Area(), rtol=1e-9, atol=0)
+        or not np.isclose(shape.Volume(), carrier.shape.Volume(), rtol=1e-9, atol=0)
+    ):
+        return None
+    return SurfaceBRepResult(
+        shape=shape, graph=graph, surface_counts=carrier.surface_counts,
+        face_count=len(faces), solid_count=1, free_edge_count=0,
+        sewing_tolerance=carrier.sewing_tolerance, valid=True, closed=True,
+        topology_vertex_count=len(shape.Vertices()), topology_edge_count=len(shape.Edges()),
+        warnings=[
+            f"Recovered {len(faces)} connected planar faces by merging coplanar "
+            "source triangles without refitting their boundaries."
+        ],
     )
 
 
@@ -4178,9 +4322,10 @@ def surface_graph_json(
     }
 
 
-def _disjoint_component_brep(
+def _closed_component_brep(
     data: MeshData,
     progress_callback: Callable[[str], None] | None,
+    trimming_tolerance_scale: float = 1.0,
 ) -> SurfaceBRepResult | None:
     components = trimesh.graph.connected_components(
         data.mesh.face_adjacency, nodes=np.arange(len(data.mesh.faces)), min_len=1
@@ -4195,13 +4340,24 @@ def _disjoint_component_brep(
             process=False,
         )
         parts.append((face_ids, vertex_ids, mesh))
-    # Overlapping bounds may describe nested cavity shells. Preserve the joint
-    # path for those inputs rather than assuming that every shell is a body.
+    parents = data.shell_parents or [-1] * len(parts)
+
+    def is_ancestor(parent: int, child: int) -> bool:
+        while parents[child] != -1:
+            child = parents[child]
+            if child == parent:
+                return True
+        return False
+
+    # Fit disjoint bodies and classified enclosed shells independently. The
+    # joint path remains necessary when overlapping bounds do not correspond
+    # to containment: those surfaces can be parts of one intersecting assembly.
     for index, (_, _, first) in enumerate(parts):
-        for _, _, second in parts[index + 1:]:
+        for other_index in range(index + 1, len(parts)):
+            second = parts[other_index][2]
             if not np.any(
                 (first.bounds[1] < second.bounds[0]) | (second.bounds[1] < first.bounds[0])
-            ):
+            ) and not (is_ancestor(index, other_index) or is_ancestor(other_index, index)):
                 return None
 
     combined = SurfaceGraph(face_patch_ids=np.full(len(data.mesh.faces), "", dtype=object))
@@ -4209,8 +4365,14 @@ def _disjoint_component_brep(
     for index, (face_ids, vertex_ids, mesh) in enumerate(parts):
         if progress_callback:
             progress_callback(f"surface_component_start index={index} triangles={len(mesh.faces)}")
-        local = replace(data, mesh=mesh, section_cache={})
-        result = _build_surface_brep_single(local, progress_callback)
+        if mesh.volume < 0:
+            mesh.invert()
+        local = replace(
+            data, mesh=mesh, section_cache={}, shell_face_indices=None, shell_parents=None,
+        )
+        result = _build_surface_brep_single(
+            local, progress_callback, trimming_tolerance_scale,
+        )
         prefix = f"body-{index + 1}:"
         for patch in result.graph.patches:
             patch.patch_id = prefix + patch.patch_id
@@ -4253,15 +4415,69 @@ def _disjoint_component_brep(
     )
 
 
+def _nest_closed_solids(solids: list[cq.Solid], tolerance: float) -> cq.Shape:
+    """Reassemble closed fitted shells as solids with enclosed voids."""
+    # Already assembled hollow solids must keep every inner shell. The general
+    # sewing path normally emits one solid per shell, but callers can also
+    # provide valid multi-shell solids alongside separate bodies.
+    if any(len(solid.Shells()) != 1 for solid in solids):
+        return cq.Compound.makeCompound(solids)
+    solids = [
+        cq.Solid(solid.wrapped.Reversed()) if solid.Volume() < 0 else solid
+        for solid in solids
+    ]
+    bounds = []
+    for solid in solids:
+        box = solid.BoundingBox()
+        bounds.append([[box.xmin, box.ymin, box.zmin], [box.xmax, box.ymax, box.zmax]])
+
+    def contains(parent: int, child: int) -> bool:
+        points = [vertex.toTuple() for vertex in solids[child].Vertices()]
+        # Closed curved faces can have very few topological vertices. Sample
+        # their actual surfaces as well, rather than a face's mass centroid.
+        vertices, _ = solids[child].tessellate(max(tolerance, 1e-7))
+        points.extend(vertex.toTuple() for vertex in vertices)
+        return bool(points) and all(solids[parent].isInside(point, tolerance) for point in points)
+
+    parents = containment_parents(
+        np.asarray(bounds), [abs(solid.Volume()) for solid in solids], contains,
+    )
+    assembled = []
+    for index, depth in enumerate(shell_depths(parents)):
+        if depth % 2:
+            continue
+        maker = BRepBuilderAPI_MakeSolid(solids[index].Shells()[0].wrapped)
+        for child, parent in enumerate(parents):
+            if parent == index:
+                maker.Add(TopoDS.Shell_s(solids[child].Shells()[0].wrapped.Reversed()))
+        shape = cq.Shape(maker.Solid())
+        if not shape.isValid() or shape.Volume() <= 0:
+            raise ValueError("Enclosed fitted shells did not produce a valid hollow solid")
+        assembled.append(shape)
+    return assembled[0] if len(assembled) == 1 else cq.Compound.makeCompound(assembled)
+
+
 def build_surface_brep(
     data: MeshData,
     progress_callback: Callable[[str], None] | None = None,
+    *,
+    trimming_tolerance_scale: float = 1.0,
 ) -> SurfaceBRepResult:
     result = None
     if isinstance(data, MeshData) and data.mesh.body_count > 1 and data.mesh.is_watertight:
-        result = _disjoint_component_brep(data, progress_callback)
+        result = _closed_component_brep(data, progress_callback, trimming_tolerance_scale)
     if result is None:
-        result = _build_surface_brep_single(data, progress_callback)
+        result = _build_surface_brep_single(data, progress_callback, trimming_tolerance_scale)
+    if (
+        result.closed
+        and getattr(getattr(data, "report", None), "cavity_shell_count", 0)
+        and len(result.shape.Solids()) > 1
+    ):
+        result.shape = _nest_closed_solids(result.shape.Solids(), result.sewing_tolerance)
+        result.joined_shape = result.shape
+        result.solid_count = len(result.shape.Solids())
+        result.face_count = len(result.shape.Faces())
+        result.valid = bool(result.shape.isValid())
     result.graph.source_face_indices = getattr(data, "source_face_indices", None)
     return result
 
@@ -4269,6 +4485,7 @@ def build_surface_brep(
 def _build_surface_brep_single(
     data: MeshData,
     progress_callback: Callable[[str], None] | None = None,
+    trimming_tolerance_scale: float = 1.0,
 ) -> SurfaceBRepResult:
     graph = detect_surface_graph(data)
     if progress_callback is not None:
@@ -4284,7 +4501,7 @@ def _build_surface_brep_single(
             f"revolutions={len(graph.revolution_patches)} "
             f"freeforms={len(graph.freeform_patches)}"
         )
-    tolerance = max(data.diagonal * 0.0006, 2e-7)
+    tolerance = max(data.diagonal * 0.0006 * trimming_tolerance_scale, 2e-7)
     models: dict[str, _SurfaceModel] = {}
     for patch in graph.patches:
         try:
@@ -4419,6 +4636,11 @@ def _build_surface_brep_single(
             if face is None:
                 try:
                     face = _uv_boundary_face(model, data.mesh, tolerance)
+                except Exception:
+                    face = None
+            if face is None and isinstance(patch, SphericalPatch):
+                try:
+                    face = _spherical_cap_face(model, data.mesh, tolerance)
                 except Exception:
                     face = None
             if face is not None and _usable_face(face, tolerance):
@@ -4961,11 +5183,21 @@ def export_surface_brep(
 ) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     step_path = directory / "reconstruction.step"
-    cq.exporters.export(result.shape, str(step_path))
+    # Planar triangle carriers need only their spatial edges. Redundant surface
+    # parameter curves inflate dense fallback files and slow their round trip.
+    cq.exporters.export(
+        result.shape, str(step_path),
+        opt={"write_pcurves": not result.source_mesh_fallback},
+    )
     if result.closed and verify_roundtrip:
         try:
-            roundtrip = cq.importers.importStep(str(step_path)).val()
-            exchange_valid = bool(roundtrip.isValid() and roundtrip.Solids())
+            roundtrip = load_step_shape(step_path)
+            exchange_valid = bool(
+                roundtrip.isValid()
+                and roundtrip.Solids()
+                and len(roundtrip.Solids()) == result.solid_count
+                and not unowned_geometry_counts(roundtrip)
+            )
         except Exception:
             exchange_valid = False
         if not exchange_valid:

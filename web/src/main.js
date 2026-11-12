@@ -11,10 +11,12 @@ CameraControls.install({ THREE });
 
 const app = document.querySelector("#app");
 let selectedFile = null;
+let selectedDimensions = null;
 let inputViewer;
 let outputViewer;
 let livePreviewRevision = 0;
 let livePreviewLoading = false;
+let livePreviewGeneration = 0;
 let activeReport = null;
 let editablePlan = null;
 let selectedFeatureId = null;
@@ -61,6 +63,8 @@ app.innerHTML = `
         </label>
         <button id="sampleButton" class="sample-button" type="button">Try the sample plate</button>
         <div id="fileChip" class="file-chip hidden"></div>
+        <label class="field"><span>STL export units</span><select id="units"><option value="mm">Millimetres</option><option value="in">Inches</option><option value="cm">Centimetres</option><option value="m">Metres</option></select><small id="inputDimensions" aria-live="polite">Choose the units used when exporting. STL files do not store units.</small></label>
+        <div id="unitHint" class="unit-hint hidden" role="status"><span></span><button id="useMetres" type="button">Use metres</button></div>
       </section>
 
       <button id="reconstructButton" class="primary-button convert-button" disabled>
@@ -118,7 +122,6 @@ app.innerHTML = `
       <section class="advanced-section">
         <h2>Conversion settings</h2>
         <div class="advanced-settings-grid">
-          <label class="field"><span>STL units</span><select id="units"><option value="mm">Millimetres</option><option value="in">Inches</option><option value="cm">Centimetres</option><option value="m">Metres</option></select></label>
           <label class="field"><span>Reconstruction method</span><select id="engine"><option value="surface_brep">Recognized surfaces (recommended)</option><option value="feature_tree">Parametric feature history</option></select><small id="engineHelp">Fits analytic and B-spline surfaces, then joins their boundaries.</small></label>
         </div>
       </section>
@@ -150,7 +153,10 @@ document.querySelector("#engine").addEventListener("change", updateEngineCopy);
 updateEngineCopy();
 
 fetch("/api/health")
-  .then((response) => response.json())
+  .then((response) => {
+    if (!response.ok) throw new Error("Converter unavailable");
+    return response.json();
+  })
   .then(() => {
     document.querySelector("#engineStatus").innerHTML = "<span></span> Converter ready";
   })
@@ -304,6 +310,7 @@ class MeshViewer {
     rawGeometry.computeBoundingBox();
     const rawBox = rawGeometry.boundingBox;
     const rawSize = rawBox.getSize(new THREE.Vector3());
+    this.sourceDimensions = rawSize.toArray();
     const topologyGeometry = rawGeometry.clone();
     topologyGeometry.deleteAttribute("normal");
     const weldedGeometry = mergeVertices(
@@ -472,9 +479,10 @@ class MeshViewer {
       }
     }
 
-    const sourceGeometry = new STLLoader().parse(sourceBuffer);
-    const sourcePositions = sourceGeometry.getAttribute("position");
-    const sourceFaceCount = Math.floor(sourcePositions.count / 3);
+    const sourceGeometry = sourceBuffer && !visualization.global_faceted_fallback
+      ? new STLLoader().parse(sourceBuffer) : null;
+    const sourcePositions = sourceGeometry?.getAttribute("position");
+    const sourceFaceCount = Math.floor((sourcePositions?.count || 0) / 3);
     if (visualization.global_faceted_fallback) {
       const wireframe = new THREE.Mesh(
         this.mesh.geometry,
@@ -488,7 +496,8 @@ class MeshViewer {
       );
       wireframe.userData.sharedGeometry = true;
       group.add(wireframe);
-      triangleCount = sourceFaceCount;
+      triangleCount = Math.floor((this.mesh.geometry.index?.count
+        || this.mesh.geometry.getAttribute("position").count) / 3);
     } else {
       const requestedFaces = visualization.faceted_source_face_indices || [];
       const trianglePositions = [];
@@ -524,7 +533,7 @@ class MeshViewer {
         );
       }
     }
-    sourceGeometry.dispose();
+    sourceGeometry?.dispose();
 
     this.surfaceOverlay = group;
     this.scene.add(group);
@@ -1065,6 +1074,31 @@ const formatBytes = (bytes) => {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 };
 
+function updateInputDimensions() {
+  const units = document.querySelector("#units").value;
+  const scale = { mm: 1, cm: 10, m: 1000, in: 25.4 }[units];
+  const dimensions = selectedDimensions?.map((value) => value * scale);
+  const format = (values) => values.map((value) =>
+    value.toLocaleString(undefined, { maximumFractionDigits: 3 })).join(" × ");
+  document.querySelector("#inputDimensions").textContent = dimensions
+    ? `Output size: ${format(dimensions)} mm`
+    : "Choose the units used when exporting. STL files do not store units.";
+  const suggestMetres = dimensions && units === "mm" && Math.max(...dimensions) < 1;
+  const hint = document.querySelector("#unitHint");
+  hint.classList.toggle("hidden", !suggestMetres);
+  if (suggestMetres) {
+    hint.querySelector("span").textContent = "This model is less than 1 mm across. If you exported in metres, change the units.";
+    document.querySelector("#useMetres").textContent =
+      `Use metres: ${format(selectedDimensions.map((value) => value * 1000))} mm`;
+  }
+}
+
+document.querySelector("#units").addEventListener("change", updateInputDimensions);
+document.querySelector("#useMetres").addEventListener("click", () => {
+  document.querySelector("#units").value = "m";
+  updateInputDimensions();
+});
+
 async function chooseFile(file) {
   if (!file || !file.name.toLowerCase().endsWith(".stl")) {
     showError("Choose a file with an .stl extension.");
@@ -1084,6 +1118,8 @@ async function chooseFile(file) {
   const selectionVersion = ++fileSelectionVersion;
   const showPreview = file.size <= MAX_PREVIEW_BYTES;
   selectedFile = null;
+  selectedDimensions = null;
+  updateInputDimensions();
   button.disabled = true;
   errorBox.classList.add("hidden");
   if (showPreview) {
@@ -1101,6 +1137,8 @@ async function chooseFile(file) {
   }
   if (selectionVersion !== fileSelectionVersion) return;
   selectedFile = file;
+  selectedDimensions = showPreview ? inputViewer.sourceDimensions : null;
+  updateInputDimensions();
   surfaceLegend.classList.add("hidden");
   surfaceLegendStatus.textContent = "";
   inputTriangleLegend.classList.toggle("hidden", !showPreview);
@@ -1132,6 +1170,8 @@ function clearFile(event) {
   event?.preventDefault();
   fileSelectionVersion += 1;
   selectedFile = null;
+  selectedDimensions = null;
+  updateInputDimensions();
   fileInput.value = "";
   fileChip.classList.add("hidden");
   dropzone.classList.remove("hidden");
@@ -1162,6 +1202,7 @@ sampleButton.addEventListener("click", async () => {
     const response = await fetch("/sample-plate.stl", { cache: "no-store" });
     if (!response.ok) throw new Error();
     const blob = await response.blob();
+    document.querySelector("#units").value = "mm";
     await chooseFile(new File([blob], "sample-plate.stl", { type: "model/stl" }));
   } catch {
     showError("The sample model could not be loaded.");
@@ -1248,16 +1289,19 @@ function renderReconstructionProgress(progress) {
 }
 
 async function updateLivePreview(progress) {
+  if (progress.status !== "running") return;
   const revision = Number(progress.preview_revision) || 0;
   if (!progress.preview_url || revision <= livePreviewRevision || livePreviewLoading) return;
   livePreviewLoading = true;
+  const generation = livePreviewGeneration;
   try {
     const response = await fetch(progress.preview_url, { cache: "no-store" });
     if (!response.ok) return;
     const buffer = await response.arrayBuffer();
-    if (revision <= livePreviewRevision) return;
+    if (generation !== livePreviewGeneration || revision <= livePreviewRevision) return;
     outputViewer ||= new MeshViewer(outputCanvas, 0x8ebbd2);
     await outputViewer.load(buffer, { resetCamera: livePreviewRevision === 0 });
+    if (generation !== livePreviewGeneration) return;
     livePreviewRevision = revision;
     viewerEmpty.classList.add("hidden");
     inputCanvas.classList.add("hidden");
@@ -1269,7 +1313,7 @@ async function updateLivePreview(progress) {
     // A candidate can be superseded between polling and download. The next
     // progress event will provide a newer stable preview.
   } finally {
-    livePreviewLoading = false;
+    if (generation === livePreviewGeneration) livePreviewLoading = false;
   }
 }
 
@@ -1315,11 +1359,14 @@ async function waitForReconstruction(runId) {
 button.addEventListener("click", async () => {
   if (!selectedFile) return;
   button.disabled = true;
+  document.querySelector("#units").disabled = true;
+  document.querySelector("#useMetres").disabled = true;
   errorBox.classList.add("hidden");
   baseWarnings.classList.add("hidden");
   processing.classList.remove("hidden");
   livePreviewRevision = 0;
   livePreviewLoading = false;
+  livePreviewGeneration += 1;
   document.querySelector("#results").classList.add("hidden");
   renderReconstructionProgress({
     stage: "Uploading mesh",
@@ -1337,7 +1384,12 @@ button.addEventListener("click", async () => {
   form.append("input_units", document.querySelector("#units").value);
   form.append("engine", document.querySelector("#engine").value);
   try {
-    const response = await fetch("/api/reconstruct/start", { method: "POST", body: form });
+    let response;
+    try {
+      response = await fetch("/api/reconstruct/start", { method: "POST", body: form });
+    } catch {
+      throw new Error("Could not reach the converter. The STL preview runs in your browser, but conversion needs the server. Check that the server is running, then try again.");
+    }
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.detail || "Reconstruction failed.");
     const runUrl = new URL(window.location.href);
@@ -1351,15 +1403,19 @@ button.addEventListener("click", async () => {
   } finally {
     processing.classList.add("hidden");
     button.disabled = false;
+    document.querySelector("#units").disabled = false;
+    document.querySelector("#useMetres").disabled = false;
   }
 });
 
 async function renderResult(report, options = {}) {
+  livePreviewGeneration += 1;
   surfaceLegend.classList.add("hidden");
   document.querySelector("#previewSubtitle").textContent = report.mesh?.file_name || "Saved result";
   const complete = report.status === "complete";
   const surfaceMode = report.engine === "surface_brep" && report.surface;
   const surfaceFallback = Boolean(surfaceMode && report.surface.faceted_fallback);
+  const verifiedFallback = Boolean(surfaceFallback && report.surface.fallback_geometry_verified);
   const semantic = report.plan?.representation !== "sampled_approximation";
   document.querySelector("#resultTitle").textContent = complete
     ? surfaceMode
@@ -1368,7 +1424,7 @@ async function renderResult(report, options = {}) {
     : report.status === "best_effort"
       ? surfaceMode
         ? surfaceFallback
-          ? "Analytic fit incomplete"
+          ? verifiedFallback ? "Faceted STEP ready" : "Analytic fit incomplete"
           : report.surface.closed
           ? "Best fitted surface solid produced"
           : "Surface recognition result ready"
@@ -1384,7 +1440,7 @@ async function renderResult(report, options = {}) {
       : "High-confidence match"
     : surfaceMode
       ? surfaceFallback
-        ? "Rejected: fallback geometry"
+        ? verifiedFallback ? "Verified faceted fallback" : "Unverified fallback"
         : report.surface.closed
         ? "Best effort"
         : "Valid fitted surface set"
@@ -1554,12 +1610,14 @@ async function renderResult(report, options = {}) {
     .replace(/[^A-Za-z0-9._-]+/g, "_")
     .replace(/^[._]+|[._]+$/g, "") || "model";
   const reconstructedStepName = `${sourceStem}_reconstructed.step`;
-  const diagnosticStep = surfaceMode && (!complete || surfaceFallback);
+  const diagnosticStep = surfaceMode && !verifiedFallback && (!complete || surfaceFallback);
   const downloadTitle = diagnosticStep ? "Download diagnostic STEP" : "Export STEP file";
   const downloadDetail = diagnosticStep
     ? surfaceFallback
       ? `Rejected analytic fit · ${report.surface.faceted_face_count} fallback faces`
       : "Not accepted · inspect verification report"
+    : verifiedFallback
+      ? "Geometry verified; CAD surface recovery incomplete"
     : surfaceMode && report.surface.closed
       ? "Verified watertight analytic B-rep"
       : "Reconstructed CAD model";
@@ -1631,10 +1689,12 @@ async function renderResult(report, options = {}) {
     let sourceMeshBuffer = null;
     try {
       const sourceResponse = await fetch(`${fileBase}/input.stl`, { cache: "no-store" });
-      if (sourceResponse.ok) {
+      if (sourceResponse.ok && Number(sourceResponse.headers.get("content-length")) <= MAX_PREVIEW_BYTES) {
         sourceMeshBuffer = await sourceResponse.arrayBuffer();
         inputViewer ||= new MeshViewer(inputCanvas, 0x8ebbd2);
         await inputViewer.load(sourceMeshBuffer.slice(0));
+      } else {
+        await sourceResponse.body?.cancel();
       }
     } catch {
       // The STEP result remains usable if an older saved run has no source preview.
@@ -1642,7 +1702,7 @@ async function renderResult(report, options = {}) {
     if (surfaceMode) {
       try {
         const graphResponse = await fetch(`${fileBase}/surface_graph.json`, { cache: "no-store" });
-        if (graphResponse.ok && sourceMeshBuffer) {
+        if (graphResponse.ok) {
           const surfaceGraph = await graphResponse.json();
           const overlay = outputViewer.showSurfaceOverlay(
             surfaceGraph,
@@ -1651,6 +1711,8 @@ async function renderResult(report, options = {}) {
           );
           surfaceLegendStatus.textContent = overlay.triangleCount
             ? `${overlay.triangleCount.toLocaleString()} fallback triangles shown`
+            : report.surface.faceted_face_count
+            ? "Fallback faces present; detailed overlay unavailable"
             : "No triangle fallback used";
           surfaceLegend.classList.remove("hidden");
         }
@@ -1659,6 +1721,7 @@ async function renderResult(report, options = {}) {
       }
     }
     viewTabs.classList.remove("hidden");
+    viewTabs.querySelector('[data-view="input"]').disabled = !sourceMeshBuffer;
     [...viewTabs.children].forEach((item) => {
       const active = item.dataset.view === "output";
       item.classList.toggle("active", active);
@@ -1673,11 +1736,13 @@ async function renderResult(report, options = {}) {
 
 const requestedRun = new URLSearchParams(window.location.search).get("run");
 if (/^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestedRun || "")) {
-  fetch(`/api/runs/${requestedRun}`, { cache: "no-store" })
-    .then(async (response) => {
-      if (!response.ok) throw new Error("Saved reconstruction not found");
-      return response.json();
-    })
+  button.disabled = true;
+  processing.classList.remove("hidden");
+  waitForReconstruction(requestedRun)
     .then((report) => renderResult(report, { scroll: false }))
-    .catch((error) => showError(error.message));
+    .catch((error) => showError(error.message))
+    .finally(() => {
+      processing.classList.add("hidden");
+      button.disabled = !selectedFile;
+    });
 }

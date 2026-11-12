@@ -129,12 +129,17 @@ def apply_stage(progress: dict[str, Any], label: str) -> None:
             detail="Measuring surface deviation and volume",
             percent=max(progress["percent"], 95.0),
         )
+    elif label == "surface_fine_trimming_start":
+        progress.update(
+            stage="Refining small boundaries",
+            detail="Retrying joins around small holes and shoulders",
+            percent=max(progress["percent"], 95.0),
+        )
     elif label.startswith("surface_reconstruction_complete"):
         progress.update(
-            status="complete",
-            stage="Surface B-rep ready",
-            detail=f"Completed with {progress['current_features']} surfaces",
-            percent=100.0,
+            stage="Finalizing surface result",
+            detail="Waiting for verification and recovery to finish",
+            percent=99.0,
         )
     elif label.endswith("_generated") or "_generated count=" in label:
         count = _number(label, "count") or 0
@@ -236,8 +241,7 @@ def apply_stage(progress: dict[str, Any], label: str) -> None:
         )
     elif label.startswith("reconstruction_complete"):
         progress.update(
-            status="complete",
-            stage="Editable model ready",
-            detail=f"Completed with {progress['current_features']} features",
-            percent=100.0,
+            stage="Finalizing editable model",
+            detail="Waiting for the verified result to be saved",
+            percent=99.0,
         )

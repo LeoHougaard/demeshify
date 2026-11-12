@@ -18,7 +18,7 @@ def test_surface_engine_runs_through_api_and_exposes_downloads(
     monkeypatch.setattr(storage, "RUNS", tmp_path)
     stl = trimesh.creation.box(extents=(10, 8, 6)).export(file_type="stl")
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/reconstruct",
             files={"file": ("box.stl", stl, "model/stl")},
@@ -55,7 +55,7 @@ def test_api_rejects_unknown_engine_before_creating_a_run(tmp_path, monkeypatch)
     monkeypatch.setattr(storage, "RUNS", tmp_path)
     stl = trimesh.creation.box().export(file_type="stl")
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/reconstruct/start",
             files={"file": ("box.stl", stl, "model/stl")},
@@ -73,7 +73,7 @@ def test_background_surface_job_can_be_polled_reopened_and_downloaded(
     monkeypatch.setattr(storage, "RUNS", tmp_path)
     stl = trimesh.creation.box(extents=(10, 8, 6)).export(file_type="stl")
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         start = client.post(
             "/api/reconstruct/start",
             files={"file": ("box.stl", stl, "model/stl")},
@@ -84,7 +84,8 @@ def test_background_surface_job_can_be_polled_reopened_and_downloaded(
         assert len(run_id) == 32
 
         stages = []
-        for _ in range(200):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
             progress_response = client.get(f"/api/runs/{run_id}/progress")
             assert progress_response.status_code == 200
             progress = progress_response.json()
@@ -105,7 +106,7 @@ def test_background_surface_job_can_be_polled_reopened_and_downloaded(
 def test_empty_upload_is_rejected_without_leaving_a_run(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(storage, "RUNS", tmp_path)
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/reconstruct/start",
             files={"file": ("empty.stl", b"", "model/stl")},
@@ -120,7 +121,7 @@ def test_missing_run_read_does_not_create_a_directory(tmp_path, monkeypatch) -> 
     monkeypatch.setattr(storage, "RUNS", tmp_path)
     missing_id = "d" * 32
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         assert client.get(f"/api/runs/{missing_id}").status_code == 404
 
     assert not (tmp_path / missing_id).exists()
@@ -136,6 +137,8 @@ def test_failed_report_is_not_advertised_as_a_completed_model(tmp_path, monkeypa
         input_units,
         _update,
     ) -> ReconstructionReport:
+        _update("surface_reconstruction_complete surfaces=6")
+        time.sleep(0.1)
         return ReconstructionReport(
             id=run_id,
             status="failed",
@@ -161,19 +164,22 @@ def test_failed_report_is_not_advertised_as_a_completed_model(tmp_path, monkeypa
     monkeypatch.setattr(main_module, "_reconstructor", lambda _engine: failed_reconstructor)
     stl = trimesh.creation.box().export(file_type="stl")
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         start = client.post(
             "/api/reconstruct/start",
             files={"file": ("box.stl", stl, "model/stl")},
         )
         run_id = start.json()["id"]
+        statuses = []
         for _ in range(50):
             progress = client.get(f"/api/runs/{run_id}/progress").json()
+            statuses.append(progress["status"])
             if progress["status"] == "failed":
                 break
             time.sleep(0.01)
 
     assert progress["status"] == "failed"
+    assert "complete" not in statuses
     assert progress["stage"] == "Reconstruction stopped"
     assert progress["preview_url"] is None
 
@@ -187,7 +193,7 @@ def test_full_background_queue_rejects_before_storing_upload(tmp_path, monkeypat
     )
     stl = trimesh.creation.box().export(file_type="stl")
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/reconstruct/start",
             files={"file": ("box.stl", stl, "model/stl")},

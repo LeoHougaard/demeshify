@@ -38,9 +38,9 @@ $npmExecutable = Get-Command npm -ErrorAction SilentlyContinue
 if (-not $nodeExecutable -or -not $npmExecutable) {
     throw "Install Node.js 22 LTS from https://nodejs.org/ and run this script again."
 }
-$nodeMajor = [int]((& $nodeExecutable.Source --version).TrimStart("v").Split(".")[0])
-if ($nodeMajor -lt 22) {
-    throw "Node.js 22 or newer is required. Found $(& $nodeExecutable.Source --version)."
+$nodeVersion = [version]((& $nodeExecutable.Source --version).TrimStart("v"))
+if ($nodeVersion -lt [version]"22.12.0") {
+    throw "Node.js 22.12 or newer is required. Found $nodeVersion."
 }
 
 Invoke-Uv python install 3.12

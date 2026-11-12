@@ -31,11 +31,19 @@ def passes_geometry_gate(score: ScoreReport, threshold: float) -> bool:
 
 def verification_warnings(score: ScoreReport, threshold: float) -> list[str]:
     warnings = []
+    if score.unowned_geometry_counts:
+        counts = ", ".join(
+            f"{kind}: {count}" for kind, count in score.unowned_geometry_counts.items()
+        )
+        warnings.append(
+            f"Verification: the STEP contains geometry outside its solids ({counts})."
+        )
     if score.component_count_match is False:
         warnings.append(
             "Verification: the input has "
             f"{score.source_component_count} connected surface components, but the STEP "
-            f"contains {score.step_shell_count} shells."
+            f"contains {score.step_shell_count} shells; expected "
+            f"{score.source_solid_count} solids, found {score.step_solid_count}."
         )
     maximum = max(score.chamfer_max_mm, score.local_max_mm or 0.0)
     if maximum > threshold:

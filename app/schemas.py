@@ -546,6 +546,8 @@ class MeshReport(SchemaModel):
     vertex_count: int
     watertight: bool
     body_count: int
+    solid_count: int | None = None
+    cavity_shell_count: int = 0
     dimensions_mm: Point3D
     volume_mm3: float | None
     surface_area_mm2: float
@@ -572,6 +574,9 @@ class ScoreReport(SchemaModel):
     component_count_match: bool | None = None
     source_component_count: int | None = None
     step_shell_count: int | None = None
+    source_solid_count: int | None = None
+    step_solid_count: int | None = None
+    unowned_geometry_counts: dict[str, int] = Field(default_factory=dict)
     verification_tessellation_mm: float | None = None
     local_max_mm: float | None = None
 
@@ -592,6 +597,8 @@ class SurfaceBRepReport(SchemaModel):
     faceted_patch_count: int = 0
     faceted_face_count: int = 0
     source_mesh_fallback: bool = False
+    simplified_fallback: bool = False
+    fallback_geometry_verified: bool = False
 
 
 class ReconstructionReport(SchemaModel):

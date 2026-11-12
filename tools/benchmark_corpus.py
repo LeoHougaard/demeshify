@@ -11,8 +11,6 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import cadquery as cq
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -27,6 +25,7 @@ from app.schemas import (  # noqa: E402
     ReconstructionPlan,
     SplineProfile,
 )
+from app.step import load_step_shape  # noqa: E402
 
 
 def count_arcs(profile: Profile) -> int:
@@ -82,7 +81,7 @@ def multiset_precision_recall(
 
 
 def step_topology(path: Path) -> dict[str, object]:
-    shape = cq.importers.importStep(str(path)).val()
+    shape = load_step_shape(path)
     faces = Counter(face.geomType() for face in shape.Faces())
     edges = Counter(edge.geomType() for edge in shape.Edges())
     return {

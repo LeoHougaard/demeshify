@@ -191,6 +191,8 @@ main.converter-shell {
   overflow: hidden; background: #262a2c; border-right: 1px solid #444a4e;
 }
 .import-panel { display: grid; gap: 12px; }
+.unit-hint { padding: 10px; border: 1px solid #806d47; border-radius: 7px; color: #ead5a7; font-size: 11px; line-height: 1.5; }
+.unit-hint button { display: block; width: 100%; margin-top: 8px; padding: 7px; border: 1px solid #806d47; border-radius: 5px; background: #454033; color: #fff0cd; text-align: left; cursor: pointer; }
 .section-heading { display: flex; align-items: center; gap: 10px; }
 .section-heading > span {
   width: 24px; height: 24px; flex: 0 0 auto; display: grid; place-items: center;

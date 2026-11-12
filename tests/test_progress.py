@@ -25,8 +25,8 @@ def test_reconstruction_events_report_real_candidate_and_feature_counts() -> Non
 
     public = public_progress(progress)
     assert percentages == sorted(percentages)
-    assert public["status"] == "complete"
-    assert public["percent"] == 100.0
+    assert public["status"] == "running"
+    assert public["percent"] == 99.0
     assert public["candidates_done"] == 1
     assert public["candidates_total"] == 4
     assert public["current_features"] == 8
@@ -43,3 +43,12 @@ def test_slow_stage_exposes_time_since_the_last_real_event() -> None:
 
     assert public["stage"] == "Recovering changing profiles"
     assert public["seconds_since_update"] >= 0
+
+
+def test_inner_surface_completion_does_not_publish_a_provisional_result():
+    progress = new_progress("abc123abc123")
+    apply_stage(progress, "surface_reconstruction_complete surfaces=6 preview=reconstruction.stl")
+    assert progress["status"] == "running"
+    assert progress["percent"] < 100
+    apply_stage(progress, "surface_isolated_worker_invalid recovering=faceted")
+    assert progress["status"] == "running"

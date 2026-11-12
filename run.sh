@@ -22,9 +22,8 @@ if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
   echo "Install Node.js 22 LTS from https://nodejs.org/ and run this script again." >&2
   exit 1
 fi
-node_major="$(node --version | sed 's/^v//' | cut -d. -f1)"
-if (( node_major < 22 )); then
-  echo "Node.js 22 or newer is required. Found $(node --version)." >&2
+if ! node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)'; then
+  echo "Node.js 22.12 or newer is required. Found $(node --version)." >&2
   exit 1
 fi
 
