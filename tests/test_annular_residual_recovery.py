@@ -82,8 +82,8 @@ def test_annular_loft_does_not_close_a_missing_boundary():
     assert _closed_loop_loft_face(patch, mesh, 0.003) is None
 
 
-@pytest.mark.parametrize('bad_plane', [False, True])
-def test_caps_and_annulus_share_complete_curves_or_keep_original_trims(bad_plane):
+@pytest.mark.parametrize('bad_plane,bad_node', [(False, False), (True, False), (False, True)])
+def test_caps_and_annulus_share_complete_curves_or_keep_original_trims(bad_plane, bad_node):
     patch, mesh = annular_patch()
     fitted = _closed_loop_loft_face(patch, mesh, 0.003)
     assert fitted is not None
@@ -94,16 +94,20 @@ def test_caps_and_annulus_share_complete_curves_or_keep_original_trims(bad_plane
         x_direction=np.array((1, 0, 0)), y_direction=np.array((0, 0, -1)),
         area=1, boundary_loops=[], polygon=None,
     ) for index, height in enumerate((0, 1.1 if bad_plane else 1))]
+    loops = [loop.copy() for loop in patch.boundary_loops]
+    if bad_node:
+        # Node2 is omitted by the old 32-point sampling of this49-point loop.
+        loops[0][2, 0] += 0.02
     graph = SurfaceGraph(planar_patches=planes, freeform_patches=[patch], adjacency=[
         SurfaceAdjacency(patch.patch_id, plane.patch_id, [loop])
-        for plane, loop in zip(planes, patch.boundary_loops, strict=True)
+        for plane, loop in zip(planes, loops, strict=True)
     ])
     models = {plane.patch_id: _surface_model(plane, mesh) for plane in planes}
     trims, _, _ = _shared_trim_edges(graph, models, 0.003, {patch.patch_id: fitted})
     import cadquery as cq
 
     smooth_edges = cq.Face(fitted).Edges()
-    if bad_plane:
+    if bad_plane or bad_node:
         assert not any(trim.edge.IsSame(edge.wrapped)
                        for trim in trims[patch.patch_id] for edge in smooth_edges)
     else:

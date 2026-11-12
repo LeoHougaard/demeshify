@@ -1121,7 +1121,16 @@ def _shared_trim_edges(
                     (samples - neighbor.patch.origin) @ neighbor.patch.normal))
                 local_limit = max(float(np.linalg.norm(np.ptp(points, axis=0))) * 1e-4, 1e-7)
                 if error <= local_limit and plane_error <= local_limit:
-                    candidates.append((error, edge))
+                    try:
+                        for point in points:
+                            projection = GeomAPI_ProjectPointOnCurve(_point(point), curve)
+                            if (not projection.NbPoints()
+                                    or projection.LowerDistance() > local_limit):
+                                break
+                        else:
+                            candidates.append((error, edge))
+                    except Exception:
+                        continue
             if not candidates:
                 break
             _, edge = min(candidates, key=lambda item: item[0])
@@ -4643,6 +4652,26 @@ def _build_surface_brep_single(
         if model is not None:
             models[patch.patch_id] = model
     annular_faces: dict[str, TopoDS_Face] = {}
+    for patch in graph.extrusion_patches:
+        profile = np.asarray(patch.profile_points, dtype=float)
+        if (not 0 < len(patch.vertex_indices) <= 1500 or not 5 <= len(profile) <= 500
+                or np.linalg.norm(profile[0] - profile[-1]) > 1e-7):
+            continue
+        direction_length = float(np.linalg.norm(patch.direction))
+        if (not math.isfinite(direction_length) or direction_length <= 1e-12
+                or patch.end <= patch.start):
+            continue
+        direction = patch.direction / direction_length
+        nodes = np.asarray(data.mesh.vertices[patch.vertex_indices], dtype=float)
+        heights = np.clip((nodes - profile[0]) @ direction, 0.0, patch.end - patch.start)
+        # Every support node must be close to a known point on the interpolated
+        # profile translated within the finite extrusion interval.
+        distances = cKDTree(profile).query(nodes - np.outer(heights, direction))[0]
+        if float(np.max(distances)) > tolerance * 0.5:
+            continue
+        fitted = _linear_extrusion_face(patch, [], data.mesh, tolerance)
+        if fitted is not None:
+            annular_faces[patch.patch_id] = fitted
     for patch in graph.freeform_patches:
         if (len(patch.boundary_loops) != 2 or len(patch.vertex_indices) > 1500
                 or sum(len(loop) for loop in patch.boundary_loops) > 502):
@@ -4735,6 +4764,16 @@ def _build_surface_brep_single(
     for patch in graph.patches:
         if progress_callback is not None:
             progress_callback(f"surface_face_start patch={patch.patch_id} kind={patch.kind}")
+        annular = annular_faces.get(patch.patch_id)
+        shared = trim_edges.get(patch.patch_id, [])
+        if annular is not None and len(shared) == 2 and all(
+            any(edge.edge.IsSame(candidate.wrapped) for candidate in cq.Face(annular).Edges())
+            for edge in shared
+        ):
+            faces.append(annular)
+            if isinstance(patch, FreeformPatch):
+                point_fitted_face_count += 1
+            continue
         model = models.get(patch.patch_id)
         if model is not None:
             if isinstance(patch, ToroidalPatch) and patch.boundary_loops:
@@ -4993,15 +5032,6 @@ def _build_surface_brep_single(
             else:
                 add_faceted_or_mark(patch)
         elif isinstance(patch, FreeformPatch):
-            annular = annular_faces.get(patch.patch_id)
-            shared = trim_edges.get(patch.patch_id, [])
-            if annular is not None and len(shared) == 2 and all(
-                any(edge.edge.IsSame(candidate.wrapped) for candidate in cq.Face(annular).Edges())
-                for edge in shared
-            ):
-                faces.append(annular)
-                point_fitted_face_count += 1
-                continue
             longest_boundary = max(
                 (len(loop) for loop in patch.boundary_loops),
                 default=0,
