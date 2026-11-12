@@ -1619,7 +1619,7 @@ async function renderResult(report, options = {}) {
     : verifiedFallback
       ? "Geometry verified; CAD surface recovery incomplete"
     : surfaceMode && report.surface.closed
-      ? "Verified watertight analytic B-rep"
+      ? "Verified watertight B-rep"
       : "Reconstructed CAD model";
   const hasOutput = report.status !== "failed";
   document.querySelector("#downloads").innerHTML = hasOutput

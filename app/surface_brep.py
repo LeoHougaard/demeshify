@@ -27,6 +27,7 @@ from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepFeat import BRepFeat_SplitShape
 from OCP.BRepFill import BRepFill, BRepFill_Filling
 from OCP.BRepLib import BRepLib
+from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
 from OCP.BRepTools import BRepTools, BRepTools_ReShape, BRepTools_WireExplorer
 from OCP.GCE2d import GCE2d_MakeSegment
 from OCP.Geom import (
@@ -78,6 +79,7 @@ from OCP.TColgp import (
     TColgp_Array2OfPnt,
     TColgp_HArray1OfPnt,
 )
+from OCP.TColStd import TColStd_HArray1OfReal
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID, TopAbs_WIRE
 from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopLoc import TopLoc_Location
@@ -1083,6 +1085,7 @@ def _shared_trim_edges(
     graph: SurfaceGraph,
     models: dict[str, _SurfaceModel],
     tolerance: float,
+    annular_faces: dict[str, TopoDS_Face] | None = None,
 ) -> tuple[dict[str, list[_TrimEdge]], int, int]:
     by_patch: dict[str, list[_TrimEdge]] = {patch.patch_id: [] for patch in graph.patches}
     records = [
@@ -1090,10 +1093,52 @@ def _shared_trim_edges(
         for adjacency in graph.adjacency
         for points in adjacency.boundary_curves
     ]
+    overrides: dict[int, _TrimEdge] = {}
+    for patch_id, face in (annular_faces or {}).items():
+        borders = [(index, second if first == patch_id else first, points)
+                   for index, (first, second, points) in enumerate(records)
+                   if patch_id in (first, second)]
+        closed_edges = [edge.wrapped for edge in cq.Face(face).Edges()
+                        if BRep_Tool.IsClosed_s(edge.wrapped)]
+        if len(borders) != 2 or len(closed_edges) != 2:
+            continue
+        proposed: dict[int, _TrimEdge] = {}
+        available = list(closed_edges)
+        for index, neighbor_id, points in borders:
+            neighbor = models.get(neighbor_id)
+            if neighbor is None or not isinstance(neighbor.patch, PlanarPatch):
+                break
+            if len(points) < 5 or np.linalg.norm(points[0] - points[-1]) > 1e-7:
+                break
+            candidates = []
+            for edge in available:
+                curve = BRepAdaptor_Curve(edge).Curve().Curve()
+                error, parameters = _project_parameters(points, curve)
+                if not len(parameters):
+                    continue
+                samples = np.asarray([point.toTuple() for point in cq.Edge(edge).sample(64)[0]])
+                plane_error = np.max(np.abs(
+                    (samples - neighbor.patch.origin) @ neighbor.patch.normal))
+                local_limit = max(float(np.linalg.norm(np.ptp(points, axis=0))) * 1e-4, 1e-7)
+                if error <= local_limit and plane_error <= local_limit:
+                    candidates.append((error, edge))
+            if not candidates:
+                break
+            _, edge = min(candidates, key=lambda item: item[0])
+            proposed[index] = _TrimEdge(edge, points, points.copy())
+            available = [item for item in available if not item.IsSame(edge)]
+        if len(proposed) == 2:
+            overrides.update(proposed)
     endpoints, canonical_vertices = _canonical_vertices(records, models, tolerance)
     vertex_occurrences = Counter(id(vertex) for vertex in endpoints.values())
     canonical_edge_count = 0
     for record_index, (first_id, second_id, points) in enumerate(records):
+        if record_index in overrides:
+            edge = overrides[record_index]
+            by_patch[first_id].append(edge)
+            by_patch[second_id].append(edge)
+            canonical_edge_count += 1
+            continue
         first = models.get(first_id)
         second = models.get(second_id)
         start = endpoints.get((record_index, 0))
@@ -2872,6 +2917,80 @@ def _graph_bspline_face_impl(
     return _orient_face(face, patch, mesh)
 
 
+def _closed_loop_loft_face(
+    patch: FreeformPatch, mesh: object, tolerance: float,
+) -> TopoDS_Face | None:
+    """Fit an annular residual from its two loops, checking every support node."""
+    if len(patch.boundary_loops) != 2 or len(patch.vertex_indices) > 500:
+        return None
+    loops = [np.asarray(loop, dtype=float) for loop in patch.boundary_loops]
+    if any(len(loop) < 5 or np.linalg.norm(loop[0] - loop[-1]) > 1e-7 for loop in loops):
+        return None
+    if len(loops[0]) != len(loops[1]):
+        return None
+    rings = [loop[:-1].copy() for loop in loops]
+    centered = [ring - np.mean(ring, axis=0) for ring in rings]
+    normals = [np.sum(np.cross(ring, np.roll(ring, -1, axis=0)), axis=0) for ring in centered]
+    if float(normals[0] @ normals[1]) < 0:
+        rings[1] = rings[1][::-1]
+        centered[1] = centered[1][::-1]
+    shift = min(range(len(rings[1])), key=lambda index: float(np.sum(
+        (centered[0] - np.roll(centered[1], -index, axis=0)) ** 2)))
+    rings[1] = np.roll(rings[1], -shift, axis=0)
+    loops = [np.vstack((ring, ring[0])) for ring in rings]
+    lengths = np.concatenate([np.linalg.norm(np.diff(loop, axis=0), axis=1) for loop in loops])
+    positive = lengths[lengths > 1e-12]
+    if not len(positive):
+        return None
+    fit_tolerance = min(tolerance, max(float(np.min(positive)) * 0.02, 1e-8))
+    try:
+        increments = np.mean([np.linalg.norm(np.diff(loop, axis=0), axis=1)
+                              for loop in loops], axis=0)
+        parameters = np.r_[0.0, np.cumsum(increments)]
+        parameters /= parameters[-1]
+        common_parameters = TColStd_HArray1OfReal(1, len(parameters))
+        for index, parameter in enumerate(parameters, start=1):
+            common_parameters.SetValue(index, float(parameter))
+        loft = BRepOffsetAPI_ThruSections(False, False, fit_tolerance)
+        loft.CheckCompatibility(False)
+        for loop in loops:
+            # These are closed cross-sections: enforce periodic derivatives
+            # rather than merely coincident endpoints on an open B-spline.
+            points = TColgp_HArray1OfPnt(1, len(loop) - 1)
+            for index, point in enumerate(loop[:-1], start=1):
+                points.SetValue(index, _point(point))
+            curve = GeomAPI_Interpolate(points, common_parameters, True, fit_tolerance)
+            curve.Perform()
+            if not curve.IsDone():
+                return None
+            edge = BRepBuilderAPI_MakeEdge(curve.Curve())
+            if not edge.IsDone():
+                return None
+            wire = BRepBuilderAPI_MakeWire(edge.Edge())
+            if not wire.IsDone():
+                return None
+            loft.AddWire(wire.Wire())
+        loft.Build()
+        if not loft.IsDone():
+            return None
+        faces = cq.Shape.cast(loft.Shape()).Faces()
+        if len(faces) != 1 or not _usable_face(faces[0].wrapped, tolerance):
+            return None
+        face = faces[0].wrapped
+        area_ratio = float(faces[0].Area()) / max(patch.area, 1e-15)
+        if not 0.5 <= area_ratio <= 1.5:
+            return None
+        surface = BRep_Tool.Surface_s(face)
+        bounds = BRepTools.UVBounds_s(face)
+        for node in np.asarray(mesh.vertices[patch.vertex_indices], dtype=float):
+            projection = GeomAPI_ProjectPointOnSurf(_point(node), surface, *bounds)
+            if not projection.NbPoints() or projection.LowerDistance() > tolerance:
+                return None
+        return _orient_face(face, patch, mesh)
+    except Exception:
+        return None
+
+
 def _graph_bspline_face(
     patch: FreeformPatch,
     edges: list[_TrimEdge],
@@ -2881,15 +3000,13 @@ def _graph_bspline_face(
     """Prefer shared topology, then retain the validated independent trim."""
 
     fitted = _graph_bspline_face_impl(patch, edges, mesh, tolerance)
-    if fitted is not None or not edges:
+    if fitted is not None:
         return fitted
-    return _graph_bspline_face_impl(
-        patch,
-        edges,
-        mesh,
-        tolerance,
-        shared_topology=False,
-    )
+    if edges:
+        fitted = _graph_bspline_face_impl(
+            patch, edges, mesh, tolerance, shared_topology=False,
+        )
+    return fitted
 
 
 def _faceted_residual_faces(
@@ -4510,10 +4627,20 @@ def _build_surface_brep_single(
             model = None
         if model is not None:
             models[patch.patch_id] = model
+    annular_faces: dict[str, TopoDS_Face] = {}
+    for patch in graph.freeform_patches:
+        if len(patch.boundary_loops) != 2 or len(patch.vertex_indices) > 500:
+            continue
+        if _graph_bspline_face_impl(patch, [], data.mesh, tolerance) is not None:
+            continue
+        fitted = _closed_loop_loft_face(patch, data.mesh, tolerance)
+        if fitted is not None:
+            annular_faces[patch.patch_id] = fitted
     trim_edges, topology_vertex_count, topology_edge_count = _shared_trim_edges(
         graph,
         models,
         tolerance,
+        annular_faces,
     )
     if progress_callback is not None:
         progress_callback(
@@ -4850,6 +4977,15 @@ def _build_surface_brep_single(
             else:
                 add_faceted_or_mark(patch)
         elif isinstance(patch, FreeformPatch):
+            annular = annular_faces.get(patch.patch_id)
+            shared = trim_edges.get(patch.patch_id, [])
+            if annular is not None and len(shared) == 2 and all(
+                any(edge.edge.IsSame(candidate.wrapped) for candidate in cq.Face(annular).Edges())
+                for edge in shared
+            ):
+                faces.append(annular)
+                point_fitted_face_count += 1
+                continue
             longest_boundary = max(
                 (len(loop) for loop in patch.boundary_loops),
                 default=0,

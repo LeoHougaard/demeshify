@@ -4,7 +4,10 @@
 
 Started November 12, 2026 from reliability branch
 `codex/stl-reliability-20261011`, `fb6c6f23ff3e53d7f0b86450b64299e4a17400a4`.
-No reconstruction candidate has been promoted in this run. The October
+The registered annular-boundary candidate (V9) is locally qualified for a
+source milestone; see `docs/annular-recovery-2026-11-12.md`. It improves one
+strict reconstruction without losing a prior pass in 20 matched public cases.
+The October
 498/500 geometry, 384/500 strict CAD and 406/500 non-faceted results are
 historical, not a fresh baseline. Existing source and private geometry remain
 local. Research is not paused. No duration or spending budget was supplied.
@@ -73,7 +76,8 @@ runtime; original full-run evidence must never be overwritten by a candidate.
 - `benchmarks/multires-1000/`: full 1,000-source acquisition/export is resumable
   serially. Source byte hashes, signature exclusions, preset meshes and split
   membership are retained locally. Neither 1,000 sources nor the 10,000-case
-  baseline is complete yet. No reconstruction gain is claimed.
+  baseline is complete yet. The measured reconstruction gain below is limited
+  to selected development cases, not a corpus-wide estimate.
 - Eight new tests cover mesh identity, real ten-way curved exports, rejection
   of unchanged planar exports, partial-count reporting, identical reference
   acceptance and rejection of displaced/extra geometry. Related benchmark
@@ -94,7 +98,17 @@ presets (coarse, middle, fine), 18 cases. This is selected development evidence,
 not an unbiased corpus estimate. Personal difficult anchors remain additional
 regressions. Other resolutions of the same sources are not independent holdout.
 
-Run matched inner-cohort baselines and candidates now. Expand checks after a
+V9 aligns closed residual cross-sections and their periodic parameters, then
+shares each complete fitted boundary with its planar neighbor. The matched
+13-case inner cohort improves from 4 to 5 strict passes. Seven additional
+exports of the affected source retain 4 strict passes; together these are
+20 distinct cases from five source models, improving 8 to 9 strict passes.
+The affected source improves 5/10 to 6/10 exports; its all-ten source-model
+success remains false. Three private development anchors retain their prior
+geometry outcomes, including two non-faceted successes. No holdout tuning or
+gate/budget changes occurred. Failed V1 through V8 evidence remains local.
+
+Expand checks after a
 candidate earns them: targeted failure plus passing controls, all ten variants
 of affected development sources, then broader validation and justified full
 corpus evaluation. Resume fixture acquisition in separate serial batches
@@ -110,7 +124,7 @@ source, tests and public documentation, never private manifests. Leo authorized
 delivery through qualified CI, ready-for-review, merge and merged-SHA CI;
 initial draft status is not a final delivery gate.
 
-## Product rubric (unmeasured unless evidence is attached)
+## Product rubric
 
 1. Import an original STL, choose correct units, see dimensions before convert.
 2. Convert with truthful progress, bounded completion and actionable failure.
@@ -121,6 +135,12 @@ initial draft status is not a final delivery gate.
 5. Export STEP, independently reopen every transfer root, verify topology and
    geometry, then reopen the saved run in the product.
 
-Record reproducible actions, action counts, screenshots and artifact hashes
-for success, fallback and malformed-input flows. Current UI claims remain
-unverified in this run; source inspection is not a browser workflow test.
+The V9 success flow was exercised in the native browser: original STL import,
+millimetre dimensions, live progress, input/STEP inspection, projection and
+wheel zoom, export, independent STEP reimport, and saved-run reopen. Both
+saved input and STEP were visible after reopening. Screenshots and downloaded
+STEP hash are retained locally in `benchmarks/multires-1000/product-v9-runs/`.
+The export caption now avoids calling fitted B-splines analytic. Right-drag
+orbit and middle-drag pan were not driven by the available native drag API;
+fallback and malformed-input browser flows remain unverified in this run.
+Record those limitations rather than awarding a product quality score.
