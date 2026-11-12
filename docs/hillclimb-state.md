@@ -6,11 +6,12 @@ Started November 12, 2026 from reliability branch
 `codex/stl-reliability-20261011`, `fb6c6f23ff3e53d7f0b86450b64299e4a17400a4`.
 The registered annular-boundary candidate V9 is merged in PR #2. Its exact
 head `1f4d35d` and main merge `724953f` both passed repository CI. The denser
-interior extension V10 is the strongest locally verified candidate; see
-`docs/dense-annular-recovery-2026-11-12.md`. Development strict recovery now
-improves from 8 to 10 of 20 cases, without losing a prior pass. Nine separate
-validation cases and three private geometry controls retain their outcomes;
-the full 262-test local suite passes.
+interior extension V10 is merged in PR #3; both `a510c2c` and main `0bd4001`
+passed CI. Periodic closed extrusion fitting V11 is now the strongest locally
+verified candidate; see `docs/periodic-extrusion-recovery-2026-11-12.md`.
+Development strict recovery improves from 8 to 11 of 20 cases, without losing
+a prior pass. Nine separate validation cases and three private geometry
+controls retain their outcomes; the full 263-test local suite passes.
 The October
 498/500 geometry, 384/500 strict CAD and 406/500 non-faceted results are
 historical, not a fresh baseline. Existing source and private geometry remain
@@ -122,6 +123,16 @@ exact source hash. Acquisition's clean five-model batch reached 74/740 fixtures;
 continue toward 1,000/10,000 in bounded batches between experiments. The next
 observed category is zero-free-edge invalid trim shells, not another blanket
 increase in fitting bounds. Inspect actual faces and shared curves first.
+
+V11's actual shell diagnostic found 34 bad edge orientations around a small
+closed extrusion. Retaining its profile nodes in a periodic fit recovered the
+fine export and reduced conversion time 109.46 to 40.93 seconds, with greater
+sampled memory (2.01 to 2.81 GB). The affected source reaches 8/10, still failing
+all-ten acceptance. Its hole's Euler signature and five visual sections match
+the reference. Fragmented trim chains remain: the delivered STEP has 1,011
+edges. Share complete periodic rims next, and make STL preview export explicitly
+serial as a separate resource change. Acquisition reached 99/990 usable inputs;
+20 additional licensed KiCad STEP downloads are not counted until qualified.
 
 Expand checks after a
 candidate earns them: targeted failure plus passing controls, all ten variants
