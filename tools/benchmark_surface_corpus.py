@@ -70,22 +70,56 @@ def step_surface_metrics(path: Path) -> dict[str, object]:
     }
 
 
-def reference_topology_diagnostic(source: dict, output: dict) -> dict:
+def reference_topology_diagnostic(
+    source: dict, output: dict, *, source_step: Path | None = None,
+    output_step: Path | None = None,
+) -> dict:
     """Report supported native invariants without changing existing acceptance."""
+    from_files = source_step is not None or output_step is not None
+    measurement = {
+        'measurement_stage': ('fresh_step_import_before_meshing' if from_files
+                              else 'supplied_metric_shapes'),
+        'provenance': {'kind': 'independent_step_imports' if from_files
+                       else 'supplied_metric_shapes'},
+    }
+    if from_files:
+        missing = [f'{name}_step_unavailable' for name, path in (
+            ('reference', source_step), ('output', output_step),
+        ) if path is None]
+        if missing:
+            return {'reference': None, 'output': None, 'available': False,
+                    'topology_match': None, 'status': 'indeterminate',
+                    'indeterminate_reasons': missing, **measurement}
+        try:
+            # Scoring tessellation can attach invalid polygon-on-triangulation
+            # metadata to otherwise valid native topology. Inspect independent
+            # imports instead of cleaning or modifying the scorer's objects.
+            measurement['provenance'].update(
+                reference_step_sha256=hashlib.sha256(source_step.read_bytes()).hexdigest(),
+                output_step_sha256=hashlib.sha256(output_step.read_bytes()).hexdigest(),
+            )
+            source = {'shape': load_step_shape(source_step)}
+            output = {'shape': load_step_shape(output_step)}
+        except Exception as exc:
+            return {'reference': None, 'output': None, 'available': False,
+                    'topology_match': None, 'status': 'indeterminate',
+                    'indeterminate_reasons': ['diagnostic_error'],
+                    'diagnostic_error': f'{type(exc).__name__}: {exc}', **measurement}
     missing = [f'{name}_shape_unavailable' for name, metrics in (
         ('reference', source), ('output', output),
     ) if metrics.get('shape') is None]
     if missing:
         return {'reference': None, 'output': None, 'available': False,
                 'topology_match': None, 'status': 'indeterminate',
-                'indeterminate_reasons': missing}
+                'indeterminate_reasons': missing, **measurement}
     try:
-        return {'available': True, **compare_topology(source['shape'], output['shape'])}
+        return {'available': True, **compare_topology(source['shape'], output['shape']),
+                **measurement}
     except Exception as exc:
         return {'reference': None, 'output': None, 'available': False,
                 'topology_match': None, 'status': 'indeterminate',
                 'indeterminate_reasons': ['diagnostic_error'],
-                'diagnostic_error': f'{type(exc).__name__}: {exc}'}
+                'diagnostic_error': f'{type(exc).__name__}: {exc}', **measurement}
 
 
 def analytic_quality_metrics(
@@ -312,6 +346,11 @@ def benchmark_case(
             raise TimeoutError(f"Conversion exceeded {conversion_timeout:g} seconds")
         verification_started = time.perf_counter()
         step_path = working / "reconstruction.step"
+        source_step = case.get("source_step")
+        source_step_path = _case_path(source_step, manifest_parent) if source_step else None
+        topology_diagnostic = reference_topology_diagnostic(
+            {}, {}, source_step=source_step_path, output_step=step_path,
+        )
         step_roundtrip_valid = False
         step_roundtrip_solids = 0
         output_metrics: dict[str, object] = {}
@@ -322,10 +361,8 @@ def benchmark_case(
             step_roundtrip_solids = len(imported.Solids())
 
         source_metrics: dict[str, object] = {}
-        source_step = case.get("source_step")
         if source_step and _case_path(source_step, manifest_parent).is_file():
             source_metrics = step_surface_metrics(_case_path(source_step, manifest_parent))
-        topology_diagnostic = reference_topology_diagnostic(source_metrics, output_metrics)
         analytic_metrics = (
             analytic_quality_metrics(source_metrics, output_metrics)
             if source_metrics and output_metrics
