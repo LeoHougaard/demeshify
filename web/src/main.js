@@ -103,7 +103,7 @@ app.innerHTML = `
         <canvas id="inputCanvas"></canvas><canvas id="outputCanvas" class="hidden"></canvas>
         <div id="surfaceLegend" class="surface-legend hidden"><span><i class="fitted-edge"></i>Fitted surface boundary</span><span><i class="faceted-edge"></i>Fallback triangle edges</span><small id="surfaceLegendStatus"></small></div>
         <div id="inputTriangleLegend" class="surface-legend input-triangle-legend hidden"><span><i class="source-triangle-edge"></i>Every source STL triangle edge</span><small id="inputTriangleLegendStatus"></small></div>
-        <div class="navigation-hint">Right-drag rotates around model center · Middle-drag pan · Wheel zoom</div>
+        <div class="navigation-hint">Right-drag orbit · Middle-drag pan · Wheel zoom · Double-click or F to fit</div>
         <div id="processing" class="processing hidden" role="status" aria-live="polite">
           <div class="processing-card">
             <div class="processing-heading"><div class="scan-object"><span></span></div><div><small>CONVERTING</small><strong id="processingStage">Starting reconstruction</strong></div></div>
@@ -119,6 +119,9 @@ app.innerHTML = `
   <aside id="advancedDrawer" class="advanced-drawer hidden" role="dialog" aria-modal="true" aria-labelledby="advancedTitle" aria-hidden="true">
     <header class="drawer-header"><div><small>Optional controls</small><strong id="advancedTitle">Advanced</strong></div><button id="advancedClose" type="button" aria-label="Close advanced settings">×</button></header>
     <div class="drawer-content">
+      <section class="advanced-section">
+        <h2>Model viewer</h2><button id="fitView" type="button">Fit view</button>
+      </section>
       <section class="advanced-section">
         <h2>Conversion settings</h2>
         <div class="advanced-settings-grid">
@@ -196,6 +199,7 @@ class MeshViewer {
         );
       }
     }, true);
+    canvas.addEventListener("dblclick", () => this.fitView());
 
     // Camera-relative studio lighting removes any fixed world-space top,
     // bottom, floor, or shadow direction while preserving readable curvature.
@@ -388,47 +392,51 @@ class MeshViewer {
     }
     topologyGeometry.dispose();
     weldedGeometry.dispose();
-    if (resetCamera || !hadMesh) {
-      const size = box.getSize(new THREE.Vector3());
-      const radius = Math.max(size.length() * 0.65, 1e-6);
-      const framingSphere = new THREE.Sphere(
-        this.rotationPivot.clone(),
-        Math.max(size.length() * 0.55, 1e-6),
-      );
-      const cameraPosition = new THREE.Vector3(radius, radius * 0.72, radius);
-      const distance = cameraPosition.length();
-      this.orthoViewHeight =
-        2 * distance * Math.tan(THREE.MathUtils.degToRad(this.perspectiveCamera.fov / 2));
-      for (const camera of [this.perspectiveCamera, this.orthographicCamera]) {
-        camera.near = radius / 1000;
-        camera.far = radius * 100;
-        camera.position.copy(cameraPosition);
-        camera.up.set(0, 1, 0);
-        camera.zoom = 1;
-      }
-      this.updateCameraFrustums(
-        this.canvas.parentElement.clientWidth,
-        this.canvas.parentElement.clientHeight,
-      );
-      this.controls.setLookAt(
-        cameraPosition.x,
-        cameraPosition.y,
-        cameraPosition.z,
-        this.rotationPivot.x,
-        this.rotationPivot.y,
-        this.rotationPivot.z,
-        false,
-      );
-      this.controls.setOrbitPoint(
-        this.rotationPivot.x,
-        this.rotationPivot.y,
-        this.rotationPivot.z,
-      );
-      // Use the controller's perspective/orthographic-aware fitting math so
-      // every model starts fully visible with a small framing margin.
-      this.controls.fitToSphere(framingSphere, false);
-      this.controls.update(0);
+    if (resetCamera || !hadMesh) this.fitView();
+    this.render();
+  }
+
+  fitView() {
+    if (!this.mesh) return;
+    const size = this.mesh.geometry.boundingBox.getSize(new THREE.Vector3());
+    const radius = Math.max(size.length() * 0.65, 1e-6);
+    const framingSphere = new THREE.Sphere(
+      this.rotationPivot.clone(),
+      Math.max(size.length() * 0.55, 1e-6),
+    );
+    const cameraPosition = new THREE.Vector3(radius, radius * 0.72, radius);
+    const distance = cameraPosition.length();
+    this.orthoViewHeight =
+      2 * distance * Math.tan(THREE.MathUtils.degToRad(this.perspectiveCamera.fov / 2));
+    for (const camera of [this.perspectiveCamera, this.orthographicCamera]) {
+      camera.near = radius / 1000;
+      camera.far = radius * 100;
+      camera.position.copy(cameraPosition);
+      camera.up.set(0, 1, 0);
+      camera.zoom = 1;
     }
+    this.updateCameraFrustums(
+      this.canvas.parentElement.clientWidth,
+      this.canvas.parentElement.clientHeight,
+    );
+    this.controls.setLookAt(
+      cameraPosition.x,
+      cameraPosition.y,
+      cameraPosition.z,
+      this.rotationPivot.x,
+      this.rotationPivot.y,
+      this.rotationPivot.z,
+      false,
+    );
+    this.controls.setOrbitPoint(
+      this.rotationPivot.x,
+      this.rotationPivot.y,
+      this.rotationPivot.z,
+    );
+    // Use the controller's perspective/orthographic-aware fitting math so
+    // every model starts fully visible with a small framing margin.
+    this.controls.fitToSphere(framingSphere, false);
+    this.controls.update(0);
     this.render();
   }
 
@@ -618,6 +626,20 @@ function setAdvancedOpen(open) {
 advancedToggle.addEventListener("click", () => setAdvancedOpen(true));
 advancedClose.addEventListener("click", () => setAdvancedOpen(false));
 document.querySelector("#openResultDetails").addEventListener("click", () => setAdvancedOpen(true));
+function fitVisibleModel() {
+  if (!outputCanvas.classList.contains("hidden")) outputViewer?.fitView();
+  else if (!inputCanvas.classList.contains("hidden")) inputViewer?.fitView();
+}
+document.querySelector("#fitView").addEventListener("click", () => {
+  fitVisibleModel();
+  setAdvancedOpen(false);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key.toLowerCase() !== "f" || event.ctrlKey || event.altKey || event.metaKey
+    || event.target.closest("input, select, textarea, [contenteditable]:not([contenteditable='false'])")) return;
+  event.preventDefault();
+  fitVisibleModel();
+});
 drawerBackdrop.addEventListener("click", () => setAdvancedOpen(false));
 document.addEventListener("keydown", (event) => {
   if (advancedDrawer.classList.contains("hidden")) return;
@@ -1041,6 +1063,7 @@ document.querySelector("#resetAllDimensions").addEventListener("click", () => re
 
 applyFeatureEdits.addEventListener("click", async () => {
   if (!activeReport?.plan || !editablePlan || editorBusy || !plansDiffer()) return;
+  const selectionVersion = fileSelectionVersion;
   editorBusy = true;
   renderEditorFeedback("Rebuilding the ordered feature tree and verifying it against the STL…");
   try {
@@ -1060,9 +1083,11 @@ applyFeatureEdits.addEventListener("click", async () => {
       throw new Error(detail || `Rebuild failed (${response.status})`);
     }
     const report = await response.json();
+    if (selectionVersion !== fileSelectionVersion) return;
     editorBusy = false;
-    await renderResult(report, { scroll: false });
+    await renderResult(report, { scroll: false, selectionVersion });
   } catch (error) {
+    if (selectionVersion !== fileSelectionVersion) return;
     editorBusy = false;
     renderEditorFeedback(error.message);
     editorFeedback.classList.add("error");
@@ -1099,7 +1124,47 @@ document.querySelector("#useMetres").addEventListener("click", () => {
   updateInputDimensions();
 });
 
+function resetResultForInput() {
+  livePreviewGeneration += 1;
+  livePreviewLoading = false;
+  activeReport = null;
+  editablePlan = null;
+  selectedFeatureId = null;
+  undoStack = [];
+  redoStack = [];
+  editorBusy = false;
+  document.querySelector("#units").disabled = false;
+  document.querySelector("#useMetres").disabled = false;
+  for (const element of [document.querySelector("#results"), featureEditor, viewTabs,
+    surfaceLegend, inputTriangleLegend, processing, baseWarnings, inputCanvas, outputCanvas]) {
+    element.classList.add("hidden");
+  }
+  for (const id of ["downloads", "advancedDownloads", "featurePlan", "warnings"]) {
+    document.getElementById(id).replaceChildren();
+  }
+  for (const id of ["p95", "volumeError", "construction", "constructionUnit", "elapsed"]) {
+    document.getElementById(id).textContent = "—";
+  }
+  surfaceLegendStatus.textContent = "";
+  viewerEmpty.classList.remove("hidden");
+  viewerEmpty.querySelector("strong").textContent = "Import a model to inspect it";
+  viewerEmpty.querySelector("p").textContent = "Right-drag to orbit · wheel to zoom · double-click to fit";
+  document.querySelector("#previewSubtitle").textContent = "Import an STL to begin";
+  const url = new URL(window.location.href);
+  url.searchParams.delete("run");
+  window.history.replaceState(null, "", url);
+}
+
 async function chooseFile(file) {
+  const selectionVersion = ++fileSelectionVersion;
+  resetResultForInput();
+  selectedFile = null;
+  selectedDimensions = null;
+  updateInputDimensions();
+  button.disabled = true;
+  fileChip.classList.add("hidden");
+  dropzone.classList.remove("hidden");
+  sampleButton.classList.remove("hidden");
   if (!file || !file.name.toLowerCase().endsWith(".stl")) {
     showError("Choose a file with an .stl extension.");
     fileInput.value = "";
@@ -1115,12 +1180,7 @@ async function chooseFile(file) {
     fileInput.value = "";
     return;
   }
-  const selectionVersion = ++fileSelectionVersion;
   const showPreview = file.size <= MAX_PREVIEW_BYTES;
-  selectedFile = null;
-  selectedDimensions = null;
-  updateInputDimensions();
-  button.disabled = true;
   errorBox.classList.add("hidden");
   if (showPreview) {
     try {
@@ -1169,6 +1229,7 @@ async function chooseFile(file) {
 function clearFile(event) {
   event?.preventDefault();
   fileSelectionVersion += 1;
+  resetResultForInput();
   selectedFile = null;
   selectedDimensions = null;
   updateInputDimensions();
@@ -1176,15 +1237,6 @@ function clearFile(event) {
   fileChip.classList.add("hidden");
   dropzone.classList.remove("hidden");
   sampleButton.classList.remove("hidden");
-  viewerEmpty.classList.remove("hidden");
-  viewerEmpty.querySelector("strong").textContent = "Import a model to inspect it";
-  viewerEmpty.querySelector("p").textContent = "Drag to orbit · pinch or scroll to zoom";
-  inputCanvas.classList.add("hidden");
-  outputCanvas.classList.add("hidden");
-  viewTabs.classList.add("hidden");
-  surfaceLegend.classList.add("hidden");
-  surfaceLegendStatus.textContent = "";
-  inputTriangleLegend.classList.add("hidden");
   button.disabled = true;
 }
 
@@ -1319,9 +1371,9 @@ async function updateLivePreview(progress) {
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-async function waitForReconstruction(runId) {
+async function waitForReconstruction(runId, selectionVersion = fileSelectionVersion) {
   let transientFailures = 0;
-  while (true) {
+  while (selectionVersion === fileSelectionVersion) {
     let response;
     let progress;
     try {
@@ -1332,6 +1384,7 @@ async function waitForReconstruction(runId) {
       }
       transientFailures = 0;
     } catch (error) {
+      if (selectionVersion !== fileSelectionVersion) return null;
       transientFailures += 1;
       if (transientFailures >= 4) {
         throw new Error(
@@ -1342,6 +1395,7 @@ async function waitForReconstruction(runId) {
       await wait(Math.min(5000, 750 * 2 ** (transientFailures - 1)));
       continue;
     }
+    if (selectionVersion !== fileSelectionVersion) return null;
     renderReconstructionProgress(progress);
     if (progress.status === "failed") {
       throw new Error(progress.error || "Reconstruction failed.");
@@ -1349,15 +1403,18 @@ async function waitForReconstruction(runId) {
     if (progress.status === "complete") {
       const reportResponse = await fetch(`/api/runs/${runId}`, { cache: "no-store" });
       const report = await reportResponse.json();
+      if (selectionVersion !== fileSelectionVersion) return null;
       if (!reportResponse.ok) throw new Error(report.detail || "Could not load the result.");
       return report;
     }
     await wait(650);
   }
+  return null;
 }
 
 button.addEventListener("click", async () => {
   if (!selectedFile) return;
+  const selectionVersion = fileSelectionVersion;
   button.disabled = true;
   document.querySelector("#units").disabled = true;
   document.querySelector("#useMetres").disabled = true;
@@ -1391,24 +1448,30 @@ button.addEventListener("click", async () => {
       throw new Error("Could not reach the converter. The STL preview runs in your browser, but conversion needs the server. Check that the server is running, then try again.");
     }
     const payload = await response.json();
+    if (selectionVersion !== fileSelectionVersion) return;
     if (!response.ok) throw new Error(payload.detail || "Reconstruction failed.");
     const runUrl = new URL(window.location.href);
     runUrl.searchParams.set("run", payload.id);
     window.history.replaceState(null, "", runUrl);
     renderReconstructionProgress(payload);
-    const report = await waitForReconstruction(payload.id);
-    await renderResult(report);
+    const report = await waitForReconstruction(payload.id, selectionVersion);
+    if (report) await renderResult(report, { selectionVersion });
   } catch (error) {
-    showError(error.message);
+    if (selectionVersion === fileSelectionVersion) showError(error.message);
   } finally {
-    processing.classList.add("hidden");
-    button.disabled = false;
-    document.querySelector("#units").disabled = false;
-    document.querySelector("#useMetres").disabled = false;
+    if (selectionVersion === fileSelectionVersion) {
+      processing.classList.add("hidden");
+      button.disabled = !selectedFile;
+      document.querySelector("#units").disabled = false;
+      document.querySelector("#useMetres").disabled = false;
+    }
   }
 });
 
 async function renderResult(report, options = {}) {
+  const selectionVersion = options.selectionVersion ?? fileSelectionVersion;
+  const current = () => selectionVersion === fileSelectionVersion;
+  if (!current()) return;
   livePreviewGeneration += 1;
   surfaceLegend.classList.add("hidden");
   document.querySelector("#previewSubtitle").textContent = report.mesh?.file_name || "Saved result";
@@ -1673,12 +1736,15 @@ async function renderResult(report, options = {}) {
       });
       if (!response.ok) throw new Error();
       const outputBuffer = await response.arrayBuffer();
+      if (!current()) return;
       outputViewer ||= new MeshViewer(outputCanvas, 0x8ebbd2);
       await outputViewer.load(outputBuffer);
+      if (!current()) return;
       viewerEmpty.classList.add("hidden");
       inputCanvas.classList.add("hidden");
       outputCanvas.classList.remove("hidden");
     } catch {
+      if (!current()) return;
       viewerEmpty.querySelector("strong").textContent = "Result preview unavailable";
       viewerEmpty.querySelector("p").textContent = "The STEP download is still available";
       viewerEmpty.classList.remove("hidden");
@@ -1689,8 +1755,10 @@ async function renderResult(report, options = {}) {
     let sourceMeshBuffer = null;
     try {
       const sourceResponse = await fetch(`${fileBase}/input.stl`, { cache: "no-store" });
+      if (!current()) return;
       if (sourceResponse.ok && Number(sourceResponse.headers.get("content-length")) <= MAX_PREVIEW_BYTES) {
         sourceMeshBuffer = await sourceResponse.arrayBuffer();
+        if (!current()) return;
         inputViewer ||= new MeshViewer(inputCanvas, 0x8ebbd2);
         await inputViewer.load(sourceMeshBuffer.slice(0));
       } else {
@@ -1699,11 +1767,13 @@ async function renderResult(report, options = {}) {
     } catch {
       // The STEP result remains usable if an older saved run has no source preview.
     }
+    if (!current()) return;
     if (surfaceMode) {
       try {
         const graphResponse = await fetch(`${fileBase}/surface_graph.json`, { cache: "no-store" });
         if (graphResponse.ok) {
           const surfaceGraph = await graphResponse.json();
+          if (!current()) return;
           const overlay = outputViewer.showSurfaceOverlay(
             surfaceGraph,
             sourceMeshBuffer,
@@ -1717,6 +1787,7 @@ async function renderResult(report, options = {}) {
           surfaceLegend.classList.remove("hidden");
         }
       } catch {
+        if (!current()) return;
         surfaceLegend.classList.add("hidden");
       }
     }
@@ -1736,12 +1807,16 @@ async function renderResult(report, options = {}) {
 
 const requestedRun = new URLSearchParams(window.location.search).get("run");
 if (/^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestedRun || "")) {
+  const selectionVersion = fileSelectionVersion;
   button.disabled = true;
   processing.classList.remove("hidden");
-  waitForReconstruction(requestedRun)
-    .then((report) => renderResult(report, { scroll: false }))
-    .catch((error) => showError(error.message))
+  waitForReconstruction(requestedRun, selectionVersion)
+    .then((report) => report && renderResult(report, { scroll: false, selectionVersion }))
+    .catch((error) => {
+      if (selectionVersion === fileSelectionVersion) showError(error.message);
+    })
     .finally(() => {
+      if (selectionVersion !== fileSelectionVersion) return;
       processing.classList.add("hidden");
       button.disabled = !selectedFile;
     });
