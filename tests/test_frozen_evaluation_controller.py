@@ -673,3 +673,335 @@ def test_native_readiness_bridge_uses_frozen_cli_without_retained_output_args(tm
     command, kwargs = calls[0]
     assert command[1:3] == ["-I", "-B"] and command[4] == "--reference-readiness"
     assert len(command) == 7 and kwargs["timeout"] == 59
+
+
+@pytest.mark.parametrize("source_ready", [True, False])
+def test_host_timeout_preserves_verified_conversion_and_qualifies_only_ready_source(
+    tmp_path, monkeypatch, source_ready,
+):
+    fixture = Fixture(tmp_path, cases=1)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(controller.time, "monotonic", lambda: clock["now"])
+
+    def grade_timeout(*args, **kwargs):
+        clock["now"] = 361.0
+        raise TimeoutError("host reference preparation exceeded the original case deadline")
+
+    fixture.backend.grade = grade_timeout
+    if not source_ready:
+        fixture.backend.readiness_change = lambda row: row.update(
+            fixture_readiness={"fixture_ready": False}, evaluation_failure_kind="fixture",
+        )
+    result = fixture.run()
+    row = result["results"][0]
+    assert row["accepted"] is False and row["execution_certified"] is True
+    assert row["failure_origin"] == "grader_timeout"
+    assert row["conversion_attestation"]["permissions_revoked"] is True
+    assert row["conversion_attestation"]["launch"]["job_drained"] is True
+    assert row["conversion_wall_seconds"] == 1.25
+    assert row["solver_outcome_scored"] is source_ready
+    assert row["certified"] is source_ready
+    assert row["failure_kind"] == ("case_timeout" if source_ready else "fixture")
+    assert len(fixture.backend.convert_calls) == 1
+    assert len(fixture.backend.readiness_calls) == 1
+    resumed = fixture.run()["results"][0]
+    assert resumed["reused"] and not resumed["accepted"]
+    assert len(fixture.backend.convert_calls) == 1
+
+
+def test_host_timeout_with_unknown_source_retries_readiness_without_reconversion(
+    tmp_path, monkeypatch,
+):
+    fixture = Fixture(tmp_path, cases=1)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(controller.time, "monotonic", lambda: clock["now"])
+
+    def grade_timeout(*args, **kwargs):
+        clock["now"] = 361.0
+        raise TimeoutError("host grading exhausted the original case budget")
+
+    fixture.backend.grade = grade_timeout
+    fixture.backend.readiness_error = RuntimeError("source qualification unavailable")
+    row = fixture.run()["results"][0]
+    assert row["execution_certified"] and not row["solver_outcome_scored"]
+    assert not row["certified"] and not row["accepted"]
+    assert row["failure_kind"] == "case_timeout"
+    fixture.backend.readiness_error = None
+    row = fixture.run()["results"][0]
+    assert row["reused"] and row["certified"] and not row["accepted"]
+    assert row["solver_outcome_scored"] and row["failure_kind"] == "case_timeout"
+    assert len(fixture.backend.convert_calls) == 1
+    assert len(fixture.backend.readiness_calls) == 2
+
+
+def test_grader_protocol_error_is_not_certified_as_a_timeout(tmp_path):
+    fixture = Fixture(tmp_path, cases=1)
+
+    def protocol_error(*args, **kwargs):
+        raise controller.GraderError("actual result protocol failure")
+
+    fixture.backend.grade = protocol_error
+    row = fixture.run()["results"][0]
+    assert not row["execution_certified"] and not row["certified"] and not row["accepted"]
+    assert row["failure_origin"] == "grader"
+    assert row["conversion_attestation"]["permissions_revoked"]
+    assert not fixture.backend.readiness_calls
+
+
+def test_expired_clock_cannot_certify_incomplete_isolation_attestation(tmp_path, monkeypatch):
+    fixture = Fixture(tmp_path, cases=1)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(controller.time, "monotonic", lambda: clock["now"])
+    original = fixture.backend.convert
+
+    def unsafe_conversion(**kwargs):
+        value = original(**kwargs)
+        value.attestation["permissions_revoked"] = False
+        clock["now"] = 361.0
+        return value
+
+    fixture.backend.convert = unsafe_conversion
+    row = fixture.run()["results"][0]
+    assert row["failure_kind"] == "isolation"
+    assert not row["execution_certified"] and not row["certified"] and not row["accepted"]
+    assert not fixture.backend.readiness_calls
+
+
+def _prefix_fixture(tmp_path, cases=15):
+    fixture = Fixture(tmp_path, cases=cases)
+    document = json.loads(fixture.manifest.read_text())
+    for index, row in enumerate(document['cases']):
+        row.update(source_model_id=f'source-{index // 10}',
+                   geometry_family=f'family-{index // 10}', preset=f'q{index % 10:02d}')
+    fixture.manifest.write_text(json.dumps(document))
+    return fixture
+
+
+def test_certified_prefix_uses_two_boundary_checks_without_new_work(tmp_path):
+    fixture = _prefix_fixture(tmp_path)
+    fixture.run()
+    previous_conversions = len(fixture.backend.convert_calls)
+    previous_gradings = len(fixture.backend.grade_calls)
+    original_verify = fixture.backend.verify
+    checks = []
+
+    def verify():
+        checks.append(True)
+        original_verify()
+
+    fixture.backend.verify = verify
+    result = fixture.run(batch=1)
+    assert len(checks) == 3  # Initial bootstrap, then before/after cached transaction.
+    assert len(result['results']) == 15 and result['summary']['fresh_cases'] == 0
+    assert all(row['cache_lookup_protocol'] == 'certified-prefix-full-boundary-checks-v1'
+               for row in result['results'])
+    assert all(row['reused'] and row['timing_provenance'] == 'historical_verified_case'
+               for row in result['results'])
+    assert len(fixture.backend.convert_calls) == previous_conversions
+    assert len(fixture.backend.grade_calls) == previous_gradings
+
+
+def test_prefix_stops_at_first_missing_case_and_preserves_fresh_batch_count(tmp_path):
+    fixture = _prefix_fixture(tmp_path, cases=4)
+    first = fixture.run(batch=2)
+    assert len(first['results']) == 2
+    resumed = fixture.run(batch=1)
+    assert len(resumed['results']) == 3 and resumed['summary']['fresh_cases'] == 1
+    assert [row['reused'] for row in resumed['results']] == [True, True, False]
+    assert len(fixture.backend.convert_calls) == 3
+
+
+def test_prefix_keeps_cache_checksum_and_retained_output_hash_checks(tmp_path):
+    fixture = _prefix_fixture(tmp_path, cases=2)
+    fixture.run()
+    original_output = fixture.config.output.read_bytes()
+    record = next((fixture.root / 'frozen-controller-completed-v1').glob('*.json'))
+    envelope = json.loads(record.read_text())
+    retained = Path(envelope['retained']) / 'reconstruction.step'
+    retained.write_bytes(b'tampered retained CAD output')
+    with pytest.raises(controller.ControllerError, match='retained output changed'):
+        fixture.run(batch=1)
+    assert fixture.config.output.read_bytes() == original_output
+    assert len(fixture.backend.convert_calls) == 2
+
+
+def test_prefix_detects_fixture_change_before_reusing_a_cached_record(tmp_path):
+    fixture = _prefix_fixture(tmp_path, cases=3)
+    fixture.run()
+    case = json.loads(fixture.manifest.read_text())['cases'][1]
+    Path(case['stl']).write_bytes(b'changed input bytes')
+    resumed = fixture.run(batch=1)
+    assert resumed['results'][0]['reused']
+    assert resumed['results'][1]['status'] == 'fixture_error'
+    assert not resumed['results'][1]['accepted']
+    assert len(fixture.backend.convert_calls) == 3  # No converter ran for bad fixture.
+
+
+def test_unscored_cache_record_does_not_enter_fast_prefix(tmp_path):
+    fixture = _prefix_fixture(tmp_path, cases=1)
+    fixture.run()
+    record = next((fixture.root / 'frozen-controller-completed-v1').glob('*.json'))
+    envelope = json.loads(record.read_text())
+    envelope['result'].update(certified=False, solver_outcome_scored=False)
+    envelope.pop('record_sha256')
+    envelope['record_sha256'] = controller._hash(envelope)
+    record.write_text(json.dumps(envelope))
+    expected = controller._cases(json.loads(fixture.manifest.read_text()),
+                                 fixture.manifest.parent, None)
+    rows, halt = controller._load_scored_cached_prefix(
+        expected, fixture.backend.identity(), record.parent, fixture.root, fixture.backend,
+        fixture.manifest, controller._digest(fixture.manifest))
+    assert rows == [] and halt is None
+    assert len(fixture.backend.grade_calls) == 1 and not fixture.backend.readiness_calls
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows seal proof')
+def test_native_prefix_boundary_detects_transient_catalog_changes(tmp_path, monkeypatch):
+    from tools import sealed_runtime as sealed
+    fixture = _prefix_fixture(tmp_path, cases=3)
+    fixture.run()
+    original_output = fixture.config.output.read_bytes()
+    catalog = {fixture.grader: {'dependency.dll': controller._digest(fixture.library)}}
+    active = sealed.SealedRuntimeSession(catalog, module_sha256=sealed.module_digest())
+    original_load = controller._load_completed
+    original_verify = fixture.backend.verify
+    loaded = []
+
+    def load(*args, **kwargs):
+        result = original_load(*args, **kwargs)
+        loaded.append(True)
+        if len(loaded) == 2:
+            transient = fixture.grader / 'transient-private.step'
+            transient.write_bytes(b'must invalidate even after removal')
+            transient.unlink()
+        return result
+
+    def verify():
+        original_verify()
+        active.require_catalogs(catalog)
+
+    fixture.backend.verify = verify
+    monkeypatch.setattr(controller, '_load_completed', load)
+    with pytest.raises(sealed.SealError, match='changed'):
+        with active:
+            fixture.run(batch=1)
+    assert fixture.config.output.read_bytes() == original_output
+    assert len(fixture.backend.convert_calls) == 3
+    with pytest.raises(sealed.SealError, match='closed'):
+        active.check()
+
+
+class GraderResourceFailure(controller.GraderError):
+    classification = "grader_resource_limit"
+
+    def __init__(self, *, drained=True):
+        super().__init__("protocol-only bounded host memory exhaustion")
+        self.resource_evidence = {
+            "worker_drained": drained,
+            "process_memory_limit_bytes": 8 * 1024**3,
+            "memory_limit_events": [{"message": 9, "pid": 123}],
+        }
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_drained_host_resource_failure_is_cached_but_always_unscored(
+    tmp_path, monkeypatch, expired,
+):
+    fixture = Fixture(tmp_path, cases=1)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(controller.time, "monotonic", lambda: clock["now"])
+
+    def resource_failure(*args, **kwargs):
+        if expired:
+            clock["now"] = 361.0
+        raise GraderResourceFailure()
+
+    fixture.backend.grade = resource_failure
+    row = fixture.run()["results"][0]
+    assert row["execution_certified"] and not row["accepted"]
+    assert not row["certified"] and not row["solver_outcome_scored"]
+    assert row["failure_kind"] == row["failure_origin"] == "grader_resource_limit"
+    assert row["resource_evidence"]["worker_drained"] is True
+    assert row["conversion_attestation"]["permissions_revoked"] is True
+    assert not fixture.backend.readiness_calls
+    resumed = fixture.run()["results"][0]
+    assert resumed["reused"] and not resumed["solver_outcome_scored"]
+    assert len(fixture.backend.convert_calls) == 1
+    assert not fixture.backend.readiness_calls
+    assert not fixture.config.output.with_suffix(".fixture-exclusions.json").exists()
+
+
+def test_ready_source_receipt_cannot_score_partial_invalid_host_resource_grade(tmp_path):
+    fixture = Fixture(tmp_path, cases=2)
+    original = fixture.backend.grade
+    calls = []
+
+    def grade(case, retained, destination, artifacts, *, timeout):
+        calls.append(case)
+        if len(calls) == 1:
+            return original(case, retained, destination, artifacts, timeout=timeout)
+        destination.write_text(json.dumps({
+            "accepted": False, "fixture_readiness": {"fixture_ready": False},
+            "evaluation_failure_kind": "fixture",
+        }))
+        raise GraderResourceFailure()
+
+    fixture.backend.grade = grade
+    result = fixture.run()
+    assert result["results"][0]["accepted"]
+    row = result["results"][1]
+    assert row["execution_certified"] and not row["solver_outcome_scored"]
+    assert row["failure_kind"] == "grader_resource_limit" and not row["accepted"]
+    assert "fixture_readiness" not in row
+    assert not fixture.backend.readiness_calls
+    assert not fixture.config.output.with_suffix(".fixture-exclusions.json").exists()
+    resumed = fixture.run()
+    assert all(row["reused"] for row in resumed["results"])
+    assert not resumed["results"][1]["solver_outcome_scored"]
+    assert len(fixture.backend.convert_calls) == len(calls) == 2
+
+
+@pytest.mark.parametrize("drained", [False, None])
+def test_undrained_host_resource_failure_is_not_execution_certified(tmp_path, drained):
+    fixture = Fixture(tmp_path, cases=1)
+
+    def resource_failure(*args, **kwargs):
+        raise GraderResourceFailure(drained=drained)
+
+    fixture.backend.grade = resource_failure
+    row = fixture.run()["results"][0]
+    assert row["failure_kind"] == "grader_resource_limit"
+    assert not row["execution_certified"] and not row["certified"] and not row["accepted"]
+    assert not list((fixture.root / "frozen-controller-completed-v1").glob("*.json"))
+
+
+def test_readiness_resource_failure_preserves_unknown_source_without_repeating_work(tmp_path):
+    fixture = Fixture(tmp_path, cases=1)
+    fixture.backend.fail_conversion = True
+    fixture.backend.readiness_error = GraderResourceFailure()
+    row = fixture.run()["results"][0]
+    assert row["execution_certified"] and not row["solver_outcome_scored"]
+    assert row["failure_kind"] == "converter_exit"
+    assert row["fixture_preparation_failure_kind"] == "grader_resource_limit"
+    assert row["fixture_preparation_resource_evidence"]["worker_drained"] is True
+    assert not row.get("fixture_readiness") and not row["certified"] and not row["accepted"]
+    fixture.backend.readiness_error = None
+    resumed = fixture.run()["results"][0]
+    assert resumed["reused"] and not resumed["solver_outcome_scored"]
+    assert len(fixture.backend.convert_calls) == len(fixture.backend.readiness_calls) == 1
+    assert not fixture.config.output.with_suffix(".fixture-exclusions.json").exists()
+
+
+def test_resource_exception_attestation_cannot_replace_validated_conversion(tmp_path):
+    fixture = Fixture(tmp_path, cases=1)
+
+    def no_completed_conversion(**kwargs):
+        error = GraderResourceFailure()
+        error.attestation = {"permissions_revoked": True, "input_unchanged": True}
+        raise error
+
+    fixture.backend.convert = no_completed_conversion
+    row = fixture.run()["results"][0]
+    assert not row["execution_certified"] and not row["certified"] and not row["accepted"]
+    assert not row["solver_outcome_scored"] and not fixture.backend.readiness_calls
+    assert not list((fixture.root / "frozen-controller-completed-v1").glob("*.json"))

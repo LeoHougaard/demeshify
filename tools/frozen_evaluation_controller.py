@@ -798,6 +798,7 @@ def _qualify_failed_execution(
     if (
         not row.get("execution_certified")
         or row.get("solver_outcome_scored") is True
+        or row.get("fixture_preparation_failure_kind") == "grader_resource_limit"
         or type(row.get("fixture_readiness", {}).get("fixture_ready")) is bool
         or row.get("failure_kind") not in ("converter_exit", "converter_timeout", "case_timeout")
     ):
@@ -843,7 +844,12 @@ def _qualify_failed_execution(
         row["fixture_preparation_resources"] = resources
     except Exception as exc:
         row["fixture_preparation_error"] = f"{type(exc).__name__}: {exc}"
-        # Retry readiness on resume; the verified execution remains cached.
+        if getattr(exc, "classification", None) == "grader_resource_limit":
+            row["fixture_preparation_failure_kind"] = "grader_resource_limit"
+            row["fixture_preparation_resource_evidence"] = getattr(exc, "resource_evidence", {})
+            row.update(accepted=False, certified=False, solver_outcome_scored=False)
+        # Ordinary readiness errors remain retryable. A resource-limited source
+        # needs a separately qualified policy; do not repeat expensive preparation.
     row["fixture_preparation_wall_seconds"] = time.perf_counter() - started
     _atomic(
         attempt / "preparation-record.json",
@@ -903,6 +909,55 @@ def run_controller(configuration: Configuration, *, _backend=None) -> dict:
             cleanup()
 
 
+def _load_scored_cached_prefix(
+    expected: list[dict], identity: dict, cache: Path, root: Path, backend,
+    manifest: Path, manifest_hash: str,
+) -> tuple[list[dict], str | None]:
+    """Read certified history as one transaction; publish only after full checks.
+
+    The live seal continuously locks bytes and monitors all directory changes.
+    No grading, readiness preparation or conversion runs inside this transaction.
+    Cache envelopes, retained output bytes and both fixtures are still checked
+    for every row. Incomplete/unscored records return to the normal case loop.
+    """
+    rows, halt = [], None
+    for case in expected:
+        if shutil.disk_usage(cache.parent).free < 15 * 1024**3:
+            halt = "storage_floor"
+            break
+        started = time.perf_counter()
+        fingerprint = _hash({"schema": CACHE_SCHEMA, "case": case, "identity": identity})
+        completed = cache / (fingerprint + ".json")
+        try:
+            _fixture(case)
+            reused = _load_completed(completed, fingerprint, root)
+        except FixtureError:
+            break  # Preserve the existing case loop's fixture-error handling.
+        if (reused is None or reused.get("certified") is not True
+                or reused.get("execution_certified") is not True
+                or reused.get("solver_outcome_scored") is not True
+                or reused.get("fixture_readiness", {}).get("fixture_ready") is not True):
+            break
+        if not rows:
+            _check_identities(backend, identity)
+        _fixture(case)
+        row = {
+            **reused, "reused": True, "reused_from": str(completed),
+            "timing_provenance": "historical_verified_case",
+            "reuse_lookup_wall_seconds": time.perf_counter() - started,
+            "fixture_preparation_fresh": False,
+            "cache_lookup_protocol": "certified-prefix-full-boundary-checks-v1",
+        }
+        if "fixture_preparation_wall_seconds" in row:
+            row["fixture_preparation_timing_provenance"] = "historical_fixture_preparation"
+        rows.append(row)
+    if rows:
+        _check_identities(backend, identity)
+        if _digest(manifest) != manifest_hash:
+            raise ControllerError("Frozen corpus manifest changed during cached prefix lookup")
+    return rows, halt
+
+
 def _run_controller(configuration: Configuration, backend) -> dict:
     if configuration.batch_cases is not None and configuration.batch_cases <= 0:
         raise ValueError("--batch-cases must be positive")
@@ -947,9 +1002,13 @@ def _run_controller(configuration: Configuration, backend) -> dict:
         }
     )
     _atomic(launches_path, launches, root)
-    results, fresh = [], 0
-    halt = None
-    for case in expected:
+    results, halt = _load_scored_cached_prefix(
+        expected, identity, cache, root, backend, configuration.manifest, manifest_hash,
+    )
+    fresh = 0
+    for case in expected[len(results):]:
+        if halt:
+            break
         if shutil.disk_usage(output.parent).free < 15 * 1024**3:
             halt = "storage_floor"
             break
@@ -1020,6 +1079,7 @@ def _run_controller(configuration: Configuration, backend) -> dict:
             retained = attempt / "retained"
             retained.mkdir()
             hashes, attestation = {}, None
+            conversion_validated = False
             stage = "fixture"
             result = {key: case[key] for key in ("id", "source_model_id", "preset", "split")}
             result.update(
@@ -1050,6 +1110,14 @@ def _run_controller(configuration: Configuration, backend) -> dict:
                     attestation = converted.attestation
                     stage = "isolation"
                     hashes = _validate_attestation(converted, case, identity, retained, root)
+                    conversion_validated = True
+                    # Preserve a validated conversion even if host grading later times out.
+                    result.update(
+                        conversion_attestation=attestation,
+                        conversion_wall_seconds=attestation["conversion_wall_seconds"],
+                        artifact_copy_wall_seconds=attestation["artifact_copy_wall_seconds"],
+                        adapter_wall_seconds=attestation.get("adapter_wall_seconds"),
+                    )
                     _remaining(deadline)
                     configuration_data = {
                         "grader_manifest_sha256": configuration.grader_sha256,
@@ -1098,7 +1166,9 @@ def _run_controller(configuration: Configuration, backend) -> dict:
                     )
                 except Exception as exc:
                     classification = getattr(exc, "classification", None)
-                    if isinstance(exc, CaseTimeout):
+                    if classification == "grader_resource_limit" and stage == "grader":
+                        kind = "grader_resource_limit"
+                    elif isinstance(exc, CaseTimeout):
                         kind = "case_timeout"
                     elif classification == "isolation" or stage == "isolation":
                         kind = "isolation"
@@ -1121,8 +1191,14 @@ def _run_controller(configuration: Configuration, backend) -> dict:
                         accepted=False,
                         status=status,
                         failure_kind=kind,
+                        failure_origin=kind,
                         error=f"{type(exc).__name__}: {exc}",
                     )
+                    if kind == "grader_resource_limit":
+                        result.update(
+                            resource_evidence=getattr(exc, "resource_evidence", {}),
+                            accepted=False, certified=False, solver_outcome_scored=False,
+                        )
                     error_attestation = getattr(exc, "attestation", None)
                     if error_attestation:
                         result["conversion_attestation"] = error_attestation
@@ -1172,6 +1248,20 @@ def _run_controller(configuration: Configuration, backend) -> dict:
                     raise ControllerError("Retained outputs changed after grading/failure")
                 if _digest(configuration.manifest) != manifest_hash:
                     raise ControllerError("Frozen corpus manifest changed during evaluation")
+                # Decide timeout certification from the final classification. Never
+                # disguise isolation, fixture or non-timeout grader errors as solves.
+                if time.monotonic() > deadline and result.get("failure_kind") in (
+                    None, "converter_exit", "converter_timeout", "case_timeout", "grader_timeout",
+                ):
+                    result.setdefault(
+                        "failure_origin", result.get("failure_kind") or result["status"],
+                    )
+                    result.update(
+                        accepted=False,
+                        status="timeout",
+                        failure_kind="case_timeout",
+                        error="Original 360-second whole-case deadline exhausted",
+                    )
                 failure_kind = result.get("failure_kind")
                 result["execution_certified"] = failure_kind in (
                     None,
@@ -1181,17 +1271,20 @@ def _run_controller(configuration: Configuration, backend) -> dict:
                 ) or (
                     failure_kind == "fixture"
                     and result.get("fixture_readiness", {}).get("fixture_ready") is False
+                ) or (
+                    failure_kind == "grader_resource_limit"
+                    and conversion_validated
+                    and result.get("conversion_attestation") is not None
+                    and isinstance(result.get("resource_evidence"), dict)
+                    and result["resource_evidence"].get("worker_drained") is True
                 )
+                if failure_kind == "grader_resource_limit":
+                    # Host resource exhaustion cannot qualify a solver outcome,
+                    # even when another export already established source readiness.
+                    result.update(accepted=False, solver_outcome_scored=False)
                 result["certified"] = (
                     result["execution_certified"] and result.get("solver_outcome_scored") is True
                 )
-                if time.monotonic() > deadline:
-                    result.update(
-                        accepted=False,
-                        status="timeout",
-                        failure_kind="case_timeout",
-                        error="Original 360-second whole-case deadline exhausted",
-                    )
                 if not result["certified"]:
                     result["accepted"] = False
             except Exception as exc:
