@@ -39,20 +39,44 @@ def digest(path: Path) -> str:
 
 
 def inventory(root: Path) -> dict[str, str]:
+    import os
+    import stat
+
     root = root.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError('Empty runtime artifact')
+    canonical = os.path.normcase(str(root))
     result = {}
-    for path in sorted(root.rglob('*')):
-        if path.is_symlink() or (hasattr(path, 'is_junction') and path.is_junction()):
-            raise ValueError('Runtime artifacts cannot contain links or junctions')
-        if not path.is_file():
-            continue
-        if (not path.resolve().is_relative_to(root)
-                or any(suffix.lower() in FORBIDDEN for suffix in path.suffixes)):
-            raise ValueError('Runtime artifact contains an escaped path or CAD asset')
-        result[path.relative_to(root).as_posix()] = digest(path)
+    pending = [(str(root), '')]
+    while pending:
+        directory, prefix = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                info = entry.stat(follow_symlinks=False)
+                if (stat.S_ISLNK(info.st_mode)
+                        or getattr(info, 'st_file_attributes', 0) & 0x400):
+                    raise ValueError('Runtime artifacts cannot contain links or junctions')
+                relative = prefix + entry.name
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append((entry.path, relative + '/'))
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                # Keep a resolved containment check for every hashed file.
+                # Constructing relative keys from checked directory entries
+                # avoids repeated pathlib parent walks, never any byte hashes.
+                resolved = os.path.realpath(entry.path, strict=True)
+                if (os.path.normcase(os.path.commonpath((str(root), resolved))) != canonical
+                        or any(suffix.lower() in FORBIDDEN
+                               for suffix in PurePosixPath(entry.name).suffixes)):
+                    raise ValueError('Runtime artifact contains an escaped path or CAD asset')
+                result[relative] = digest(Path(entry.path))
     if not result:
         raise ValueError('Empty runtime artifact')
-    return result
+    # Match pathlib's previous component-wise ordering, including Windows case
+    # normalization, so artifact serialization remains deterministic.
+    return dict(sorted(result.items(), key=lambda pair: tuple(
+        os.path.normcase(part) for part in pair[0].split('/'))))
 
 
 def compile_module(source: bytes, name: str, destination: Path) -> None:

@@ -28,6 +28,7 @@ from tools.analyze_surface_failures import (  # noqa: E402
     analyze_results,
     markdown_report,
 )
+from tools.brep_topology import compare_topology  # noqa: E402
 
 ANALYTIC_CURVED_TYPES = {"CYLINDER", "CONE", "SPHERE", "TORUS"}
 VERIFICATION_TIMEOUT_SECONDS = 120
@@ -67,6 +68,24 @@ def step_surface_metrics(path: Path) -> dict[str, object]:
         "edge_counts": dict(edge_counts),
         "edge_lengths_mm": dict(edge_lengths),
     }
+
+
+def reference_topology_diagnostic(source: dict, output: dict) -> dict:
+    """Report supported native invariants without changing existing acceptance."""
+    missing = [f'{name}_shape_unavailable' for name, metrics in (
+        ('reference', source), ('output', output),
+    ) if metrics.get('shape') is None]
+    if missing:
+        return {'reference': None, 'output': None, 'available': False,
+                'topology_match': None, 'status': 'indeterminate',
+                'indeterminate_reasons': missing}
+    try:
+        return {'available': True, **compare_topology(source['shape'], output['shape'])}
+    except Exception as exc:
+        return {'reference': None, 'output': None, 'available': False,
+                'topology_match': None, 'status': 'indeterminate',
+                'indeterminate_reasons': ['diagnostic_error'],
+                'diagnostic_error': f'{type(exc).__name__}: {exc}'}
 
 
 def analytic_quality_metrics(
@@ -306,6 +325,7 @@ def benchmark_case(
         source_step = case.get("source_step")
         if source_step and _case_path(source_step, manifest_parent).is_file():
             source_metrics = step_surface_metrics(_case_path(source_step, manifest_parent))
+        topology_diagnostic = reference_topology_diagnostic(source_metrics, output_metrics)
         analytic_metrics = (
             analytic_quality_metrics(source_metrics, output_metrics)
             if source_metrics and output_metrics
@@ -395,6 +415,7 @@ def benchmark_case(
                 {},
             ),
             "output_edge_type_counts": output_metrics.get("edge_counts", {}),
+            "reference_topology": topology_diagnostic,
             **analytic_metrics,
             "geometric_accepted": geometric_accepted,
             "clean_analytic": clean_analytic,
@@ -419,6 +440,8 @@ def benchmark_case(
                 "analytic_diagnostic_joined_surfaces.step",
                 "analytic_diagnostic_surface_graph.json",
                 "analytic_diagnostic_report.json",
+                "closed_shell_roundtrip_diagnostic.step",
+                "closed_shell_roundtrip_score.json",
                 "surface-worker-progress.log",
                 "surface-worker.stderr.log",
                 "surface-worker.stdout.log",
