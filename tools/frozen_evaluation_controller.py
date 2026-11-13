@@ -150,7 +150,9 @@ def _scratch_root(root: Path) -> str:
 
 def _atomic(path: Path, value, root: Path, *, exclusive=False) -> None:
     path = _owned(path, root, create_parent=True)
-    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex + ".tmp")
+    # Keep the sibling temporary short: a valid 64-character cache filename
+    # can otherwise exceed Windows MAX_PATH when copied into the temp name.
+    temporary = path.with_name(".write-" + uuid.uuid4().hex + ".tmp")
     with temporary.open("xb") as stream:
         stream.write(_json_bytes(value))
         stream.flush()
