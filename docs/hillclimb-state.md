@@ -1,5 +1,41 @@
 # Demeshify hill climb
 
+## Current continuation, November 13
+
+The [final corpus](frozen-corpus-1000x10-2026-11-13.md) is frozen at **1,000
+distinct sources / 10,000 STL inputs**, grouped into 859 geometry families.
+This completes acquisition, not the quantitative reconstruction baseline.
+The evaluator/process-boundary milestone is merged in
+[PR #13](https://github.com/LeoHougaard/demeshify/pull/13), main
+`9c039a7796678caf40afff87c456bbef8316c7fa`, with
+[actual merged-SHA CI passing](https://github.com/LeoHougaard/demeshify/actions/runs/43367014677).
+
+The strongest qualified converter remains V21. Later experiments are preserved
+locally and unpromoted. V37 makes the difficult target a valid 57-face analytic
+solid with zero facets, but actual isolated conversion and the frozen original
+grader reject its 0.227862 mm dimension error against the unchanged 0.12 mm limit.
+Native bounds explain cached-mesh inflation but do not waive that gate: actual
+circle/vertex boundary gaps also reach 0.227862 and 0.203 mm. The next experiment
+jointly fits demonstrably coincident cylindrical supports from mesh evidence
+before absorbing their false planar chord. No per-file fix or tolerance cap is
+authorized. Target-first checks do not establish passing controls or a global gain.
+
+The isolated adapter and retained-output frozen grader have run a real baseline
+success and this rejecting target without a second conversion. References are
+read only after every converter process terminates and scoped permissions are
+revoked. Resumable controller integration, progressive baseline batches and
+matched reconstruction qualification remain active. The prior dated sections
+below are historical and may contain smaller corpus counts or incomplete
+qualification states.
+
+The [input/result identity and Fit correction](input-result-identity-2026-11-13.md)
+is merged in [PR #14](https://github.com/LeoHougaard/demeshify/pull/14).
+Head `00a67c3161d17769ef099ea7d0765722957bc25f` passed
+[CI](https://github.com/LeoHougaard/demeshify/actions/runs/43375492644), as did
+actual main merge `a5a14b7314ad3c2e45d4530ce472feb8de0c1783`
+([merged-SHA CI](https://github.com/LeoHougaard/demeshify/actions/runs/43376294715)).
+This product fix does not change reconstruction yield.
+
 ## Latest qualification, November 12
 
 November 13 continuation: reference-only failure retention is merged in
