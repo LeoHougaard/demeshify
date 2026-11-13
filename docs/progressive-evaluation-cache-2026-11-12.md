@@ -1,5 +1,42 @@
 # Resume progressive evaluation without repeating unchanged conversions
 
+## Bounded evaluation batches
+
+`--batch-cases 20` now stops after at most 20 new case evaluations. Failures
+consume a slot; identical cached cases do not. The aggregate and summary are
+saved at the batch boundary, including explicit partial-run status. Repeating
+the command resumes completed cases and advances the next batch. A positive
+batch size can change between invocations because it changes scheduling, not
+the case identity or grading contract; each launch records the chosen size.
+
+```powershell
+python tools/benchmark_multires_corpus.py frozen-manifest.json --output baseline.json --batch-cases 20
+```
+
+The 240-second conversion and 360-second case limits, strict acceptance gates,
+grading function and summary function remain unchanged. Their syntax trees were
+checked against the preceding controller. Source/runtime/input identities still
+invalidate changed results; this does not permit editing the converter inside
+a frozen run. It allows finite evaluation chunks between acquisition and
+reconstruction experiments instead of starting all 10,000 cases at once.
+
+Eight protocol checks pass, covering successive batches, preserved failed
+outcomes, changed batch sizes, complete cached resumes and rejected zero/negative
+limits, alongside the preceding provenance checks. Two real q00/q05 workflow
+cases were then evaluated with a one-case limit: the first invocation reports
+one of two cases and `complete=false`; the second reuses that conversion and
+evaluates the other, reporting one fresh/one reused case and `complete=true`.
+Their acceptance and reference metrics match the preceding converter within
+1e-9. This completes only that two-case manifest, not the requested full corpus.
+Evidence is local under `experiments/case-batches-*`.
+
+The latest composed snapshot at this milestone is 467 distinct sources / 4,670
+inputs (`partial-20261112-pass9.json`), explicitly incomplete. Further fixture
+qualification and the full 1,000-source / 10,000-input baseline remain pending.
+The sections below preserve the original cache milestone's evidence.
+
+## Original cache milestone
+
 The multiresolution runner previously included the entire manifest and every
 tool in each case identity, and required the same Git revision to resume. An
 expanded cohort, documentation commit or unrelated acquisition change could
