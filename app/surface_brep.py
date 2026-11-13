@@ -100,6 +100,7 @@ from shapely.geometry import LineString
 
 from .mesh import MeshData, closed_shell_topology, containment_parents, shell_depths
 from .step import load_step_shape, unowned_geometry_counts
+from .step_preview import export_stl_preview
 from .surface_graph import (
     ConicalPatch,
     CylindricalPatch,
@@ -5528,6 +5529,13 @@ def export_surface_brep(
         and abs(source_unit_scale - 1.0) <= 1e-12
     ):
         shutil.copy2(source_stl_path, reconstruction_stl)
+    elif result.closed and result.valid:
+        export_stl_preview(
+            result.shape,
+            reconstruction_stl,
+            linear_deflection=max(min(result.sewing_tolerance * 0.5, 0.01), 1e-7),
+            angular_deflection=0.04,
+        )
     else:
         if not result.shape.exportStl(
             str(reconstruction_stl),
