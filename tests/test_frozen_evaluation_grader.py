@@ -224,7 +224,11 @@ def test_short_scratch_root_handles_deep_result_hierarchy(tmp_path, monkeypatch)
     scratch.mkdir()
     configuration['scratch_root'] = str(scratch)
     case_path.write_text(json.dumps(configuration))
-    destination = tmp_path / ('nested-result-' * 7) / ('attempt-' * 7) / 'result.json'
+    # Keep the result itself below native MAX_PATH even on a longer CI temp
+    # root; the extra nested CAD scratch suffix would exceed that boundary.
+    padding = max(2, 205 - len(str(tmp_path)) - 2)
+    destination = (tmp_path / ('n' * (padding // 2)) / ('a' * (padding - padding // 2))
+                   / 'result.json')
     command[-1] = str(destination)
     process = run(command)
     assert process.returncode == 0, process.stderr
