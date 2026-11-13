@@ -106,6 +106,8 @@ def evaluate(case: dict, manifest: Path, artifacts: Path | None) -> dict:
 
 
 def summary(results: list[dict], expected: list[dict]) -> dict:
+    from tools.multires_summary import aggregate_details
+
     by_model, by_preset, by_split = defaultdict(list), defaultdict(list), defaultdict(list)
     for result in results:
         by_model[result['source_model_id']].append(result)
@@ -127,6 +129,7 @@ def summary(results: list[dict], expected: list[dict]) -> dict:
         'source_models_ten_evaluated': sum(len(rows) == 10 for rows in by_model.values()),
         'per_preset': {k: counts(v) for k, v in sorted(by_preset.items())},
         'per_split': {k: counts(v) for k, v in sorted(by_split.items())},
+        **aggregate_details(results, expected),
     }
 
 
@@ -245,13 +248,15 @@ def main() -> None:
         results.append({**result, 'reused': reused, 'reused_from': reused_from})
         if source_identity(ROOT) != source_hashes:
             raise RuntimeError('Source changed during evaluation; do not combine results')
-        aggregate = summary(results, cases)
         batch_complete = bool(args.batch_cases and fresh_completed >= args.batch_cases)
-        atomic_write_text(args.output.with_suffix('.summary.json'), json.dumps(aggregate, indent=2))
         # Individual cache records are durable after each case. Avoid rewriting
-        # tens of megabytes 10,000 times; complete snapshots every 100 cases.
+        # or recomputing whole-run distributions 10,000 times. Both summary and
+        # result snapshots describe their actual first/100/final/batch coverage.
         if (len(results) == 1 or len(results) % 100 == 0 or len(results) == len(cases)
                 or batch_complete):
+            aggregate = summary(results, cases)
+            atomic_write_text(args.output.with_suffix('.summary.json'),
+                              json.dumps(aggregate, indent=2))
             atomic_write_text(args.output, json.dumps({
                 'summary': aggregate, 'revision': revision, 'results': results}, indent=2))
         print(f'[{len(results)}/{len(cases)}] {case["id"]}: '
