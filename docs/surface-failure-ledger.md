@@ -4,6 +4,45 @@ This file records failure mechanisms, not just failing filenames. Update it
 after every benchmark cycle with `tools/analyze_surface_failures.py` and retain
 the raw JSON report beside the benchmark.
 
+## November 13, 2026 hill climb continuation
+
+The current verified reconstruction is V21, with corrected strict reporting:
+13/20 development cases versus a truthful 12/20 baseline, nine separate
+validation passes, and preserved private controls. These are limited cohorts;
+the historical totals below are not fresh full-corpus results. The composed
+new corpus has 569 source models / 5,690 actual inputs and remains incomplete.
+
+New source-only trim probes located a native `GeomProjLib.Curve2d` stall while
+projecting canonical 3D curves onto an independently fitted spline. The sampled
+curve was close to, but not exactly on, the support. V22 tried the existing
+independent UV trim first; it still timed out and retained both success controls.
+V23's uniform graph parameterization reduced measured XY chart distortion and
+allowed fitting to finish, but its diagnostic still had zero solids, retained
+facets and excessive local error. It was not promoted.
+
+V24 tested connected cylinder growth into residuals using stricter existing
+chord-support tests and the unchanged complete-union validator. Its ownership
+tests passed and both reconstruction controls retained their strict outcomes.
+Matched target q00/q05/q09 still yielded no strict recovery. The middle/fine
+failures returned sooner, but q00 lost a valid hybrid containing 84 facets and
+returned a full 364-facet carrier. Reject this tradeoff and restore V21.
+
+The next reconstruction category is consistent shared trim/solid topology,
+including preservation of curved/profile breakpoints. Closed edge counts alone
+do not establish a valid solid. Preserve the actual failed fitted surfaces,
+not just their final fallback, for the next discriminating experiment.
+Further source-only inspection found one disconnected 26-face residual matching
+an already recognized cylinder, plus three exact flat rectangles. Their roughly
+0.25 mm altitudes rule out the proposed float-normal-noise explanation. A next
+candidate can test independently validated global cylinder seeds and recovery
+of planes constrained by two independent tangent supports, retaining every old
+owner. Mere four-node planarity is insufficient evidence of smooth CAD and must
+not become another disguised faceted fallback.
+Raw results, source snapshots, rejected tests and patches, diagnostic STEP,
+decisions and `tools/analyze_surface_failures.py` reports are retained locally
+under `benchmarks/multires-1000/experiments/` with V22/V23/V24 prefixes. No
+faceted carrier was counted as a strict success and no gates were relaxed.
+
 ## Prior verified baseline
 
 The strict Fusion holdout gate now accepts 60 of 60 models:

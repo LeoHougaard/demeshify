@@ -2,12 +2,27 @@
 
 ## Latest qualification, November 12
 
+November 13 continuation: reference-only failure retention is merged in
+[PR #11](https://github.com/LeoHougaard/demeshify/pull/11), exact head
+`c84f7ac864a1a251bc944f1333c7f81105db96dc`, main
+`fdb8fda9f6d22d8a24d49f37e8d147492b2f3895`. Both passed CI
+([head](https://github.com/LeoHougaard/demeshify/actions/runs/43341322727),
+[merge](https://github.com/LeoHougaard/demeshify/actions/runs/43343429599)).
+The composed snapshot is now 569 sources / 5,690 inputs. A further bounded
+100-source acquisition batch is active. Frozen converter bytecode passed an
+actual ten-export AppContainer/reference-grading workflow for one source; see
+[the artifact tool and limits](frozen-converter-artifacts-2026-11-13.md).
+Production sandbox integration, a frozen grader and the full corpus/baseline
+remain unfinished. V22/V23/V24 are not promoted; verified reconstruction stays
+V21. V24 sped up failures but replaced a useful coarse hybrid with all facets.
+Its source, tests, patch, matched results and diagnostic STEP remain local.
+
 V21 is merged in [PR #9](https://github.com/LeoHougaard/demeshify/pull/9).
 Exact head `04ae353d7d8b51ee0889f36fc89298b0f11919bd` and main merge
 `50abe20631110980f0113260d0caac140777eab8` passed repository CI:
 [head run](https://github.com/LeoHougaard/demeshify/actions/runs/43332981593),
 [merged run](https://github.com/LeoHougaard/demeshify/actions/runs/43334033398).
-The corpus has since reached 469 sources / 4,690 inputs, still partial.
+The earlier snapshot at that milestone was 469 sources / 4,690 inputs, still partial.
 Bounded case batches now support progressive evaluation; see
 [the controller evidence](progressive-evaluation-cache-2026-11-12.md).
 They are merged in [PR #10](https://github.com/LeoHougaard/demeshify/pull/10),
