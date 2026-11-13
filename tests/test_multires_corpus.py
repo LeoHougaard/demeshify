@@ -80,10 +80,12 @@ def test_reference_grader_rejects_displaced_and_extra_geometry(
     cq.exporters.export(reference, str(source_path))
     cq.exporters.export(output, str(output_path))
 
-    def fake_benchmark(case, parent, artifacts, timeout):
+    def fake_benchmark(case, parent, artifacts, timeout, *, finalize_result):
         multires.benchmark.step_surface_metrics(output_path)
         multires.benchmark.step_surface_metrics(source_path)
-        return {'accepted': True}
+        result = {'accepted': True}
+        finalize_result(result)
+        return result
 
     monkeypatch.setattr(multires.benchmark, 'benchmark_case', fake_benchmark)
     result = multires.evaluate({'source_model_id': 'a', 'split': 'development', 'preset': 'q00'},

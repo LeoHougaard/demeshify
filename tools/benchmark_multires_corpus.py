@@ -87,17 +87,21 @@ def evaluate(case: dict, manifest: Path, artifacts: Path | None) -> dict:
             )
         return result
 
+    def finalize(result):
+        result.update(reference)
+        result['stl_strict_accepted'] = result['accepted']
+        result['accepted'] = bool(
+            result['accepted'] and reference.get('reference_geometry_accepted'))
+        result.update({k: case[k] for k in ('source_model_id', 'split', 'preset')})
+
     benchmark.reconstruct_surfaces = convert
     benchmark.step_surface_metrics = metrics
     try:
-        result = benchmark.benchmark_case(case, manifest.parent, artifacts, 240)
+        result = benchmark.benchmark_case(
+            case, manifest.parent, artifacts, 240, finalize_result=finalize)
     finally:
         benchmark.reconstruct_surfaces = original_convert
         benchmark.step_surface_metrics = original_metrics
-    result.update(reference)
-    result['stl_strict_accepted'] = result['accepted']
-    result['accepted'] = bool(result['accepted'] and reference.get('reference_geometry_accepted'))
-    result.update({k: case[k] for k in ('source_model_id', 'split', 'preset')})
     return result
 
 
