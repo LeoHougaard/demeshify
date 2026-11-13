@@ -15,14 +15,64 @@ from pathlib import Path
 import cadquery as cq
 import numpy as np
 from OCP.BRep import BRep_Tool
+from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from OCP.gp import gp_Pnt, gp_Vec
 from OCP.IMeshTools import IMeshTools_Parameters
+from OCP.Poly import Poly_Triangle
 from OCP.StlAPI import StlAPI_Writer
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FORWARD, TopAbs_REVERSED, TopAbs_VERTEX, TopAbs_WIRE
 from OCP.TopExp import TopExp
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopTools import TopTools_IndexedMapOfShape
+
+
+def _collapsed_uv_edge(face, poly, indices, corners) -> bool:
+    """Certify a repeated native vertex as the image of a collapsed UV edge.
+
+    Natural closed faces can have no topological pole edges. Native positions
+    must already coincide exactly; five surface/derivative checks distinguish a
+    singular edge from an ordinary periodic seam or binary precision loss.
+    """
+    if not poly.HasUVNodes():
+        return False
+    surface = BRepAdaptor_Surface(face.wrapped)
+    epsilon = 64 * np.finfo(float).eps
+    for first, second in ((0, 1), (1, 2), (2, 0)):
+        if not np.array_equal(corners[first], corners[second]):
+            continue
+        start = poly.UVNode(int(indices[first]) + 1)
+        end = poly.UVNode(int(indices[second]) + 1)
+        uv = np.array([start.X(), start.Y()])
+        delta = np.array([end.X() - start.X(), end.Y() - start.Y()])
+        if not np.all(np.isfinite(uv)) or not np.all(np.isfinite(delta)):
+            continue
+        length = float(np.linalg.norm(delta))
+        if length == 0:
+            continue
+        try:
+            for fraction in np.linspace(0.0, 1.0, 5):
+                parameter = uv + fraction * delta
+                point, du, dv = gp_Pnt(), gp_Vec(), gp_Vec()
+                surface.D1(float(parameter[0]), float(parameter[1]), point, du, dv)
+                derivatives = np.array([du.Coord(), dv.Coord()])
+                reference = float(np.max(np.linalg.norm(derivatives, axis=1)))
+                position = np.asarray(point.Coord())
+                if not np.all(np.isfinite(derivatives)) or not np.all(np.isfinite(position)):
+                    break
+                if (reference == 0
+                        or np.linalg.norm(delta @ derivatives) > epsilon * reference * length):
+                    break
+                scale = max(float(np.max(np.abs(corners[first]))), reference)
+                parameter_scale = max(1.0, float(np.max(np.abs(parameter))))
+                if np.max(np.abs(position - corners[first])) > epsilon * scale * parameter_scale:
+                    break
+            else:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _complete_triangles(shape: cq.Shape) -> int:
@@ -59,6 +109,24 @@ def _complete_triangles(shape: cq.Shape) -> int:
         ], dtype=np.int64)
         if np.any(triangles < 0) or np.any(triangles >= len(points)):
             raise ValueError("Preview tessellation contains invalid triangle indices")
+        native_corners = points[triangles]
+        native_cross = np.cross(
+            native_corners[:, 1] - native_corners[:, 0],
+            native_corners[:, 2] - native_corners[:, 0],
+        )
+        zero = np.flatnonzero(np.all(native_cross == 0, axis=1))
+        if len(zero):
+            for index in zero:
+                if not _collapsed_uv_edge(face, poly, triangles[index], native_corners[index]):
+                    raise ValueError("Preview tessellation contains a degenerate triangle")
+            # Only exact zero-geometric singular artifacts are removed, on the
+            # independent mesh copy. No positive native area may be discarded.
+            triangles = np.delete(triangles, zero, axis=0)
+            if not len(triangles):
+                raise ValueError("Preview tessellation omitted a face")
+            poly.ResizeTriangles(len(triangles), False)
+            for index, triangle in enumerate(triangles, start=1):
+                poly.SetTriangle(index, Poly_Triangle(*(int(node) + 1 for node in triangle)))
         # Validate the coordinates the binary STL will actually contain.
         corners = encoded.astype(float)[triangles]
         cross = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])

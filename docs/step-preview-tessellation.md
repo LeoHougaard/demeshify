@@ -35,6 +35,24 @@ does the helper stage an STL. A false native writer result, truncated file or
 triangle-count mismatch raises an error. An existing destination survives a
 failure; successful publication is atomic.
 
+Full repository CI exposed a valid spherical-cavity regression: the native
+mesher emitted four exactly zero-area pole triangles, causing the preview guard
+to reject the otherwise valid analytic result. The helper now removes only
+artifacts with repeated, exactly identical native coordinates and a certified
+collapsed UV edge. Five native surface/derivative checks establish a constant
+3D image and null edge direction. Ordinary periodic seams, collinear triangles
+and positive-area triangles lost at binary precision remain refused. Pruning
+affects only the separate copied triangulation; no native geometry or tolerance
+changes. Each face must still retain valid triangles, and writer completeness
+is checked against that cleaned mesh.
+
+The original unchanged spherical-cavity conversion test and sixteen preview
+checks pass on an exact original-head application overlay with only this helper
+recompiled. New controls retain both shell orientations, watertight winding and
+the original BREP bytes, and refuse regular-seam and collinear degeneracies.
+The failed CI, original child traceback and current/legacy comparison remain
+preserved separately. Full CI must qualify the updated PR head.
+
 Eleven small checks cover an analytic cylinder with a preexisting mesh and
 nonzero native tolerances, a through-hole, two separate solids, translated and
 explicitly scaled coordinates, both face orientations, an incomplete mesher,
