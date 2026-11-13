@@ -7,9 +7,16 @@ Exact head `04ae353d7d8b51ee0889f36fc89298b0f11919bd` and main merge
 `50abe20631110980f0113260d0caac140777eab8` passed repository CI:
 [head run](https://github.com/LeoHougaard/demeshify/actions/runs/43332981593),
 [merged run](https://github.com/LeoHougaard/demeshify/actions/runs/43334033398).
-The corpus has since reached 467 sources / 4,670 inputs, still partial.
+The corpus has since reached 469 sources / 4,690 inputs, still partial.
 Bounded case batches now support progressive evaluation; see
 [the controller evidence](progressive-evaluation-cache-2026-11-12.md).
+They are merged in [PR #10](https://github.com/LeoHougaard/demeshify/pull/10),
+head `b064e669ceeddb7a855df3e7d528b8b9d0c1ad30`, main
+`59d8774d04aeb232d5e906a70fe0b246ec4a42a9`; both passed CI
+([merged run](https://github.com/LeoHougaard/demeshify/actions/runs/43338306959)).
+Four additional development middle exports give three strict passes and one
+analytic-worker timeout/faceted failure. Reference-only failure retention is
+fixed and tested locally; see [the evidence](reference-failure-artifacts-2026-11-13.md).
 
 V21 is locally qualified: truthful planar fallback reporting, complete planar
 patch recovery and canonical open-extrusion junctions. Source SHA-256 is
@@ -23,8 +30,7 @@ Both inspected target STEP files retain the reference's through-hole topology.
 The tiny coarse hole remains polygonal. See
 [the matched evidence and commands](canonical-planar-recovery-2026-11-12.md).
 
-The composed corpus is 359 sources / 3,590 inputs, explicitly partial, with a
-further bounded acquisition batch underway. The full 1,000-source / 10,000-input
+The full 1,000-source / 10,000-input
 baseline, production OS isolation and additional cross-model hill climbing
 remain unfinished. Earlier sections below preserve the experiment history;
 their old strict counts and smaller fixture totals are superseded by this note.

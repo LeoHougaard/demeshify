@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -271,6 +272,8 @@ def benchmark_case(
     manifest_parent: Path,
     artifacts_root: Path | None = None,
     conversion_timeout: float | None = None,
+    *,
+    finalize_result: Callable[[dict], None] | None = None,
 ) -> dict[str, object]:
     source = manifest_parent / str(case["stl"])
     ground_truth = case.get("ground_truth", {})
@@ -398,7 +401,11 @@ def benchmark_case(
             "accepted": accepted,
             "warnings": report.warnings,
         }
-        if artifacts_root is not None and not accepted:
+        # Additional graders must finish before the temporary STEP is removed
+        # and before deciding whether failure artifacts need to be retained.
+        if finalize_result is not None:
+            finalize_result(result)
+        if artifacts_root is not None and not result["accepted"]:
             case_directory = artifacts_root / str(case["id"])
             case_directory.mkdir(parents=True, exist_ok=True)
             for name in (
