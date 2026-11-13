@@ -11,6 +11,7 @@ from pathlib import Path
 EVALUATION_TOOLS = (
     'benchmark_multires_corpus.py', 'benchmark_surface_corpus.py',
     'analyze_surface_failures.py', 'process_resources.py', 'evaluation_identity.py',
+    'multires_summary.py',
 )
 
 
