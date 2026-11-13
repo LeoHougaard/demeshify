@@ -1,3 +1,4 @@
+import hashlib
 import json
 import shutil
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ import cadquery as cq
 import pytest
 
 from tools import benchmark_surface_corpus as benchmark
+from tools.brep_topology import topology_metrics
 
 
 def plate(hole=False):
@@ -115,3 +117,85 @@ def test_missing_reference_does_not_become_an_empty_or_matching_signature(source
     assert not diagnostic['available'] and diagnostic['topology_match'] is None
     assert diagnostic['status'] == 'indeterminate'
     assert diagnostic['indeterminate_reasons'] == missing
+
+
+def test_fresh_file_diagnostics_ignore_contaminated_metric_shapes_without_mutating_them(tmp_path):
+    reference_path, output_path = tmp_path / 'reference.step', tmp_path / 'output.step'
+    shape = plate(True)
+    for path in (reference_path, output_path):
+        cq.exporters.export(shape, str(path))
+    contaminated = cq.Compound.makeCompound([
+        shape, cq.Edge.makeLine((20, 0, 0), (21, 0, 0)),
+    ])
+    source, output = {'shape': contaminated}, {'shape': contaminated}
+    before = topology_metrics(contaminated)
+    assert not before['supported'] and before['unowned_geometry_counts']['edge'] == 1
+    file_bytes = {path: path.read_bytes() for path in (reference_path, output_path)}
+    assert benchmark.reference_topology_diagnostic(source, output)['status'] == 'indeterminate'
+    diagnostic = benchmark.reference_topology_diagnostic(
+        source, output, source_step=reference_path, output_step=output_path,
+    )
+    assert diagnostic['available'] and diagnostic['status'] == 'match'
+    assert diagnostic['topology_match'] is True
+    assert diagnostic['measurement_stage'] == 'fresh_step_import_before_meshing'
+    assert diagnostic['provenance'] == {
+        'kind': 'independent_step_imports',
+        'reference_step_sha256': hashlib.sha256(file_bytes[reference_path]).hexdigest(),
+        'output_step_sha256': hashlib.sha256(file_bytes[output_path]).hexdigest(),
+    }
+    assert source['shape'] is output['shape'] is contaminated
+    assert topology_metrics(contaminated) == before
+    assert all(path.read_bytes() == expected for path, expected in file_bytes.items())
+
+
+def test_production_diagnostic_precedes_metric_shape_contamination(tmp_path, monkeypatch):
+    original_metrics = benchmark.step_surface_metrics
+    contaminated_shapes = []
+
+    def contaminated_metrics(path):
+        metrics = original_metrics(path)
+        contaminated = cq.Compound.makeCompound([
+            metrics['shape'], cq.Edge.makeLine((20, 0, 0), (21, 0, 0)),
+        ])
+        metrics['shape'] = contaminated
+        contaminated_shapes.append((contaminated, topology_metrics(contaminated)))
+        return metrics
+
+    monkeypatch.setattr(benchmark, 'step_surface_metrics', contaminated_metrics)
+    result = protocol_benchmark(tmp_path, monkeypatch, plate(True), plate(True))
+    diagnostic = result['reference_topology']
+    assert diagnostic['status'] == 'match' and diagnostic['topology_match'] is True
+    assert diagnostic['measurement_stage'] == 'fresh_step_import_before_meshing'
+    assert len(contaminated_shapes) == 2
+    assert all(topology_metrics(shape) == before for shape, before in contaminated_shapes)
+
+
+def test_fresh_file_lost_hole_remains_a_mismatch(tmp_path):
+    source, output = tmp_path / 'reference.step', tmp_path / 'output.step'
+    cq.exporters.export(plate(True), str(source))
+    cq.exporters.export(plate(), str(output))
+    diagnostic = benchmark.reference_topology_diagnostic(
+        {}, {}, source_step=source, output_step=output,
+    )
+    assert diagnostic['available'] and diagnostic['status'] == 'mismatch'
+    assert diagnostic['topology_match'] is False
+    assert diagnostic['reference']['solids'][0]['shells'][0]['genus'] == 1
+    assert diagnostic['output']['solids'][0]['shells'][0]['genus'] == 0
+
+
+@pytest.mark.parametrize('source_contents', [None, b'invalid STEP bytes'])
+def test_fresh_file_read_or_import_failure_cannot_use_supplied_matching_shapes(
+    tmp_path, source_contents,
+):
+    source, output = tmp_path / 'reference.step', tmp_path / 'output.step'
+    if source_contents is not None:
+        source.write_bytes(source_contents)
+    shape = plate()
+    cq.exporters.export(shape, str(output))
+    diagnostic = benchmark.reference_topology_diagnostic(
+        {'shape': shape}, {'shape': shape}, source_step=source, output_step=output,
+    )
+    assert not diagnostic['available'] and diagnostic['status'] == 'indeterminate'
+    assert diagnostic['topology_match'] is None
+    assert diagnostic['indeterminate_reasons'] == ['diagnostic_error']
+    assert diagnostic['measurement_stage'] == 'fresh_step_import_before_meshing'
