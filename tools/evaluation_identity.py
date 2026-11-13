@@ -12,6 +12,8 @@ EVALUATION_TOOLS = (
     'benchmark_multires_corpus.py', 'benchmark_surface_corpus.py',
     'analyze_surface_failures.py', 'process_resources.py', 'evaluation_identity.py',
     'multires_summary.py',
+    'geometry_dimensions.py',
+    'brep_topology.py',
 )
 
 

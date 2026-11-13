@@ -34,6 +34,11 @@ def evaluate(case: dict, manifest: Path, artifacts: Path | None) -> dict:
     from app.mesh import surface_samples
     from app.scoring import _local_samples, _point_mesh_distances, _step_mesh
     from app.verification import acceptance_threshold
+    from tools.geometry_dimensions import (
+        GeometryMeasurementError,
+        native_geometry_bounds,
+        topology_tolerance_diagnostics,
+    )
 
     original_metrics = benchmark.step_surface_metrics
     original_convert = benchmark.reconstruct_surfaces
@@ -72,12 +77,36 @@ def evaluate(case: dict, manifest: Path, artifacts: Path | None) -> dict:
             solid_match = len(source_shape.Solids()) == len(output_shape.Solids())
             shell_match = len(source_shape.Shells()) == len(output_shape.Shells())
             limit = acceptance_threshold(diagonal)
+            # These independent geometry bounds explain uncertainty; they do
+            # not waive the original conservative dimension measurement/gate.
+            native_diagnostics = {'reference_native_dimension_measurement_available': False}
+            try:
+                source_native = native_geometry_bounds(source_shape)
+                output_native = native_geometry_bounds(output_shape)
+                native_diagnostics.update(
+                    reference_native_dimension_measurement_available=True,
+                    reference_source_native_dimensions_mm=source_native.dimensions_mm,
+                    reference_output_native_dimensions_mm=output_native.dimensions_mm,
+                    reference_native_dimension_max_error_mm=max(abs(a - b) for a, b in zip(
+                        source_native.dimensions_mm, output_native.dimensions_mm, strict=True)),
+                    reference_native_dimension_measurement=(
+                        'native_geometry_without_mesh_or_tolerance_padding'),
+                )
+            except GeometryMeasurementError as exc:
+                native_diagnostics['reference_native_dimension_measurement_error'] = str(exc)
             reference.update(
                 reference_p95_mm=float(np.percentile(distances, 95)),
                 reference_maximum_mm=float(np.max(distances)),
                 reference_local_max_mm=float(np.max(local)),
                 reference_volume_error_percent=volume_error,
                 reference_dimension_max_error_mm=dimension_error,
+                reference_conservative_source_dimensions_mm=(bounds.xlen, bounds.ylen, bounds.zlen),
+                reference_conservative_output_dimensions_mm=(
+                    output_bounds.xlen, output_bounds.ylen, output_bounds.zlen),
+                reference_dimension_measurement='original_source_before_output_after_meshing_bbox',
+                reference_source_topology_tolerances=topology_tolerance_diagnostics(source_shape),
+                reference_output_topology_tolerances=topology_tolerance_diagnostics(output_shape),
+                **native_diagnostics,
                 reference_solid_count_match=solid_match, reference_shell_count_match=shell_match,
                 reference_mesh_deflection_mm=deflection, reference_limit_mm=limit,
                 reference_geometry_accepted=bool(
