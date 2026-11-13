@@ -8,15 +8,21 @@ November 13 continuation: reference-only failure retention is merged in
 `fdb8fda9f6d22d8a24d49f37e8d147492b2f3895`. Both passed CI
 ([head](https://github.com/LeoHougaard/demeshify/actions/runs/43341322727),
 [merge](https://github.com/LeoHougaard/demeshify/actions/runs/43343429599)).
-The latest composed snapshot is 769 sources / 7,690 inputs, explicitly partial.
+The latest composed snapshot is 819 sources / 8,190 inputs, explicitly partial.
 Acquisition proceeds in bounded batches between matched reconstruction tests.
 Frozen converter bytecode passed an
 actual ten-export AppContainer/reference-grading workflow for one source; see
 [the artifact tool and limits](frozen-converter-artifacts-2026-11-13.md).
 Production sandbox integration, a frozen grader and the full corpus/baseline
-remain unfinished. V22/V23/V24 are not promoted; verified reconstruction stays
+remain unfinished. V22 through V27 are not promoted; verified reconstruction stays
 V21. V24 sped up failures but replaced a useful coarse hybrid with all facets.
 Its source, tests, patch, matched results and diagnostic STEP remain local.
+V25/V26 recover supported analytic regions but do not make a valid solid.
+V27 normalizes the converter's own STEP into a valid solid, but the unchanged
+deviation gate rejects it (1.259 mm maximum, 0.954 mm local maximum).
+All retain the two passing controls in the matched three-case cohort. Actual
+cylindrical trims that fail tessellation are the next diagnostic category;
+neither valid topology alone nor zero facets establishes reconstruction success.
 
 V21 is merged in [PR #9](https://github.com/LeoHougaard/demeshify/pull/9).
 Exact head `04ae353d7d8b51ee0889f36fc89298b0f11919bd` and main merge

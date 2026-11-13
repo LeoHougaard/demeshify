@@ -48,6 +48,6 @@ host is not yet a reviewed production evaluation backend, and the manifest's
 isolation qualification flag remains false.
 
 The quantitative hill climb remains unfinished. The current composed snapshot
-contains 769 distinct STEP sources and 7,690 actual STL exports, not the final
+contains 819 distinct STEP sources and 8,190 actual STL exports, not the final
 1,000/10,000. Production sandbox integration, a frozen grader, full acquisition
 and the full baseline are still required. Holdout remains untouched.
