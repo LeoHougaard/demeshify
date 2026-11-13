@@ -131,6 +131,7 @@ app.innerHTML = `
 
       <section class="advanced-section result-details">
         <h2>Conversion details</h2><div class="detail-metrics"><span>Volume difference</span><strong id="volumeError">—</strong><small>percent</small></div>
+        <div class="detail-metrics"><span>Measured max deviation</span><strong id="maxDeviation">—</strong><small>mm</small></div>
         <h3 id="constructionHeading">Detected surfaces</h3><div id="featurePlan" class="advanced-feature-plan"></div>
         <h3>Additional files</h3><div id="advancedDownloads" class="downloads advanced-downloads"></div><div id="warnings"></div>
       </section>
@@ -1099,6 +1100,15 @@ const formatBytes = (bytes) => {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 };
 
+const isNonnegativeMeasurement = (value) =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0;
+const formatMeasurement = (value, decimals = 3) => {
+  if (!isNonnegativeMeasurement(value)) return "—";
+  const resolution = 10 ** -decimals;
+  return value > 0 && value < resolution
+    ? `<${resolution.toFixed(decimals)}` : value.toFixed(decimals);
+};
+
 function updateInputDimensions() {
   const units = document.querySelector("#units").value;
   const scale = { mm: 1, cm: 10, m: 1000, in: 25.4 }[units];
@@ -1142,7 +1152,7 @@ function resetResultForInput() {
   for (const id of ["downloads", "advancedDownloads", "featurePlan", "warnings"]) {
     document.getElementById(id).replaceChildren();
   }
-  for (const id of ["p95", "volumeError", "construction", "constructionUnit", "elapsed"]) {
+  for (const id of ["p95", "maxDeviation", "volumeError", "construction", "constructionUnit", "elapsed"]) {
     document.getElementById(id).textContent = "—";
   }
   surfaceLegendStatus.textContent = "";
@@ -1511,12 +1521,16 @@ async function renderResult(report, options = {}) {
         ? "Best effort"
         : "Approximation only";
 
-  if (report.score) {
-    document.querySelector("#p95").textContent = report.score.chamfer_p95_mm.toFixed(3);
-    document.querySelector("#volumeError").textContent = report.score.volume_comparable !== false
-      ? report.score.volume_error_percent.toFixed(2)
-      : "N/A";
-  }
+  document.querySelector("#p95").textContent = formatMeasurement(report.score?.chamfer_p95_mm);
+  const measuredMaxima = [report.score?.chamfer_max_mm, report.score?.local_max_mm]
+    .filter(isNonnegativeMeasurement);
+  document.querySelector("#maxDeviation").textContent = formatMeasurement(
+    measuredMaxima.length ? Math.max(...measuredMaxima) : null,
+  );
+  const volumeError = report.score?.volume_error_percent;
+  document.querySelector("#volumeError").textContent = report.score?.volume_comparable === false
+    ? "N/A"
+    : formatMeasurement(volumeError, 2);
   document.querySelector("#elapsed").textContent = report.elapsed_seconds.toFixed(1);
   const featureCount = report.plan
     ? 1 + (report.plan.operations || []).filter((operation) => !operation.suppressed).length
