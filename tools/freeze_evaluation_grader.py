@@ -110,7 +110,19 @@ def fixture_hashes():
 actual_outputs = sealed_outputs()
 inputs = fixture_hashes()
 destination.parent.mkdir(parents=True, exist_ok=True)
-working = tempfile.TemporaryDirectory(dir=destination.parent, prefix='grader-work-')
+# The result hierarchy can be much deeper than Windows' native CAD file APIs
+# permit. Keep scratch independently selectable without changing global paths.
+scratch = Path(configuration.get('scratch_root', str(destination.parent)))
+if not scratch.is_absolute() or not scratch.is_dir():
+    raise ValueError('Grader scratch root must be an existing absolute directory')
+for ancestor in (scratch, *scratch.parents):
+    if ancestor.is_symlink() or (hasattr(ancestor, 'is_junction') and ancestor.is_junction()):
+        raise ValueError('Grader scratch root cannot traverse links or junctions')
+scratch = scratch.resolve(strict=True)
+if any(scratch.is_relative_to(root) for root in (snapshot, runtime, retained)
+       if root is not None):
+    raise ValueError('Grader scratch must be outside sealed artifacts and retained outputs')
+working = tempfile.TemporaryDirectory(dir=scratch, prefix='grader-work-')
 atexit.register(working.cleanup)
 work = Path(working.name)
 for name, directory in (('STL_TO_STEP_RUNS_DIR', 'runs'), ('MPLCONFIGDIR', 'mpl'),

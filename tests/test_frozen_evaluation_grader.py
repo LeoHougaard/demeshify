@@ -217,6 +217,34 @@ def test_generated_entry_never_overwrites_existing_result(tmp_path, monkeypatch)
     assert destination.read_bytes() == b'preserved result'
 
 
+def test_short_scratch_root_handles_deep_result_hierarchy(tmp_path, monkeypatch):
+    _, snapshot, identity = artifact(tmp_path, monkeypatch)
+    configuration, case_path, _, _, command = grading_case(tmp_path, snapshot, identity)
+    scratch = tmp_path / 'scratch'
+    scratch.mkdir()
+    configuration['scratch_root'] = str(scratch)
+    case_path.write_text(json.dumps(configuration))
+    destination = tmp_path / ('nested-result-' * 7) / ('attempt-' * 7) / 'result.json'
+    command[-1] = str(destination)
+    process = run(command)
+    assert process.returncode == 0, process.stderr
+    graded = json.loads(destination.read_text())
+    assert graded['accepted']
+    assert all(Path(value).is_relative_to(scratch)
+               for value in graded['grader_environment'].values())
+    assert not any(scratch.iterdir())
+
+
+def test_grader_scratch_cannot_be_inside_sealed_artifact(tmp_path, monkeypatch):
+    _, snapshot, identity = artifact(tmp_path, monkeypatch)
+    configuration, case_path, _, destination, command = grading_case(tmp_path, snapshot, identity)
+    configuration['scratch_root'] = str(snapshot / 'application')
+    case_path.write_text(json.dumps(configuration))
+    process = run(command)
+    assert process.returncode != 0 and not destination.exists()
+    frozen.verify(snapshot, identity)
+
+
 def test_runtime_changed_during_grading_cannot_publish_result(tmp_path, monkeypatch):
     runtime, snapshot, identity = artifact(tmp_path, monkeypatch)
     configuration, case_path, _, destination, command = grading_case(tmp_path, snapshot, identity)

@@ -68,6 +68,13 @@ there. Storage import side effects and verification scratch files therefore
 stay outside the sealed artifact. These are process-local settings; no global
 configuration, AppContainer profile or permission grant is changed.
 
+Production controllers pass an existing absolute task-owned `scratch_root` in
+the pinned case JSON. The grader creates its fresh working directory there,
+independently of a potentially deep results hierarchy. This avoids Windows CAD
+file API path limits without changing long-path or temporary-directory settings
+globally. Scratch roots traversing links or inside sealed artifacts/retained
+outputs are refused. Existing callers default to the result parent.
+
 Grading temporarily replaces `reconstruct_in_worker` with a callback that
 copies only pinned, retained outputs and parses the retained actual report.
 For a ready reference, exactly one callback is required. The unchanged evaluator grades the
@@ -113,7 +120,7 @@ hashes and pinned source/grader/runtime/case attestations. The controller can us
 this distinct fixture proof to score an already observed execution failure;
 reference-readiness success alone can never turn it into a reconstruction pass.
 
-Twenty-one focused protocol checks pass, including actual cross-process execution
+Twenty-three focused protocol checks pass, including actual cross-process execution
 of generated sourceless entrypoint/modules against a tiny fake grading package.
 They establish retained-report truthfulness, no second conversion/benchmark CLI,
 output allowlisting, process-local storage paths, no runtime copy, immutable
