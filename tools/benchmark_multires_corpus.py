@@ -137,7 +137,11 @@ def main() -> None:
                         help='Shared immutable case results (default: beside output)')
     parser.add_argument('--fresh', action='store_true',
                         help='Skip shared results; still resume completed cases in this run')
+    parser.add_argument('--batch-cases', type=int,
+                        help='Stop after this many new case evaluations; cached cases do not count')
     args = parser.parse_args()
+    if args.batch_cases is not None and args.batch_cases <= 0:
+        parser.error('--batch-cases must be positive')
     manifest = json.loads(args.manifest.read_text())
     cases = [c for c in manifest['cases'] if not args.split or c['split'] == args.split]
     if len({c['id'] for c in cases}) != len(cases):
@@ -171,9 +175,11 @@ def main() -> None:
     # resuming a frozen evaluation. Retain each invocation's actual revision.
     launches_path = args.output.with_suffix('.launches.json')
     launches = json.loads(launches_path.read_text()) if launches_path.exists() else []
-    launches.append({'revision': revision, 'started_unix_seconds': time.time()})
+    launches.append({'revision': revision, 'started_unix_seconds': time.time(),
+                     'batch_cases': args.batch_cases})
     atomic_write_text(launches_path, json.dumps(launches, indent=2))
     results = []
+    fresh_completed = 0
     for case in cases:
         if shutil.disk_usage(args.output.parent).free < 15 * 1024**3:
             raise RuntimeError('Storage floor reached; results preserved')
@@ -231,18 +237,25 @@ def main() -> None:
             atomic_write_text(path, json.dumps(result, indent=2))
             if not shared_path.exists():
                 atomic_write_text(shared_path, json.dumps(result, indent=2))
+            fresh_completed += 1
         results.append({**result, 'reused': reused, 'reused_from': reused_from})
         if source_identity(ROOT) != source_hashes:
             raise RuntimeError('Source changed during evaluation; do not combine results')
         aggregate = summary(results, cases)
+        batch_complete = bool(args.batch_cases and fresh_completed >= args.batch_cases)
         atomic_write_text(args.output.with_suffix('.summary.json'), json.dumps(aggregate, indent=2))
         # Individual cache records are durable after each case. Avoid rewriting
         # tens of megabytes 10,000 times; complete snapshots every 100 cases.
-        if len(results) == 1 or len(results) % 100 == 0 or len(results) == len(cases):
+        if (len(results) == 1 or len(results) % 100 == 0 or len(results) == len(cases)
+                or batch_complete):
             atomic_write_text(args.output, json.dumps({
                 'summary': aggregate, 'revision': revision, 'results': results}, indent=2))
         print(f'[{len(results)}/{len(cases)}] {case["id"]}: '
               f'{result["status"]}, strict={result["accepted"]}, reused={reused}', flush=True)
+        if batch_complete:
+            print(f'Batch complete: {fresh_completed} new case evaluations; '
+                  f'full run complete={aggregate["complete"]}', flush=True)
+            break
 
 
 if __name__ == '__main__':

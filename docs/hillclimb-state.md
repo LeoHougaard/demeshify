@@ -2,6 +2,15 @@
 
 ## Latest qualification, November 12
 
+V21 is merged in [PR #9](https://github.com/LeoHougaard/demeshify/pull/9).
+Exact head `04ae353d7d8b51ee0889f36fc89298b0f11919bd` and main merge
+`50abe20631110980f0113260d0caac140777eab8` passed repository CI:
+[head run](https://github.com/LeoHougaard/demeshify/actions/runs/43332981593),
+[merged run](https://github.com/LeoHougaard/demeshify/actions/runs/43334033398).
+The corpus has since reached 467 sources / 4,670 inputs, still partial.
+Bounded case batches now support progressive evaluation; see
+[the controller evidence](progressive-evaluation-cache-2026-11-12.md).
+
 V21 is locally qualified: truthful planar fallback reporting, complete planar
 patch recovery and canonical open-extrusion junctions. Source SHA-256 is
 `299ef8c7f98f5e8e8ee7f1b600513f7cb7c67a94ecb8eb247a40fdb229d8499e`.
