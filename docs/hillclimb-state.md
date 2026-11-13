@@ -8,8 +8,9 @@ November 13 continuation: reference-only failure retention is merged in
 `fdb8fda9f6d22d8a24d49f37e8d147492b2f3895`. Both passed CI
 ([head](https://github.com/LeoHougaard/demeshify/actions/runs/43341322727),
 [merge](https://github.com/LeoHougaard/demeshify/actions/runs/43343429599)).
-The composed snapshot is now 569 sources / 5,690 inputs. A further bounded
-100-source acquisition batch is active. Frozen converter bytecode passed an
+The latest composed snapshot is 769 sources / 7,690 inputs, explicitly partial.
+Acquisition proceeds in bounded batches between matched reconstruction tests.
+Frozen converter bytecode passed an
 actual ten-export AppContainer/reference-grading workflow for one source; see
 [the artifact tool and limits](frozen-converter-artifacts-2026-11-13.md).
 Production sandbox integration, a frozen grader and the full corpus/baseline
