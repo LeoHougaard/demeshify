@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Raised the isolated analytic-worker and total geometry-job deadlines to one
+  hour, including for dense meshes, so slow conversions can finish instead of
+  hitting the previous 60/90/120-second worker and 240-second job limits.
 - Filter relevant mesh adjacency rows before chart and residual-neighbor scans,
   preserving their order and ownership while avoiding repeated Python walks
   through every edge of dense models.

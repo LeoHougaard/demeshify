@@ -68,7 +68,7 @@ converter attempts a clearly labelled faceted recovery within the total job
 deadline.
 
 The API supervises the complete conversion or feature edit in a separate
-process with a 240-second total deadline, including recovery, export, and
+process with a one-hour total deadline, including recovery, export, and
 verification. Disjoint closed bodies and enclosed cavity shells use their own fitting scale. Input
 cleanup removes duplicate and zero-area triangles without moving vertices;
 exact collinear boundary subdivisions exposed by that cleanup can be resolved
