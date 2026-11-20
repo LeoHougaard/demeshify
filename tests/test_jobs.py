@@ -6,7 +6,7 @@ import pytest
 import trimesh
 from fastapi.testclient import TestClient
 
-from app import storage
+from app import jobs, storage
 from app.jobs import run_bounded_process
 from app.main import app
 
@@ -34,6 +34,20 @@ def test_job_deadline_terminates_descendant_processes(tmp_path):
     assert "child started" in stdout.read_text()
     time.sleep(2.2)
     assert not marker.exists()
+
+
+def test_geometry_job_uses_one_hour_deadline(tmp_path, monkeypatch):
+    timeouts = []
+
+    def fake_run_bounded_process(*args, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired("geometry-worker", kwargs["timeout"])
+
+    monkeypatch.setattr(jobs, "run_bounded_process", fake_run_bounded_process)
+
+    with pytest.raises(TimeoutError, match="3600-second total deadline"):
+        jobs._run_job(tmp_path, {})
+    assert timeouts == [3600]
 
 
 def test_job_retains_native_error_output_and_exit_code(tmp_path):

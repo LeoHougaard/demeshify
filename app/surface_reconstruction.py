@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
@@ -25,6 +24,8 @@ from .surface_brep import (
     export_surface_brep,
 )
 from .verification import acceptance_threshold, passes_geometry_gate, verification_warnings
+
+ANALYTIC_WORKER_TIMEOUT_SECONDS = 3600
 
 
 def _acceptance_threshold(diagonal: float) -> float:
@@ -383,21 +384,7 @@ def reconstruct_surfaces(
         )
     if progress_callback is not None:
         progress_callback("surface_isolated_worker_start")
-    worker_timeout = 120
-    try:
-        file_size = stl_path.stat().st_size
-        with stl_path.open("rb") as stream:
-            stream.seek(80)
-            triangle_count = struct.unpack("<I", stream.read(4))[0]
-        if file_size == 84 + triangle_count * 50 and triangle_count > 50_000:
-            # Near-threshold dense cases finish their analytic pass in roughly
-            # 54 seconds before process startup/export overhead, so a 60-second
-            # cap discarded completed graphs. Larger meshes retain the shorter
-            # budget because constructing their recovery carrier also consumes
-            # a substantial share of the corpus-level 240-second safety bound.
-            worker_timeout = 90 if triangle_count <= 60_000 else 60
-    except (OSError, struct.error):
-        pass
+    worker_timeout = ANALYTIC_WORKER_TIMEOUT_SECONDS
     worker_progress_path = stl_path.parent / "surface-worker-progress.log"
     worker_progress_path.unlink(missing_ok=True)
     command = [

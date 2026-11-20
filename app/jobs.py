@@ -11,7 +11,7 @@ from pathlib import Path
 from . import storage
 from .schemas import PlanEditRequest, ReconstructionReport
 
-JOB_TIMEOUT_SECONDS = 240
+JOB_TIMEOUT_SECONDS = 3600
 
 
 def run_bounded_process(
