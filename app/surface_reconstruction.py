@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
@@ -13,6 +12,7 @@ import numpy as np
 import point_cloud_utils as pcu
 import trimesh
 
+from .jobs import CONVERSION_TIMEOUT_SECONDS
 from .mesh import MeshData, load_mesh, mesh_warnings
 from .prismatic_recovery import recover_prismatic_solid
 from .schemas import ReconstructionReport, SurfaceBRepReport
@@ -383,21 +383,6 @@ def reconstruct_surfaces(
         )
     if progress_callback is not None:
         progress_callback("surface_isolated_worker_start")
-    worker_timeout = 120
-    try:
-        file_size = stl_path.stat().st_size
-        with stl_path.open("rb") as stream:
-            stream.seek(80)
-            triangle_count = struct.unpack("<I", stream.read(4))[0]
-        if file_size == 84 + triangle_count * 50 and triangle_count > 50_000:
-            # Near-threshold dense cases finish their analytic pass in roughly
-            # 54 seconds before process startup/export overhead, so a 60-second
-            # cap discarded completed graphs. Larger meshes retain the shorter
-            # budget because constructing their recovery carrier also consumes
-            # a substantial share of the corpus-level 240-second safety bound.
-            worker_timeout = 90 if triangle_count <= 60_000 else 60
-    except (OSError, struct.error):
-        pass
     worker_progress_path = stl_path.parent / "surface-worker-progress.log"
     worker_progress_path.unlink(missing_ok=True)
     command = [
@@ -422,7 +407,7 @@ def reconstruct_surfaces(
             cwd=Path(__file__).resolve().parents[1],
             capture_output=True,
             text=True,
-            timeout=worker_timeout,
+            timeout=CONVERSION_TIMEOUT_SECONDS,
             creationflags=creation_flags,
             check=False,
         )
@@ -431,7 +416,7 @@ def reconstruct_surfaces(
         worker_stdout, worker_stderr = exc.stdout, exc.stderr
         reason = (
             "the isolated analytic worker exceeded "
-            f"{worker_timeout} seconds"
+            f"{CONVERSION_TIMEOUT_SECONDS} seconds"
         )
     else:
         worker_stdout = getattr(completed, "stdout", "")

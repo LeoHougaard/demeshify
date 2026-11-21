@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -778,18 +779,51 @@ def test_fine_trimming_retry_only_adopts_a_geometrically_verified_solid(
     assert report.score.volume_error_percent < 0.01
 
 
+@pytest.mark.parametrize("triangle_count", [12, 50_001, 60_001])
+def test_analytic_worker_allows_one_hour_for_all_mesh_sizes(
+    monkeypatch,
+    tmp_path,
+    triangle_count,
+) -> None:
+    stl_path = tmp_path / "input.stl"
+    stl_path.write_bytes(
+        b"\0" * 80
+        + triangle_count.to_bytes(4, "little")
+        + b"\0" * (triangle_count * 50)
+    )
+    timeouts = []
+
+    def native_worker(*args, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    fallback = SimpleNamespace(model_dump_json=lambda indent: "{}")
+    monkeypatch.setattr(surface_reconstruction.subprocess, "run", native_worker)
+    monkeypatch.setattr(
+        surface_reconstruction,
+        "_reconstruct_faceted_only",
+        lambda *args: fallback,
+    )
+
+    assert reconstruct_surfaces("worker-timeout-test", stl_path, "input.stl") is fallback
+    assert timeouts == [3600]
+
+
+@pytest.mark.parametrize("worker_timed_out", [False, True])
 def test_native_worker_failure_is_reported_as_faceted_best_effort(
     monkeypatch,
     tmp_path,
+    worker_timed_out,
 ) -> None:
     mesh = trimesh.creation.box(extents=(7, 5, 3))
     stl_path = tmp_path / "input.stl"
     mesh.export(stl_path)
-    monkeypatch.setattr(
-        surface_reconstruction.subprocess,
-        "run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=3221225477),
-    )
+    def failing_worker(command, *, timeout, **kwargs):
+        if worker_timed_out:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return SimpleNamespace(returncode=3221225477)
+
+    monkeypatch.setattr(surface_reconstruction.subprocess, "run", failing_worker)
 
     report = surface_reconstruction.reconstruct_surfaces(
         "native-failure-test",

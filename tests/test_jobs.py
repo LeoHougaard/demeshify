@@ -6,7 +6,7 @@ import pytest
 import trimesh
 from fastapi.testclient import TestClient
 
-from app import storage
+from app import jobs, storage
 from app.jobs import run_bounded_process
 from app.main import app
 
@@ -34,6 +34,30 @@ def test_job_deadline_terminates_descendant_processes(tmp_path):
     assert "child started" in stdout.read_text()
     time.sleep(2.2)
     assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("request_data", "expected_timeout"),
+    [
+        ({"mode": "edit"}, 3600),
+        ({"mode": "reconstruct", "engine": "feature_tree"}, 3600),
+        ({"mode": "reconstruct", "engine": "surface_brep"}, 3840),
+    ],
+)
+def test_geometry_job_deadline_leaves_time_for_surface_recovery(
+    tmp_path, monkeypatch, request_data, expected_timeout
+):
+    timeouts = []
+
+    def fake_run_bounded_process(*args, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired("geometry-worker", kwargs["timeout"])
+
+    monkeypatch.setattr(jobs, "run_bounded_process", fake_run_bounded_process)
+
+    with pytest.raises(TimeoutError, match=f"{expected_timeout}-second total deadline"):
+        jobs._run_job(tmp_path, request_data)
+    assert timeouts == [expected_timeout]
 
 
 def test_job_retains_native_error_output_and_exit_code(tmp_path):
