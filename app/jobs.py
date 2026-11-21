@@ -11,7 +11,10 @@ from pathlib import Path
 from . import storage
 from .schemas import PlanEditRequest, ReconstructionReport
 
-JOB_TIMEOUT_SECONDS = 3600
+CONVERSION_TIMEOUT_SECONDS = 3600
+# The outer watchdog starts before the analytic worker. Allow time for
+# startup and faceted recovery if analytic fitting uses its full budget.
+SURFACE_RECOVERY_ALLOWANCE_SECONDS = 240
 
 
 def run_bounded_process(
@@ -68,11 +71,14 @@ def _run_job(directory: Path, request: dict[str, object]) -> ReconstructionRepor
     error_path = request_path.with_suffix(".error.json")
     request_path.write_text(json.dumps(request), encoding="utf-8")
     environment = {**os.environ, "STL_TO_STEP_RUNS_DIR": str(storage.RUNS)}
+    timeout = CONVERSION_TIMEOUT_SECONDS
+    if request.get("engine") == "surface_brep":
+        timeout += SURFACE_RECOVERY_ALLOWANCE_SECONDS
     try:
         returncode = run_bounded_process(
             [sys.executable, "-m", "app.job_worker", str(request_path.resolve())],
             cwd=storage.ROOT,
-            timeout=JOB_TIMEOUT_SECONDS,
+            timeout=timeout,
             stdout_path=directory / "geometry-worker.stdout.log",
             stderr_path=directory / "geometry-worker.stderr.log",
             env=environment,
@@ -93,7 +99,7 @@ def _run_job(directory: Path, request: dict[str, object]) -> ReconstructionRepor
         )
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError(
-            f"Geometry work exceeded the {JOB_TIMEOUT_SECONDS}-second total deadline"
+            f"Geometry work exceeded the {timeout}-second total deadline"
         ) from exc
     finally:
         request_path.unlink(missing_ok=True)

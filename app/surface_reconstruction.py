@@ -12,6 +12,7 @@ import numpy as np
 import point_cloud_utils as pcu
 import trimesh
 
+from .jobs import CONVERSION_TIMEOUT_SECONDS
 from .mesh import MeshData, load_mesh, mesh_warnings
 from .prismatic_recovery import recover_prismatic_solid
 from .schemas import ReconstructionReport, SurfaceBRepReport
@@ -24,8 +25,6 @@ from .surface_brep import (
     export_surface_brep,
 )
 from .verification import acceptance_threshold, passes_geometry_gate, verification_warnings
-
-ANALYTIC_WORKER_TIMEOUT_SECONDS = 3600
 
 
 def _acceptance_threshold(diagonal: float) -> float:
@@ -384,7 +383,6 @@ def reconstruct_surfaces(
         )
     if progress_callback is not None:
         progress_callback("surface_isolated_worker_start")
-    worker_timeout = ANALYTIC_WORKER_TIMEOUT_SECONDS
     worker_progress_path = stl_path.parent / "surface-worker-progress.log"
     worker_progress_path.unlink(missing_ok=True)
     command = [
@@ -409,7 +407,7 @@ def reconstruct_surfaces(
             cwd=Path(__file__).resolve().parents[1],
             capture_output=True,
             text=True,
-            timeout=worker_timeout,
+            timeout=CONVERSION_TIMEOUT_SECONDS,
             creationflags=creation_flags,
             check=False,
         )
@@ -418,7 +416,7 @@ def reconstruct_surfaces(
         worker_stdout, worker_stderr = exc.stdout, exc.stderr
         reason = (
             "the isolated analytic worker exceeded "
-            f"{worker_timeout} seconds"
+            f"{CONVERSION_TIMEOUT_SECONDS} seconds"
         )
     else:
         worker_stdout = getattr(completed, "stdout", "")

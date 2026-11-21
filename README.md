@@ -67,10 +67,12 @@ topology closes. If native fitting crashes or exceeds its time limit, the
 converter attempts a clearly labelled faceted recovery within the total job
 deadline.
 
-The API supervises the complete conversion or feature edit in a separate
-process with a one-hour total deadline, including recovery, export, and
-verification. Disjoint closed bodies and enclosed cavity shells use their own fitting scale. Input
-cleanup removes duplicate and zero-area triangles without moving vertices;
+The API supervises conversions and feature edits in a separate process. The
+analytic surface worker has one hour, with a 64-minute total deadline to allow
+time for startup and faceted recovery. Feature-based conversions and edits
+have a one-hour total deadline. Disjoint closed bodies and enclosed cavity
+shells use their own fitting scale. Input cleanup removes duplicate and
+zero-area triangles without moving vertices;
 exact collinear boundary subdivisions exposed by that cleanup can be resolved
 using existing vertices only, while preserving surface area, volume and original
 triangle numbers. Collinearity is checked exactly on the stored coordinates to

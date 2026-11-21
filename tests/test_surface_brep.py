@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -808,18 +809,21 @@ def test_analytic_worker_allows_one_hour_for_all_mesh_sizes(
     assert timeouts == [3600]
 
 
+@pytest.mark.parametrize("worker_timed_out", [False, True])
 def test_native_worker_failure_is_reported_as_faceted_best_effort(
     monkeypatch,
     tmp_path,
+    worker_timed_out,
 ) -> None:
     mesh = trimesh.creation.box(extents=(7, 5, 3))
     stl_path = tmp_path / "input.stl"
     mesh.export(stl_path)
-    monkeypatch.setattr(
-        surface_reconstruction.subprocess,
-        "run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=3221225477),
-    )
+    def failing_worker(command, *, timeout, **kwargs):
+        if worker_timed_out:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return SimpleNamespace(returncode=3221225477)
+
+    monkeypatch.setattr(surface_reconstruction.subprocess, "run", failing_worker)
 
     report = surface_reconstruction.reconstruct_surfaces(
         "native-failure-test",

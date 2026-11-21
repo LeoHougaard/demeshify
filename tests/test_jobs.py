@@ -36,7 +36,17 @@ def test_job_deadline_terminates_descendant_processes(tmp_path):
     assert not marker.exists()
 
 
-def test_geometry_job_uses_one_hour_deadline(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("request_data", "expected_timeout"),
+    [
+        ({"mode": "edit"}, 3600),
+        ({"mode": "reconstruct", "engine": "feature_tree"}, 3600),
+        ({"mode": "reconstruct", "engine": "surface_brep"}, 3840),
+    ],
+)
+def test_geometry_job_deadline_leaves_time_for_surface_recovery(
+    tmp_path, monkeypatch, request_data, expected_timeout
+):
     timeouts = []
 
     def fake_run_bounded_process(*args, **kwargs):
@@ -45,9 +55,9 @@ def test_geometry_job_uses_one_hour_deadline(tmp_path, monkeypatch):
 
     monkeypatch.setattr(jobs, "run_bounded_process", fake_run_bounded_process)
 
-    with pytest.raises(TimeoutError, match="3600-second total deadline"):
-        jobs._run_job(tmp_path, {})
-    assert timeouts == [3600]
+    with pytest.raises(TimeoutError, match=f"{expected_timeout}-second total deadline"):
+        jobs._run_job(tmp_path, request_data)
+    assert timeouts == [expected_timeout]
 
 
 def test_job_retains_native_error_output_and_exit_code(tmp_path):
