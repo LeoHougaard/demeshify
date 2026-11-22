@@ -14,7 +14,8 @@ export function getKernel() {
 export async function buildPrism(section, job, started) {
   const { axis, width, min, max, outer, holes, epsilon } = section;
   const loops = [outer, ...holes];
-  const deviation = Math.max(epsilon * 8, ...loops.map(loop => loop.circle?.deviation || 0));
+  const deviation = Math.max(epsilon * 8, ...loops.flatMap(({ circle, segments }) =>
+    circle ? [circle.deviation] : segments.map(segment => segment.deviation ?? 0)));
   if (deviation > Math.max(0.12, section.diagonal * 0.003) / 2) return null;
   const kernel = await getKernel();
   const checkpoint = kernel.checkpoint();
@@ -30,7 +31,7 @@ export async function buildPrism(section, job, started) {
   }
   const vec = ([x, y, z]) => ({ x, y, z });
 
-  function solid({ loop, circle }) {
+  function solid({ circle, segments }) {
     if (circle) {
       let cylinder = kernel.makeCylinder(circle.radius, width);
       if (axis !== 2) cylinder = kernel.rotate(cylinder, {
@@ -38,9 +39,9 @@ export async function buildPrism(section, job, started) {
       }, Math.PI / 2);
       return kernel.translate(cylinder, ...xyz(circle.center));
     }
-    const edges = loop.map((point, i) => kernel.makeLineEdge(
-      vec(xyz(point)), vec(xyz(loop[(i + 1) % loop.length])),
-    ));
+    const edges = segments.map(({ a, b, mid }) => mid
+      ? kernel.makeArcEdge(vec(xyz(a)), vec(xyz(mid)), vec(xyz(b)))
+      : kernel.makeLineEdge(vec(xyz(a)), vec(xyz(b))));
     return kernel.extrude(kernel.makeFace(kernel.makeWire(edges)), ...vector);
   }
 
@@ -58,14 +59,18 @@ export async function buildPrism(section, job, started) {
       if (!(type in counts)) return null;
       counts[type] += 1;
     }
-    const expectedPlanes = 2 + loops.reduce((count, item) => count + (item.circle ? 0 : item.loop.length), 0);
-    if (counts.plane !== expectedPlanes || counts.cylinder !== loops.filter(item => item.circle).length) return null;
+    const expectedPlanes = 2 + loops.reduce((count, item) =>
+      count + item.segments.filter(segment => !segment.mid).length, 0);
+    const expectedCylinders = loops.reduce((count, { circle, segments }) =>
+      count + (circle ? 1 : segments.filter(segment => segment.mid).length), 0);
+    if (counts.plane !== expectedPlanes || counts.cylinder !== expectedCylinders) return null;
     const box = kernel.getBoundingBox(reopened, false);
     const boundsError = Math.max(...['x', 'y', 'z'].flatMap((key, index) => [
       Math.abs(box[`${key}min`] - min[index]), Math.abs(box[`${key}max`] - max[index]),
     ]));
-    const fittedVolume = width * loops.reduce((volume, { signed, circle }) =>
-      volume + (circle ? Math.sign(signed) * Math.PI * circle.radius ** 2 : signed), 0);
+    const fittedVolume = width * loops.reduce((volume, { signed, circle, segments }) =>
+      volume + (circle ? Math.sign(signed) * Math.PI * circle.radius ** 2
+        : signed + segments.reduce((sum, segment) => sum + (segment.addedArea ?? 0), 0)), 0);
     const resultVolume = kernel.getVolume(reopened);
     const volumeError = 100 * Math.abs(resultVolume / section.volume - 1);
     if (!Number.isFinite(volumeError) || volumeError > 2 || boundsError > deviation + 1e-6
@@ -88,14 +93,14 @@ export async function buildPrism(section, job, started) {
         component_count_match: true, step_geometry_verified: true },
       warnings: [], elapsed_seconds: (performance.now() - started) / 1000,
     };
-    const surfaceBoundaries = loops.flatMap(({ loop, circle }) => {
+    const surfaceBoundaries = loops.flatMap(({ loop, circle, segments }) => {
       const points = circle ? Array.from({ length: 64 }, (_, i) => {
         const a = i * Math.PI / 32;
         return [circle.center[0] + circle.radius * Math.cos(a), circle.center[1] + circle.radius * Math.sin(a)];
       }) : loop;
       const closed = [...points, points[0]];
       return [closed.map(point => xyz(point)), closed.map(point => xyz(point, 1)),
-        ...(circle ? [] : points.map(point => [xyz(point), xyz(point, 1)]))];
+        ...segments.map(({ a }) => [xyz(a), xyz(a, 1)])];
     });
     const text = new TextEncoder();
     const files = {

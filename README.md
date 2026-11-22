@@ -30,7 +30,7 @@ npm exec -- vite preview --mode browser
 ```
 
 The static build is in `web/dist-browser`. The default mode uses a quick CAD
-path for straight extrusions with polygonal or circular profiles and runs the
+path for straight extrusions with lines and circular arcs and runs the
 full reconstruction for other shapes. **Advanced → Fast faceted solid** keeps
 the original STL triangles as STEP faces. It accepts one closed, consistently
 oriented body with up to 20,000 triangles and checks the solid by reopening

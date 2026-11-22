@@ -11,30 +11,87 @@ function inside([x, y], loop) {
     (ay > y) !== (by > y) && x < ax + (y - ay) * (bx - ax) / (by - ay) ? !found : found, false);
 }
 
-function circle(loop, epsilon) {
-  if (loop.length < 12) return null;
-  const a = loop[0];
-  const b = delta(loop[Math.floor(loop.length / 3)], a);
-  const c = delta(loop[Math.floor(2 * loop.length / 3)], a);
+function circumcircle(a, middle, end, epsilon) {
+  const b = delta(middle, a);
+  const c = delta(end, a);
   const d = 2 * cross(b, c);
   if (Math.abs(d) <= epsilon ** 2) return null;
   const u = (Math.hypot(...b) ** 2 * c[1] - Math.hypot(...c) ** 2 * b[1]) / d;
   const v = (b[0] * Math.hypot(...c) ** 2 - c[0] * Math.hypot(...b) ** 2) / d;
   const center = [a[0] + u, a[1] + v];
   const radius = Math.hypot(u, v);
+  return { center, radius };
+}
+
+function arcAngle(a, b, center) {
+  const x = delta(a, center), y = delta(b, center);
+  return Math.atan2(cross(x, y), x[0] * y[0] + x[1] * y[1]);
+}
+
+function circle(loop, epsilon) {
+  if (loop.length < 12) return null;
+  const fit = circumcircle(loop[0], loop[Math.floor(loop.length / 3)],
+    loop[Math.floor(2 * loop.length / 3)], epsilon);
+  if (!fit) return null;
+  const { center, radius } = fit;
   if (loop.some(point => Math.abs(Math.hypot(...delta(point, center)) - radius) > epsilon * 4)) return null;
   let turn = 0;
   let maxAngle = 0;
   const orientation = Math.sign(area(loop));
   for (const [p, q] of pairs(loop)) {
-    const x = delta(p, center), y = delta(q, center);
-    const angle = Math.atan2(cross(x, y), x[0] * y[0] + x[1] * y[1]);
+    const angle = arcAngle(p, q, center);
     if (Math.sign(angle) !== orientation) return null;
     turn += angle;
     maxAngle = Math.max(maxAngle, Math.abs(angle));
   }
   if (Math.abs(Math.abs(turn) - 2 * Math.PI) > 1e-6 || maxAngle > Math.PI / 4) return null;
   return { center, radius, deviation: radius * (1 - Math.cos(maxAngle / 2)) + epsilon * 8 };
+}
+
+function fitArc(points, start, end, epsilon) {
+  const a = points[start], b = points[end], mid = points[Math.floor((start + end) / 2)];
+  const fit = circumcircle(a, mid, b, epsilon);
+  if (!fit) return null;
+  const { center, radius } = fit;
+  let turn = 0, maxAngle = 0, addedArea = 0;
+  for (let i = start; i < end; i++) {
+    const angle = arcAngle(points[i], points[i + 1], center);
+    if (Math.abs(angle) > Math.PI / 12 || !angle || turn * angle < 0
+        || Math.abs(Math.hypot(...delta(points[i], center)) - radius) > epsilon * 4) return null;
+    turn += angle;
+    maxAngle = Math.max(maxAngle, Math.abs(angle));
+    addedArea += radius ** 2 * (angle - Math.sin(angle)) / 2;
+  }
+  if (Math.abs(turn) < Math.PI / 12 || Math.abs(turn) > 1.9 * Math.PI) return null;
+  return { a, b, mid, addedArea, deviation: radius * (1 - Math.cos(maxAngle / 2)) + epsilon * 8 };
+}
+
+function profileSegments(loop, epsilon) {
+  if (loop.length > 256) return null;
+  let corner = 0, strongestTurn = 0;
+  for (let i = 0; i < loop.length; i++) {
+    const a = loop[(i + loop.length - 1) % loop.length], b = loop[i], c = loop[(i + 1) % loop.length];
+    const turn = Math.PI - Math.abs(arcAngle(a, c, b));
+    if (turn > strongestTurn) {
+      corner = i;
+      strongestTurn = turn;
+    }
+  }
+  const points = [...loop.slice(corner), ...loop.slice(0, corner), loop[corner]];
+  const segments = [];
+  for (let start = 0; start < loop.length && segments.length < 8;) {
+    let arc;
+    let end = loop.length;
+    for (; end >= start + 6; end--) {
+      arc = fitArc(points, start, end, epsilon);
+      if (arc) break;
+    }
+    if (!arc) end = start + 1;
+    segments.push(arc || { a: points[start], b: points[end] });
+    start = end;
+    if (start === loop.length) return segments;
+  }
+  return null;
 }
 
 function profile(positions, min, max, axis, epsilon) {
@@ -107,13 +164,15 @@ function profile(positions, min, max, axis, epsilon) {
       id = neighbor;
     } while (id !== start);
     if (loop.length < 3) return null;
-    loops.push({ loop, signed: area(loop), circle: circle(loop, epsilon) });
+    const round = circle(loop, epsilon);
+    const segments = round ? [] : profileSegments(loop, epsilon);
+    if (!segments) return null;
+    loops.push({ loop, signed: area(loop), circle: round, segments });
   }
   const outer = loops.find(item => item.signed > 0);
   if (!outer || loops.some(item => item !== outer && (item.signed >= 0 || !inside(item.loop[0], outer.loop)))) return null;
   const section = loops.reduce((sum, loop) => sum + loop.signed, 0);
   if (section <= 0 || capAreas.some(a => Math.abs(a - section) > section * 1e-5)) return null;
-  if (loops.some(item => !item.circle && item.loop.length > 8)) return null;
   return { axis, width, min, max, epsilon, volume: section * width, outer,
     holes: loops.filter(item => item !== outer) };
 }
