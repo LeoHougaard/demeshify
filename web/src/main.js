@@ -6,6 +6,8 @@ import {
   toCreasedNormals,
 } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import "./styles.css";
+import { createConversionNotifier } from "./notifications.js";
+import { pollReconstruction } from "./reconstruction-polling.js";
 
 CameraControls.install({ THREE });
 
@@ -29,6 +31,7 @@ let drawerReturnFocus = null;
 
 const MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
 const MAX_PREVIEW_BYTES = 50 * 1024 * 1024;
+const conversionNotifications = createConversionNotifier(window);
 
 const escapeHtml = (value) =>
   String(value ?? "")
@@ -1379,51 +1382,30 @@ async function updateLivePreview(progress) {
   }
 }
 
-const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+function waitForReconstruction(
+  runId,
+  selectionVersion = fileSelectionVersion,
+  onProgress = () => {},
+) {
+  return pollReconstruction(runId, {
+    isActive: () => selectionVersion === fileSelectionVersion,
+    onProgress: (progress) => {
+      onProgress(progress);
+      renderReconstructionProgress(progress);
+    },
+  });
+}
 
-async function waitForReconstruction(runId, selectionVersion = fileSelectionVersion) {
-  let transientFailures = 0;
-  while (selectionVersion === fileSelectionVersion) {
-    let response;
-    let progress;
-    try {
-      response = await fetch(`/api/runs/${runId}/progress`, { cache: "no-store" });
-      progress = await response.json();
-      if (!response.ok) {
-        throw new Error(progress.detail || "Could not read reconstruction progress.");
-      }
-      transientFailures = 0;
-    } catch (error) {
-      if (selectionVersion !== fileSelectionVersion) return null;
-      transientFailures += 1;
-      if (transientFailures >= 4) {
-        throw new Error(
-          `The converter stopped responding. Reload this page to reconnect to run ${runId}.`,
-          { cause: error },
-        );
-      }
-      await wait(Math.min(5000, 750 * 2 ** (transientFailures - 1)));
-      continue;
-    }
-    if (selectionVersion !== fileSelectionVersion) return null;
-    renderReconstructionProgress(progress);
-    if (progress.status === "failed") {
-      throw new Error(progress.error || "Reconstruction failed.");
-    }
-    if (progress.status === "complete") {
-      const reportResponse = await fetch(`/api/runs/${runId}`, { cache: "no-store" });
-      const report = await reportResponse.json();
-      if (selectionVersion !== fileSelectionVersion) return null;
-      if (!reportResponse.ok) throw new Error(report.detail || "Could not load the result.");
-      return report;
-    }
-    await wait(650);
-  }
-  return null;
+function announceConversionComplete(report) {
+  void conversionNotifications.notifyComplete({
+    runId: report.id,
+    fileName: report.mesh?.file_name,
+  });
 }
 
 button.addEventListener("click", async () => {
   if (!selectedFile) return;
+  void conversionNotifications.requestPermission();
   const selectionVersion = fileSelectionVersion;
   button.disabled = true;
   document.querySelector("#units").disabled = true;
@@ -1465,7 +1447,10 @@ button.addEventListener("click", async () => {
     window.history.replaceState(null, "", runUrl);
     renderReconstructionProgress(payload);
     const report = await waitForReconstruction(payload.id, selectionVersion);
-    if (report) await renderResult(report, { selectionVersion });
+    if (report) {
+      announceConversionComplete(report);
+      await renderResult(report, { selectionVersion });
+    }
   } catch (error) {
     if (selectionVersion === fileSelectionVersion) showError(error.message);
   } finally {
@@ -1824,8 +1809,15 @@ if (/^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestedRun || "")) {
   const selectionVersion = fileSelectionVersion;
   button.disabled = true;
   processing.classList.remove("hidden");
-  waitForReconstruction(requestedRun, selectionVersion)
-    .then((report) => report && renderResult(report, { scroll: false, selectionVersion }))
+  let runWasInProgress = false;
+  waitForReconstruction(requestedRun, selectionVersion, (progress) => {
+    runWasInProgress ||= progress.status === "queued" || progress.status === "running";
+  })
+    .then((report) => {
+      if (!report) return null;
+      if (runWasInProgress) announceConversionComplete(report);
+      return renderResult(report, { scroll: false, selectionVersion });
+    })
     .catch((error) => {
       if (selectionVersion === fileSelectionVersion) showError(error.message);
     })
