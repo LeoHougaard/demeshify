@@ -1,12 +1,24 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, devices, firefox, webkit } from 'playwright';
 
 const here = import.meta.dirname;
 const target = new URL(process.argv[2]);
-const corpus = process.argv.slice(3).map(file => path.resolve(file));
+const inputsArg = process.argv.slice(3);
+const complex = inputsArg[0] === '--complex';
+let corpus = inputsArg.map(file => path.resolve(file));
+if (complex) {
+  assert.ok(inputsArg.length <= 2, '--complex takes an optional dataset name prefix');
+  const fixtureGroups = JSON.parse(await readFile(path.join(here, 'complex-fixtures.json'), 'utf8'));
+  const corpusRoot = process.env.SMOKE_CORPUS_ROOT || path.resolve(here, '../../datasets');
+  const prefix = inputsArg[1] || '';
+  corpus = Object.entries(fixtureGroups).filter(([folder]) => folder.startsWith(prefix))
+    .flatMap(([folder, names]) => names.map(name => path.resolve(corpusRoot, folder, name + '.stl')));
+  assert.ok(corpus.length, 'No complex fixtures matched the dataset prefix');
+  for (const file of corpus) await access(file);
+}
 const units = process.env.SMOKE_UNITS || 'mm';
 const python = process.env.SMOKE_PYTHON || path.resolve(here, '../../.venv',
   process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
@@ -102,6 +114,7 @@ try {
     const milliseconds = Math.round(performance.now() - start);
     const reportLink = page.locator('#advancedDownloads a[download="report.json"]');
     const report = await reportLink.evaluate(async link => (await fetch(link.href)).json());
+    await writeFile(path.join(dir, name + '.report.json'), JSON.stringify(report, null, 2));
     conversions.push({ model: name, milliseconds, implementation: report.implementation || 'reconstruction' });
     const [download] = await Promise.all([page.waitForEvent('download'), link.click()]);
     await download.saveAs(path.join(dir, name + '.step'));
@@ -119,7 +132,18 @@ try {
   console.log(JSON.stringify(metrics));
   if (corpus.length) {
     const failures = JSON.parse(report).filter(result => !result.verified);
+    if (complex) {
+      const audit = execFileSync(python, [path.join(here, 'cad.py'), 'audit-references', dir, ...corpus],
+        { encoding: 'utf8' });
+      await writeFile(path.join(dir, 'reference-audit.json'), audit);
+      const auditFailures = JSON.parse(audit).filter(result => result.error || result.strict_cad === null);
+      assert.deepEqual(auditFailures, [], 'Some complex STEP files could not be audited against reference CAD');
+    }
     assert.deepEqual(failures, [], 'Some downloaded STEP files failed independent verification');
+  }
+  if (process.env.SMOKE_EXPECT_IMPLEMENTATION) {
+    assert.ok(conversions.every(result => result.implementation === process.env.SMOKE_EXPECT_IMPLEMENTATION),
+      `Expected all files to use ${process.env.SMOKE_EXPECT_IMPLEMENTATION}`);
   }
 } finally {
   await browser.close();
