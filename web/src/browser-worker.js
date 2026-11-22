@@ -34,11 +34,11 @@ self.onmessage = async ({ data: job }) => {
   const started = performance.now();
   const complete = result => send('complete', result, Object.values(result.files).map(bytes => bytes.buffer));
 
-  async function tryFaceted(reason, pyodide, directory) {
+  async function tryFaceted(reason, pyodide, directory, requireRecovery = false) {
     try {
       const { buildFaceted } = await import('./faceted-step.js');
       const result = await buildFaceted(job, started, reason);
-      if (!result) return false;
+      if (!result || (requireRecovery && result.report.implementation !== 'hybrid')) return false;
       const diagnostic = `${directory}/analytic_diagnostic.step`;
       if (pyodide?.FS.analyzePath(diagnostic).exists) {
         result.files['analytic_diagnostic.step'] = pyodide.FS.readFile(diagnostic);
@@ -115,6 +115,8 @@ self.onmessage = async ({ data: job }) => {
         send('progress', { progress: { stage: 'Recovering faceted solid', percent: 96, status: 'running' } });
         if (await tryFaceted('The fitted STEP did not pass geometry verification.', pyodide, directory)) return;
         ({ report } = reconstruct(pendingRecovery));
+      } else if (!job.reason && report.surface?.source_mesh_fallback) {
+        if (await tryFaceted('The full engine returned a faceted solid.', pyodide, directory, true)) return;
       }
       pyodide.FS.writeFile(`${directory}/report.json`, JSON.stringify(report, null, 2));
       const files = {};

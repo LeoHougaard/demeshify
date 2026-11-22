@@ -21,6 +21,12 @@ whether the result meets the strict CAD checks. Geometry verification and strict
 CAD recovery are recorded separately in `geometry.json` and `reference-audit.json`.
 Each run also keeps the app reports, timings, and recorded network requests.
 
+To exercise planar recovery across the five complex Voron parts, set
+`SMOKE_FAIL_PYTHON=1`, `SMOKE_EXPECT_IMPLEMENTATION=hybrid`, and
+`SMOKE_MIN_FACE_REDUCTION=0.35`, then run with `--complex voron`. The
+runner blocks the external Python runtime assets so that the automatic
+fallback runs. It checks the face reduction against the downloaded STEP.
+
 Capture the 25-part preview suite with `--visual` in place of `--complex`. It
 includes the ten complex parts and fifteen additional parts with bores, curved
 profiles, and cutouts. The runner waits for the STEP preview and its edge legend

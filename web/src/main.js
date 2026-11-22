@@ -1558,6 +1558,7 @@ async function renderResult(report, options = {}) {
   const surfaceFallback = Boolean(surfaceMode && report.surface.faceted_fallback);
   const verifiedFallback = Boolean(surfaceFallback && report.surface.fallback_geometry_verified);
   const exactFacets = verifiedFallback && report.implementation === "faceted";
+  const partialRecovery = verifiedFallback && report.implementation === "hybrid";
   const semantic = report.plan?.representation !== "sampled_approximation";
   document.querySelector("#resultTitle").textContent = complete
     ? surfaceMode
@@ -1566,7 +1567,8 @@ async function renderResult(report, options = {}) {
     : report.status === "best_effort"
       ? surfaceMode
         ? surfaceFallback
-          ? verifiedFallback ? "Faceted STEP ready" : "Analytic fit incomplete"
+          ? partialRecovery ? "Partial STEP ready"
+          : verifiedFallback ? "Faceted STEP ready" : "Analytic fit incomplete"
           : report.surface.closed
           ? "Best fitted surface solid produced"
           : "Surface recognition result ready"
@@ -1576,7 +1578,8 @@ async function renderResult(report, options = {}) {
       : "Automatic reconstruction stopped";
   const confidence = document.querySelector("#confidence");
   confidence.className = `confidence ${complete || exactFacets ? "good" : "caution"}`;
-  confidence.textContent = exactFacets ? "Verified faceted solid" : complete
+  confidence.textContent = partialRecovery ? "Verified solid"
+    : exactFacets ? "Verified faceted solid" : complete
     ? surfaceMode
       ? "Watertight verified solid"
       : "High-confidence match"
@@ -1614,17 +1617,18 @@ async function renderResult(report, options = {}) {
   };
   document.querySelector("#construction").textContent =
     surfaceMode
-      ? exactFacets ? `${report.surface.faceted_face_count.toLocaleString()} faces` : `${report.surface.recognized_surface_count} surfaces`
+      ? exactFacets || partialRecovery ? `${report.surface.brep_face_count.toLocaleString()} faces` : `${report.surface.recognized_surface_count} surfaces`
       : featureCount > 1
       ? `${featureCount} features`
       : baseLabels[report.plan?.base?.kind] || "Parametric solid";
   document.querySelector("#constructionUnit").textContent = surfaceMode
-    ? exactFacets ? "Source STL triangles" : surfaceFallback
+    ? partialRecovery ? "Planes merged"
+    : exactFacets ? "Source STL triangles" : surfaceFallback
       ? `${report.surface.brep_face_count} B-rep faces · ${report.surface.faceted_face_count} fallback`
       : `${report.surface.brep_face_count} fitted B-rep faces`
     : "parametric feature construction";
   document.querySelector("#constructionHeading").textContent = surfaceMode
-    ? exactFacets ? "Faceted solid" : "Recognized surface model"
+    ? partialRecovery ? "Partially reconstructed solid" : exactFacets ? "Faceted solid" : "Recognized surface model"
     : "Editable feature plan";
 
   const base = report.plan?.base;
@@ -1724,7 +1728,9 @@ async function renderResult(report, options = {}) {
         "STEP representation",
         report.surface.closed
           ? report.surface.faceted_fallback
-            ? report.surface.source_mesh_fallback
+            ? partialRecovery
+              ? "Closed solid with merged planar faces"
+              : report.surface.source_mesh_fallback
               ? report.surface.simplified_fallback
                 ? "Closed faceted solid from a reduced mesh"
                 : "Closed source-mesh faceted solid"
@@ -1771,6 +1777,8 @@ async function renderResult(report, options = {}) {
     ? surfaceFallback
       ? `Rejected analytic fit · ${report.surface.faceted_face_count} fallback faces`
       : "Not accepted · inspect verification report"
+    : partialRecovery
+      ? "Verified STEP with remaining facets"
     : exactFacets
       ? "Verified solid with the original STL triangles"
     : verifiedFallback
@@ -1885,6 +1893,7 @@ async function renderResult(report, options = {}) {
             ? "STEP edges" : "Fitted surface boundary";
           surfaceLegendStatus.textContent = overlay.triangleCount
             ? `${overlay.triangleCount.toLocaleString()} fallback triangles shown`
+            : partialRecovery ? `${report.surface.faceted_face_count.toLocaleString()} source facets retained`
             : report.surface.faceted_face_count
             ? "Fallback faces present; detailed overlay unavailable"
             : "No triangle fallback used";

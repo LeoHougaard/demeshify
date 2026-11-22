@@ -44,6 +44,8 @@ const requests = [];
 const violations = [];
 const transfers = [];
 const conversions = [];
+const minFaceReduction = Number(process.env.SMOKE_MIN_FACE_REDUCTION || 0);
+assert.ok(minFaceReduction >= 0 && minFaceReduction < 1, 'Expected a minimum face reduction between 0 and 1');
 const assetCache = process.env.SMOKE_ASSET_CACHE;
 const assetTypes = { '.mjs': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json' };
 let offline = false;
@@ -121,6 +123,12 @@ try {
     const reportLink = page.locator('#advancedDownloads a[download="report.json"]');
     const report = await reportLink.evaluate(async link => (await fetch(link.href)).json());
     await writeFile(path.join(dir, name + '.report.json'), JSON.stringify(report, null, 2));
+    if (minFaceReduction) {
+      const { mesh, surface } = report;
+      assert.ok(surface.brep_face_count <= mesh.triangle_count * (1 - minFaceReduction),
+        `${name} kept ${surface.brep_face_count} faces for ${mesh.triangle_count} source triangles`);
+      assert.ok(surface.recognized_surface_count > 0, `${name} has no recovered faces`);
+    }
     if (visual || process.env.SMOKE_SCREENSHOTS) {
       await page.locator('#outputCanvas').waitFor({ state: 'visible' });
       await page.locator('#surfaceLegend').waitFor({ state: 'visible' });
@@ -146,6 +154,14 @@ try {
   console.log(JSON.stringify(metrics));
   if (corpus.length) {
     const failures = JSON.parse(report).filter(result => !result.verified);
+    if (minFaceReduction) {
+      for (const record of JSON.parse(report)) {
+        if (!record.verified) continue;
+        const faces = Object.values(record.faces).reduce((sum, count) => sum + count, 0);
+        assert.ok(faces <= record.triangles * (1 - minFaceReduction),
+          `${record.file} reopened with ${faces} faces for ${record.triangles} triangles`);
+      }
+    }
     if (complex) {
       const audit = execFileSync(python, [path.join(here, 'cad.py'), 'audit-references', dir, ...corpus],
         { encoding: 'utf8' });
