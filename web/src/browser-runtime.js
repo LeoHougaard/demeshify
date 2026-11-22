@@ -9,10 +9,10 @@ const wheels = [
   "05/98/716a473cfb24750858ddd5d14e6527539dd206583a46408d08eeb2844a75/trimesh-4.12.2-py3-none-any.whl",
 ].map(path => "https://files.pythonhosted.org/packages/" + path);
 
-// Defer the pinned CadQuery wheel's optional VTK imports until a visualization
-// function is actually called. Only the worker's in-memory copy is modified.
-const deferVisualizationImports = `
-def _defer_vtk():
+// This worker uses STEP and STL. Defer imports for VTK visualization and
+// constraint solvers in the pinned CadQuery wheel's in-memory copy.
+const deferOptionalImports = `
+def _defer_optional_imports():
     import ast
     from importlib.metadata import distribution
     root = distribution("cadquery").locate_file("cadquery/occ_impl")
@@ -20,16 +20,18 @@ def _defer_vtk():
     source = exporters.read_text().replace("from .vtk import exportVTP\\n", "")
     source = source.replace("        exportVTP(shape,", "        from .vtk import exportVTP\\n        exportVTP(shape,")
     exporters.write_text(source)
-    for name in ("shapes.py", "assembly.py", "exporters/assembly.py"):
+    for name in ("shapes.py", "assembly.py", "exporters/assembly.py", "solver.py", "sketch_solver.py"):
         path = root / name
         source = path.read_text()
         tree = ast.parse(source)
         lines = source.splitlines(keepends=True)
         imports = {}
         for node in tree.body:
-            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+            visualization = isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
                 ("vtkmodules.", "OCP.IVtk", "exporters.vtk", "vtk")
-            ):
+            )
+            solver = isinstance(node, ast.Import) and node.names[0].name in ("casadi", "nlopt")
+            if visualization or solver:
                 statement = ast.unparse(node)
                 for alias in node.names:
                     imports[alias.asname or alias.name] = statement
@@ -43,9 +45,10 @@ def _defer_vtk():
                     first = fn.body[1 if ast.get_docstring(fn) else 0]
                     i = first.lineno - 1
                     lines[i] = "".join(" " * first.col_offset + s + "\\n" for s in required) + lines[i]
-        path.write_text("".join(lines))
-_defer_vtk()
-del _defer_vtk
+        annotations = "from __future__ import annotations\\n" if name == "solver.py" else ""
+        path.write_text(annotations + "".join(lines))
+_defer_optional_imports()
+del _defer_optional_imports
 import cadquery
 `;
 
@@ -58,10 +61,10 @@ async function start(onProgress) {
   onProgress("Loading geometry libraries");
   await py.loadPackage([
     "numpy", "scipy", "shapely", "networkx", "pydantic", "pillow",
-    "nlopt", "casadi", "pyparsing", "typing-extensions", "fonttools", ...wheels,
+    "pyparsing", "typing-extensions", "fonttools", ...wheels,
   ]);
   onProgress("Initializing CadQuery");
-  await py.runPythonAsync(deferVisualizationImports);
+  await py.runPythonAsync(deferOptionalImports);
   return py;
 }
 
