@@ -12,7 +12,7 @@ export function getKernel() {
 }
 
 export async function buildPrism(section, job, started) {
-  const { axis, width, min, max, outer, holes, epsilon } = section;
+  const { axis, width, min, max, outer, holes, epsilon, frame } = section;
   const loops = [outer, ...holes];
   const deviation = Math.max(epsilon * 8, ...loops.flatMap(({ circle, segments }) =>
     circle ? [circle.deviation] : segments.map(segment => segment.deviation ?? 0)));
@@ -30,6 +30,12 @@ export async function buildPrism(section, job, started) {
     return output;
   }
   const vec = ([x, y, z]) => ({ x, y, z });
+  const rotation = frame && { point: vec([0, 0, 0]), direction: vec(frame.axis) };
+
+  function worldPoint(point) {
+    return frame ? frame.origin.map((offset, axis) => offset
+      + frame.basis.reduce((sum, basis, index) => sum + point[index] * basis[axis], 0)) : point;
+  }
 
   function solid({ circle, segments }) {
     if (circle) {
@@ -49,7 +55,8 @@ export async function buildPrism(section, job, started) {
     let candidate = solid(outer);
     for (const hole of holes) candidate = kernel.cut(candidate, solid(hole));
     if (!kernel.isValid(candidate)) return null;
-    const step = kernel.exportStep(candidate);
+    const placed = frame ? kernel.translate(kernel.rotate(candidate, rotation, frame.angle), ...frame.origin) : candidate;
+    const step = kernel.exportStep(placed);
     const reopened = kernel.importStep(step);
     if (!kernel.isValid(reopened) || kernel.subShapeCount(reopened, 'solid') !== 1
         || kernel.subShapeCount(reopened, 'shell') !== 1) return null;
@@ -64,7 +71,9 @@ export async function buildPrism(section, job, started) {
     const expectedCylinders = loops.reduce((count, { circle, segments }) =>
       count + (circle ? 1 : segments.filter(segment => segment.mid).length), 0);
     if (counts.plane !== expectedPlanes || counts.cylinder !== expectedCylinders) return null;
-    const box = kernel.getBoundingBox(reopened, false);
+    const aligned = frame ? kernel.rotate(kernel.translate(reopened, ...frame.origin.map(x => -x)),
+      rotation, -frame.angle) : reopened;
+    const box = kernel.getBoundingBox(aligned, false);
     const boundsError = Math.max(...['x', 'y', 'z'].flatMap((key, index) => [
       Math.abs(box[`${key}min`] - min[index]), Math.abs(box[`${key}max`] - max[index]),
     ]));
@@ -99,8 +108,8 @@ export async function buildPrism(section, job, started) {
         return [circle.center[0] + circle.radius * Math.cos(a), circle.center[1] + circle.radius * Math.sin(a)];
       }) : loop;
       const closed = [...points, points[0]];
-      return [closed.map(point => xyz(point)), closed.map(point => xyz(point, 1)),
-        ...segments.map(({ a }) => [xyz(a), xyz(a, 1)])];
+      return [closed.map(point => worldPoint(xyz(point))), closed.map(point => worldPoint(xyz(point, 1))),
+        ...segments.map(({ a }) => [worldPoint(xyz(a)), worldPoint(xyz(a, 1))])];
     });
     const text = new TextEncoder();
     const files = {

@@ -94,7 +94,7 @@ function profileSegments(loop, epsilon) {
   return null;
 }
 
-function profile(positions, min, max, axis, epsilon) {
+function profile(positions, min, max, axis, epsilon, frame) {
   const u = (axis + 1) % 3, v = (axis + 2) % 3;
   const width = max[axis] - min[axis];
   if (width <= epsilon * 10) return null;
@@ -111,12 +111,25 @@ function profile(positions, min, max, axis, epsilon) {
       const level = along - min[axis] <= epsilon ? 0 : max[axis] - along <= epsilon ? 1 : -1;
       if (level < 0) return null;
       const point = [positions[j + u] - min[u], positions[j + v] - min[v]];
-      const key = point.map(x => Math.round(x / epsilon)).join(':');
-      if (!vertices.has(key)) {
-        vertices.set(key, points.length);
+      const [x, y] = point.map(value => Math.round(value / epsilon));
+      const key = `${x}:${y}`;
+      let id = vertices.get(key);
+      // A rigid projection can put opposite vertices on either side of a grid line.
+      if (frame && id === undefined) {
+        for (const [dx, dy] of [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0], [1, 1]]) {
+          const neighbor = vertices.get(`${x + dx}:${y + dy}`);
+          if (neighbor !== undefined && Math.hypot(...delta(points[neighbor], point)) <= epsilon) {
+            id = neighbor;
+            break;
+          }
+        }
+      }
+      if (id === undefined) {
+        id = points.length;
+        vertices.set(key, id);
         points.push(point);
       }
-      ids.push(vertices.get(key));
+      ids.push(id);
       levels.push(level);
     }
     const welded = ids.map((id, i) => 2 * id + levels[i]);
@@ -173,7 +186,7 @@ function profile(positions, min, max, axis, epsilon) {
   if (!outer || loops.some(item => item !== outer && (item.signed >= 0 || !inside(item.loop[0], outer.loop)))) return null;
   const section = loops.reduce((sum, loop) => sum + loop.signed, 0);
   if (section <= 0 || capAreas.some(a => Math.abs(a - section) > section * 1e-5)) return null;
-  return { axis, width, min, max, epsilon, volume: section * width, outer,
+  return { axis, width, min, max, epsilon, frame, volume: section * width, outer,
     holes: loops.filter(item => item !== outer) };
 }
 
@@ -197,6 +210,56 @@ export function readStl(data, units) {
   return { coordinates: scaled, min, max, factor, diagonal };
 }
 
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross3 = ([ax, ay, az], [bx, by, bz]) => [ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx];
+
+function* capNormals(coordinates) {
+  const faces = [];
+  for (let offset = 0; offset < coordinates.length; offset += 9) {
+    const d = [0, 1, 2].map(i => coordinates[offset + 3 + i] - coordinates[offset + i]);
+    const e = [0, 1, 2].map(i => coordinates[offset + 6 + i] - coordinates[offset + i]);
+    const normal = cross3(d, e);
+    const area = Math.hypot(...normal);
+    if (area) faces.push({ normal, area });
+  }
+  const tried = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  for (const { normal, area } of faces.sort((a, b) => b.area - a.area)) {
+    const unit = normal.map(value => value / (normal[2] < 0 ? -area : area));
+    if (tried.some(previous => Math.abs(dot3(previous, unit)) > 1 - 1e-8)) continue;
+    tried.push(unit);
+    yield unit;
+    if (tried.length === 9) return;
+  }
+}
+
+function rotatedProfile(mesh) {
+  const { coordinates, min: origin, diagonal } = mesh;
+  if (coordinates.length / 9 > 5000) return null;
+  const worldMagnitude = Math.max(...[...mesh.min, ...mesh.max].map(Math.abs));
+  const epsilon = Math.max(1e-7, diagonal * 4e-7 + worldMagnitude * 2 ** -22);
+  if (epsilon > Math.max(0.12, diagonal * 0.003) / 16) return null;
+  const projected = new Float64Array(coordinates.length);
+  for (const normal of capNormals(coordinates)) {
+    const [nx, ny, nz] = normal;
+    const s = 1 / (1 + nz);
+    const basis = [[1 - nx * nx * s, -nx * ny * s, -nx], [-nx * ny * s, 1 - ny * ny * s, -ny], normal];
+    const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < coordinates.length; i += 3) {
+      const p = [coordinates[i] - origin[0], coordinates[i + 1] - origin[1], coordinates[i + 2] - origin[2]];
+      for (let j = 0; j < 3; j++) {
+        const value = dot3(p, basis[j]);
+        min[j] = Math.min(min[j], value);
+        max[j] = Math.max(max[j], value);
+        projected[i + j] = value;
+      }
+    }
+    const frame = { basis, origin, axis: [-ny, nx, 0], angle: Math.atan2(Math.hypot(nx, ny), nz) };
+    const section = profile(projected, min, max, 2, epsilon, frame);
+    if (section) return section;
+  }
+  return null;
+}
+
 export function recognizePrism(data, units) {
   // Keep attempts bounded on inputs likely to need the full reconstruction engine.
   if (data.byteLength > 1024 * 1024) return null;
@@ -208,5 +271,6 @@ export function recognizePrism(data, units) {
     const section = profile(coordinates, min, max, axis, epsilon);
     if (section) return { ...section, factor, diagonal, triangles: coordinates.length / 9 };
   }
-  return null;
+  const section = rotatedProfile(mesh);
+  return section && { ...section, factor, diagonal, triangles: coordinates.length / 9 };
 }
