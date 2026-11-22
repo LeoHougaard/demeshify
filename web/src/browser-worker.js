@@ -1,5 +1,5 @@
 import { bootGeometryRuntime } from './browser-runtime.js';
-import { recognizePrism } from './prism-profile.js';
+import { recognizePrisms } from './prism-profile.js';
 
 const sources = import.meta.glob(['../../app/*.py', '../browser_python/*.py'], {
   eager: true, import: 'default', query: '?raw',
@@ -48,16 +48,16 @@ self.onmessage = async ({ data: job }) => {
         // Recovery can still use the existing reconstruction engine.
       }
       if (job.mode === 'faceted') {
-        throw new Error('Fast faceted mode needs one closed, consistently oriented solid with up to 20,000 triangles. Try Recognized surfaces for this STL.');
+        throw new Error('Fast faceted mode needs closed, consistently oriented, separated bodies with up to 20,000 triangles in total. Try Recognized surfaces for this STL.');
       }
     }
     if (!job.reason) {
       try {
         const started = performance.now();
-        const section = recognizePrism(job.bytes, job.units);
-        if (section) {
+        const prisms = recognizePrisms(job.bytes, job.units);
+        if (prisms) {
           const { buildPrism } = await import('./prism-step.js');
-          const result = await buildPrism(section, job, started);
+          const result = await buildPrism(prisms, job, started);
           if (result) {
             send('complete', result, Object.values(result.files).map(bytes => bytes.buffer));
             return;

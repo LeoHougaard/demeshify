@@ -11,14 +11,16 @@ export function getKernel() {
   return kernelPromise;
 }
 
-export async function buildPrism(section, job, started) {
-  const { axis, width, min, max, outer, holes, epsilon, frame } = section;
-  const loops = [outer, ...holes];
-  const deviation = Math.max(epsilon * 8, ...loops.flatMap(({ circle, segments }) =>
+function deviationBound({ outer, holes, epsilon }) {
+  return Math.max(epsilon * 8, ...[outer, ...holes].flatMap(({ circle, segments }) =>
     circle ? [circle.deviation] : segments.map(segment => segment.deviation ?? 0)));
-  if (deviation > Math.max(0.12, section.diagonal * 0.003) / 2) return null;
-  const kernel = await getKernel();
-  const checkpoint = kernel.checkpoint();
+}
+
+const axes = ['x', 'y', 'z'];
+
+function constructPrism(kernel, section, deviation) {
+  const { axis, width, min, max, outer, holes, frame } = section;
+  const loops = [outer, ...holes];
   const normal = [0, 0, 0];
   normal[axis] = 1;
   const vector = normal.map(x => x * width);
@@ -51,15 +53,13 @@ export async function buildPrism(section, job, started) {
     return kernel.extrude(kernel.makeFace(kernel.makeWire(edges)), ...vector);
   }
 
-  try {
-    let candidate = solid(outer);
-    for (const hole of holes) candidate = kernel.cut(candidate, solid(hole));
-    if (!kernel.isValid(candidate)) return null;
-    const placed = frame ? kernel.translate(kernel.rotate(candidate, rotation, frame.angle), ...frame.origin) : candidate;
-    const step = kernel.exportStep(placed);
-    const reopened = kernel.importStep(step);
-    if (!kernel.isValid(reopened) || kernel.subShapeCount(reopened, 'solid') !== 1
-        || kernel.subShapeCount(reopened, 'shell') !== 1) return null;
+  let candidate = solid(outer);
+  for (const hole of holes) candidate = kernel.cut(candidate, solid(hole));
+  if (!kernel.isValid(candidate)) return null;
+  const placed = frame ? kernel.translate(kernel.rotate(candidate, rotation, frame.angle), ...frame.origin) : candidate;
+
+  function verify(reopened) {
+    if (kernel.subShapeCount(reopened, 'shell') !== 1) return null;
     const counts = { plane: 0, cylinder: 0 };
     for (const face of kernel.getSubShapes(reopened, 'face')) {
       const type = kernel.surfaceType(face);
@@ -74,7 +74,7 @@ export async function buildPrism(section, job, started) {
     const aligned = frame ? kernel.rotate(kernel.translate(reopened, ...frame.origin.map(x => -x)),
       rotation, -frame.angle) : reopened;
     const box = kernel.getBoundingBox(aligned, false);
-    const boundsError = Math.max(...['x', 'y', 'z'].flatMap((key, index) => [
+    const boundsError = Math.max(...axes.flatMap((key, index) => [
       Math.abs(box[`${key}min`] - min[index]), Math.abs(box[`${key}max`] - max[index]),
     ]));
     const fittedVolume = width * loops.reduce((volume, { signed, circle, segments }) =>
@@ -84,15 +84,63 @@ export async function buildPrism(section, job, started) {
     const volumeError = 100 * Math.abs(resultVolume / section.volume - 1);
     if (!Number.isFinite(volumeError) || volumeError > 2 || boundsError > deviation + 1e-6
         || Math.abs(resultVolume / fittedVolume - 1) > 1e-5) return null;
+    return { counts, volumeError };
+  }
 
+  function boundaries() {
+    return loops.flatMap(({ loop, circle, segments }) => {
+      const points = circle ? Array.from({ length: 64 }, (_, i) => {
+        const a = i * Math.PI / 32;
+        return [circle.center[0] + circle.radius * Math.cos(a), circle.center[1] + circle.radius * Math.sin(a)];
+      }) : loop;
+      const closed = [...points, points[0]];
+      return [closed.map(point => worldPoint(xyz(point))), closed.map(point => worldPoint(xyz(point, 1))),
+        ...segments.map(({ a }) => [worldPoint(xyz(a)), worldPoint(xyz(a, 1))])];
+    });
+  }
+
+  return { placed, verify, boundaries, worldMin: section.worldMin, worldMax: section.worldMax };
+}
+
+export async function buildPrism({ sections, factor, triangles }, job, started) {
+  const deviations = sections.map(deviationBound);
+  if (sections.some((section, i) => deviations[i] > Math.max(0.12, section.diagonal * 0.003) / 2)) return null;
+  const kernel = await getKernel();
+  const checkpoint = kernel.checkpoint();
+  try {
+    const bodies = sections.map((section, i) => constructPrism(kernel, section, deviations[i]));
+    if (bodies.some(body => !body)) return null;
+    const model = bodies.length === 1 ? bodies[0].placed : kernel.makeCompound(bodies.map(body => body.placed));
+    const step = kernel.exportStep(model);
+    const reopened = kernel.importStep(step);
+    if (!kernel.isValid(reopened)) return null;
+    const solids = kernel.getSubShapes(reopened, 'solid');
+    if (solids.length !== bodies.length || kernel.subShapeCount(reopened, 'shell') !== bodies.length) return null;
+
+    const pending = new Set(bodies);
+    const counts = { plane: 0, cylinder: 0 };
+    let volumeError = 0;
+    for (const solid of solids) {
+      const center = kernel.getCenterOfMass(solid);
+      const body = [...pending].find(({ worldMin, worldMax }) => axes.every((key, i) =>
+        center[key] >= worldMin[i] && center[key] <= worldMax[i]));
+      const check = body?.verify(solid);
+      if (!check) return null;
+      pending.delete(body);
+      counts.plane += check.counts.plane;
+      counts.cylinder += check.counts.cylinder;
+      volumeError = Math.max(volumeError, check.volumeError);
+    }
+
+    const deviation = Math.max(...deviations);
     const faceCount = counts.plane + counts.cylinder;
     const report = {
       id: job.id, engine: 'surface_brep', implementation: 'prism', status: 'complete',
-      mesh: { file_name: job.filename, unit_scale: section.factor, watertight: true,
-        triangle_count: section.triangles },
+      mesh: { file_name: job.filename, unit_scale: factor, watertight: true,
+        triangle_count: triangles },
       surface: {
         recognized_surface_count: faceCount, surface_counts: counts, brep_face_count: faceCount,
-        solid_count: 1, free_edge_count: 0, closed: true, faceted_fallback: false,
+        solid_count: solids.length, free_edge_count: 0, closed: true, faceted_fallback: false,
         topology_vertex_count: kernel.subShapeCount(reopened, 'vertex'),
         topology_edge_count: kernel.subShapeCount(reopened, 'edge'),
         adjacency_count: kernel.subShapeCount(reopened, 'edge'),
@@ -102,15 +150,7 @@ export async function buildPrism(section, job, started) {
         component_count_match: true, step_geometry_verified: true },
       warnings: [], elapsed_seconds: (performance.now() - started) / 1000,
     };
-    const surfaceBoundaries = loops.flatMap(({ loop, circle, segments }) => {
-      const points = circle ? Array.from({ length: 64 }, (_, i) => {
-        const a = i * Math.PI / 32;
-        return [circle.center[0] + circle.radius * Math.cos(a), circle.center[1] + circle.radius * Math.sin(a)];
-      }) : loop;
-      const closed = [...points, points[0]];
-      return [closed.map(point => worldPoint(xyz(point))), closed.map(point => worldPoint(xyz(point, 1))),
-        ...segments.map(({ a }) => [worldPoint(xyz(a)), worldPoint(xyz(a, 1))])];
-    });
+    const surfaceBoundaries = bodies.flatMap(body => body.boundaries());
     const text = new TextEncoder();
     const files = {
       'reconstruction.step': text.encode(step),

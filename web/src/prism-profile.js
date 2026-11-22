@@ -1,4 +1,5 @@
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { splitSeparatedBodies } from './mesh-bodies.js';
 
 const edgeKey = (a, b) => a < b ? `${a}:${b}` : `${b}:${a}`;
 const cross = (a, b) => a[0] * b[1] - a[1] * b[0];
@@ -260,17 +261,27 @@ function rotatedProfile(mesh) {
   return null;
 }
 
-export function recognizePrism(data, units) {
+function recognizeBody(mesh) {
+  const { coordinates, min, max, diagonal } = mesh;
+  const epsilon = Math.max(diagonal * 2e-7, 1e-7);
+  for (const axis of [0, 1, 2]) {
+    const section = profile(coordinates, min, max, axis, epsilon);
+    if (section) return section;
+  }
+  return rotatedProfile(mesh);
+}
+
+export function recognizePrisms(data, units) {
   // Keep attempts bounded on inputs likely to need the full reconstruction engine.
   if (data.byteLength > 1024 * 1024) return null;
   const mesh = readStl(data, units);
   if (!mesh) return null;
-  const { coordinates, min, max, factor, diagonal } = mesh;
-  const epsilon = Math.max(diagonal * 2e-7, 1e-7);
-  for (const axis of [0, 1, 2]) {
-    const section = profile(coordinates, min, max, axis, epsilon);
-    if (section) return { ...section, factor, diagonal, triangles: coordinates.length / 9 };
-  }
-  const section = rotatedProfile(mesh);
-  return section && { ...section, factor, diagonal, triangles: coordinates.length / 9 };
+  const single = recognizeBody(mesh);
+  const bodies = single ? [mesh] : splitSeparatedBodies(mesh);
+  if (!bodies || (!single && bodies.length === 1)) return null;
+  const sections = bodies.map(body => {
+    const section = single || recognizeBody(body);
+    return section && { ...section, diagonal: body.diagonal, worldMin: body.min, worldMax: body.max };
+  });
+  return sections.every(Boolean) ? { sections, factor: mesh.factor, triangles: mesh.coordinates.length / 9 } : null;
 }
