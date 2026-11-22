@@ -1,9 +1,6 @@
 import { bootGeometryRuntime } from './browser-runtime.js';
 import { recognizePrisms } from './prism-profile.js';
 
-const sources = import.meta.glob(['../../app/*.py', '../browser_python/*.py'], {
-  eager: true, import: 'default', query: '?raw',
-});
 const sourceDir = '/demeshify';
 const publicArtifacts = [
   'reconstruction.step', 'reconstruction.stl', 'surface_graph.json',
@@ -12,7 +9,9 @@ const publicArtifacts = [
 let runtime;
 
 async function initialize(onProgress) {
-  const pyodide = await bootGeometryRuntime({ onProgress });
+  const [pyodide, { sources }] = await Promise.all([
+    bootGeometryRuntime({ onProgress }), import('./browser-python-sources.js'),
+  ]);
   pyodide.FS.mkdirTree(`${sourceDir}/app`);
   for (const [path, code] of Object.entries(sources)) {
     const name = path.split('/').at(-1);
@@ -32,34 +31,42 @@ self.onmessage = async ({ data: job }) => {
   const send = (type, payload = {}, transfer = []) => {
     self.postMessage({ type, id: job.id, ...payload }, transfer);
   };
+  const started = performance.now();
+  const complete = result => send('complete', result, Object.values(result.files).map(bytes => bytes.buffer));
+
+  async function tryFaceted(reason, pyodide, directory) {
+    try {
+      const { buildFaceted } = await import('./faceted-step.js');
+      const result = await buildFaceted(job, started, reason);
+      if (!result) return false;
+      const diagnostic = `${directory}/analytic_diagnostic.step`;
+      if (pyodide?.FS.analyzePath(diagnostic).exists) {
+        result.files['analytic_diagnostic.step'] = pyodide.FS.readFile(diagnostic);
+      }
+      complete(result);
+      return true;
+    } catch (error) {
+      if (job.mode === 'faceted') throw error;
+      return false;
+    }
+  }
+
   let phase = 'startup';
   try {
     if (job.mode === 'faceted' || job.reason) {
-      try {
-        const started = performance.now();
-        const { buildFaceted } = await import('./faceted-step.js');
-        const result = await buildFaceted(job, started);
-        if (result) {
-          send('complete', result, Object.values(result.files).map(bytes => bytes.buffer));
-          return;
-        }
-      } catch (error) {
-        if (job.mode === 'faceted') throw error;
-        // Recovery can still use the existing reconstruction engine.
-      }
+      if (await tryFaceted(job.reason)) return;
       if (job.mode === 'faceted') {
         throw new Error('Fast faceted mode needs closed, consistently oriented, separated bodies with up to 20,000 triangles in total. Try Recognized surfaces for this STL.');
       }
     }
     if (!job.reason) {
       try {
-        const started = performance.now();
         const prisms = recognizePrisms(job.bytes, job.units);
         if (prisms) {
           const { buildPrism } = await import('./prism-step.js');
           const result = await buildPrism(prisms, job, started);
           if (result) {
-            send('complete', result, Object.values(result.files).map(bytes => bytes.buffer));
+            complete(result);
             return;
           }
         }
@@ -67,10 +74,17 @@ self.onmessage = async ({ data: job }) => {
         // Unrecognized or rejected inputs use the full reconstruction engine.
       }
     }
-    runtime ??= initialize((stage) => send('progress', {
-      progress: { stage, detail: 'Preparing the browser conversion engine', percent: 3, status: 'queued' },
-    }));
-    const pyodide = await runtime;
+    let pyodide;
+    try {
+      runtime ??= initialize((stage) => send('progress', {
+        progress: { stage, detail: 'Preparing the browser conversion engine', percent: 3, status: 'queued' },
+      }));
+      pyodide = await runtime;
+    } catch (error) {
+      runtime = undefined;
+      if (!job.reason && await tryFaceted('The full reconstruction engine could not load.')) return;
+      throw error;
+    }
     const directory = `/tmp/demeshify-${job.id}`;
     const path = `${directory}/input.stl`;
     pyodide.FS.mkdir(directory);
@@ -80,8 +94,14 @@ self.onmessage = async ({ data: job }) => {
       convert = pyodide.globals.get('demeshify_convert');
       phase = 'conversion';
       send('ready');
-      const report = JSON.parse(convert(path, job.filename, job.units, job.id,
-        (progress) => send('progress', { progress: JSON.parse(progress) }), job.reason));
+      const reconstruct = reason => JSON.parse(convert(path, job.filename, job.units, job.id,
+        (progress) => send('progress', { progress: JSON.parse(progress) }), reason));
+      let { report, pending_recovery: pendingRecovery } = reconstruct(job.reason);
+      if (pendingRecovery) {
+        send('progress', { progress: { stage: 'Recovering faceted solid', percent: 96, status: 'running' } });
+        if (await tryFaceted('The fitted STEP did not pass geometry verification.', pyodide, directory)) return;
+        ({ report } = reconstruct(pendingRecovery));
+      }
       pyodide.FS.writeFile(`${directory}/report.json`, JSON.stringify(report, null, 2));
       const files = {};
       for (const name of publicArtifacts) {
@@ -90,7 +110,7 @@ self.onmessage = async ({ data: job }) => {
           files[name] = pyodide.FS.readFile(artifact);
         }
       }
-      send('complete', { report, files }, Object.values(files).map((bytes) => bytes.buffer));
+      complete({ report, files });
     } finally {
       convert?.destroy();
       pyodide.runPython(`import shutil; shutil.rmtree("${directory}", ignore_errors=True)`);

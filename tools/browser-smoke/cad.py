@@ -38,6 +38,8 @@ def verify_corpus(directory, sources, units):
                 "file": source.name,
                 "verified": passes_geometry_gate(score, acceptance_threshold(mesh.diagonal)),
                 "triangles": mesh.report.triangle_count,
+                "solids": len(model.Solids()),
+                "shells": len(model.Shells()),
                 "faces": dict(sorted(Counter(
                     face.geomType() for face in model.Faces()
                 ).items())),
@@ -56,6 +58,36 @@ def generate(directory):
             profile = profile.circle(bore)
         source = profile.extrude(height)
         source.val().exportStl(str(directory / f"{name}.stl"), 0.03, 0.12)
+
+
+def generate_extended(directory):
+    import trimesh
+    from trimesh.transformations import rotation_matrix
+
+    directory.mkdir(parents=True, exist_ok=True)
+    generate(directory)
+    tilt = rotation_matrix(0.67, [1, 2, 3])
+    tilt[:3, 3] = [17, -13, 31]
+    spacer = trimesh.load_mesh(directory / "spacer.stl")
+    spacer.apply_transform(tilt)
+    spacer.export(directory / "tilted-spacer.stl")
+
+    plate = trimesh.creation.box([20, 12, 3])
+    separate = plate.copy()
+    separate.apply_transform(tilt)
+    separate.apply_translation([30, 0, 0])
+    trimesh.util.concatenate([plate, separate]).export(directory / "two-separated-plates.stl")
+
+    sphere = trimesh.creation.icosphere(subdivisions=2, radius=5)
+    sphere.apply_translation([0, 80, 0])
+    trimesh.util.concatenate([plate, sphere]).export(directory / "plate-and-sphere.stl")
+
+    outer = trimesh.creation.box([20, 20, 20])
+    cavity = trimesh.creation.box([6, 5, 4])
+    cavity.invert()
+    trimesh.util.concatenate([outer, cavity]).export(directory / "box-with-cavity.stl")
+    plate.update_faces(list(range(1, len(plate.faces))))
+    plate.export(directory / "open-plate.stl")
 
 
 def verify(name, path):
@@ -87,13 +119,17 @@ def verify(name, path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("generate", "verify", "verify-corpus"))
+    parser.add_argument(
+        "action", choices=("generate", "generate-extended", "verify", "verify-corpus"),
+    )
     parser.add_argument("directory", type=Path)
     parser.add_argument("sources", nargs="*", type=Path)
     parser.add_argument("--units", default="mm", choices=("mm", "m", "cm", "in"))
     args = parser.parse_intermixed_args()
     if args.action == "generate":
         generate(args.directory)
+    elif args.action == "generate-extended":
+        generate_extended(args.directory)
     elif args.action == "verify":
         print(json.dumps([verify(n, args.directory / f"{n}.step") for n in CASES], indent=2))
     else:

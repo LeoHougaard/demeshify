@@ -223,13 +223,22 @@ function* capNormals(coordinates) {
     const area = Math.hypot(...normal);
     if (area) faces.push({ normal, area });
   }
-  const tried = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  const tried = [];
   for (const { normal, area } of faces.sort((a, b) => b.area - a.area)) {
     const unit = normal.map(value => value / (normal[2] < 0 ? -area : area));
-    if (tried.some(previous => Math.abs(dot3(previous, unit)) > 1 - 1e-8)) continue;
+    if (!Math.hypot(unit[0], unit[1]) || tried.some(previous => Math.abs(dot3(previous, unit)) > 1 - 1e-8)) continue;
     tried.push(unit);
-    yield unit;
-    if (tried.length === 9) return;
+    // Averaging the cap triangles removes most of the STL coordinate roundoff.
+    const combined = [0, 0, 0];
+    for (const face of faces) {
+      const alignment = dot3(unit, face.normal);
+      if (Math.abs(alignment) > face.area * (1 - 1e-8)) {
+        for (let i = 0; i < 3; i++) combined[i] += face.normal[i] * Math.sign(alignment);
+      }
+    }
+    const length = Math.hypot(...combined);
+    if (length && Math.hypot(combined[0], combined[1])) yield combined.map(value => value / length);
+    if (tried.length === 6) return;
   }
 }
 

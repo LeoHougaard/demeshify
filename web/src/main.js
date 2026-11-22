@@ -1211,7 +1211,7 @@ async function chooseFile(file) {
     return;
   }
   if (file.size > MAX_UPLOAD_BYTES) {
-    showError("This STL is larger than the 250 MB upload limit.");
+    showError("Choose an STL under 250 MiB.");
     fileInput.value = "";
     return;
   }
@@ -1553,6 +1553,7 @@ async function renderResult(report, options = {}) {
   const surfaceMode = report.engine === "surface_brep" && report.surface;
   const surfaceFallback = Boolean(surfaceMode && report.surface.faceted_fallback);
   const verifiedFallback = Boolean(surfaceFallback && report.surface.fallback_geometry_verified);
+  const exactFacets = verifiedFallback && report.implementation === "faceted";
   const semantic = report.plan?.representation !== "sampled_approximation";
   document.querySelector("#resultTitle").textContent = complete
     ? surfaceMode
@@ -1570,8 +1571,8 @@ async function renderResult(report, options = {}) {
         : "Geometric approximation produced"
       : "Automatic reconstruction stopped";
   const confidence = document.querySelector("#confidence");
-  confidence.className = `confidence ${complete ? "good" : "caution"}`;
-  confidence.textContent = complete
+  confidence.className = `confidence ${complete || exactFacets ? "good" : "caution"}`;
+  confidence.textContent = exactFacets ? "Verified faceted solid" : complete
     ? surfaceMode
       ? "Watertight verified solid"
       : "High-confidence match"
@@ -1609,17 +1610,17 @@ async function renderResult(report, options = {}) {
   };
   document.querySelector("#construction").textContent =
     surfaceMode
-      ? `${report.surface.recognized_surface_count} surfaces`
+      ? exactFacets ? `${report.surface.faceted_face_count.toLocaleString()} faces` : `${report.surface.recognized_surface_count} surfaces`
       : featureCount > 1
       ? `${featureCount} features`
       : baseLabels[report.plan?.base?.kind] || "Parametric solid";
   document.querySelector("#constructionUnit").textContent = surfaceMode
-    ? surfaceFallback
+    ? exactFacets ? "Source STL triangles" : surfaceFallback
       ? `${report.surface.brep_face_count} B-rep faces · ${report.surface.faceted_face_count} fallback`
       : `${report.surface.brep_face_count} fitted B-rep faces`
     : "parametric feature construction";
   document.querySelector("#constructionHeading").textContent = surfaceMode
-    ? "Recognized surface model"
+    ? exactFacets ? "Faceted solid" : "Recognized surface model"
     : "Editable feature plan";
 
   const base = report.plan?.base;
@@ -1739,7 +1740,7 @@ async function renderResult(report, options = {}) {
       ["Canonical vertices", String(report.surface.topology_vertex_count || 0)],
       ["Canonical edges", String(report.surface.topology_edge_count || 0)],
       ["Adjacent surface pairs", String(report.surface.adjacency_count)],
-      ["Sewn solids", String(report.surface.solid_count)],
+      ["Solid bodies", String(report.surface.solid_count)],
       ["Free edges", String(report.surface.free_edge_count)],
     );
     plan.innerHTML = details
@@ -1766,6 +1767,8 @@ async function renderResult(report, options = {}) {
     ? surfaceFallback
       ? `Rejected analytic fit · ${report.surface.faceted_face_count} fallback faces`
       : "Not accepted · inspect verification report"
+    : exactFacets
+      ? "Verified solid with the original STL triangles"
     : verifiedFallback
       ? "Geometry verified; CAD surface recovery incomplete"
     : surfaceMode && report.surface.closed

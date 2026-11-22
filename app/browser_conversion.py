@@ -30,18 +30,15 @@ def convert(
         progress["preview_path"] = None
         send_progress(json.dumps(public_progress(progress)))
 
+    pending_recovery = ""
     if recovery_reason:
         report = _reconstruct_faceted_only(run_id, path, filename, units, recovery_reason, update)
     else:
         report = reconstruct_surfaces(run_id, path, filename, units, update, isolate=False)
         if report.mesh.watertight and not _report_has_valid_solid(report):
             _preserve_analytic_diagnostic(path.parent)
-            report = _reconstruct_faceted_only(
-                run_id,
-                path,
-                filename,
-                units,
-                "the analytic STEP did not pass the solid and geometry checks",
-                update,
-            )
-    return report.model_dump_json(indent=2)
+            pending_recovery = "the analytic STEP did not pass the solid and geometry checks"
+    return json.dumps({
+        "report": json.loads(report.model_dump_json()),
+        "pending_recovery": pending_recovery,
+    })

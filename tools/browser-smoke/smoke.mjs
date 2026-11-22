@@ -54,6 +54,7 @@ try {
       return route.abort('blockedbyclient');
     }
     if (offline) return route.abort('internetdisconnected');
+    if (process.env.SMOKE_FAIL_PYTHON && url.origin !== target.origin) return route.abort('failed');
     if (assetCache && url.origin !== target.origin) {
       const file = path.posix.basename(url.pathname);
       const body = await readFile(path.join(assetCache, file));

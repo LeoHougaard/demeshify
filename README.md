@@ -29,12 +29,13 @@ cd web
 npm exec -- vite preview --mode browser
 ```
 
-The static build is in `web/dist-browser`. The default mode uses a quick CAD
-path for straight extrusions with lines and circular arcs and runs the
-full reconstruction for other shapes. **Advanced → Fast faceted solid** keeps
-the original STL triangles as STEP faces. It accepts one closed, consistently
-oriented body with up to 20,000 triangles and checks the solid by reopening
-the exported STEP. Large meshes can exceed the browser's available memory.
+The static build is in `web/dist-browser`. The default mode quickly reconstructs
+straight extrusions at any orientation, including files containing separate
+extruded bodies. Other shapes use the full surface reconstruction engine.
+**Advanced ? Fast faceted solid** preserves the STL triangles as STEP faces. It
+supports up to 32 separated, closed shells and 20,000 total triangles. Both
+paths reopen each STEP to verify the export. Large meshes can exceed the
+browser's available memory.
 
 ## Run the native engine
 

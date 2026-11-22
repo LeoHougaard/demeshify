@@ -103,7 +103,7 @@ function previewStl(mesh) {
   return bytes;
 }
 
-export async function buildFaceted(job, started) {
+export async function buildFaceted(job, started, reason) {
   if (job.bytes.byteLength > 4 * 1024 * 1024) return null;
   const mesh = readStl(job.bytes, job.units);
   if (!mesh || mesh.coordinates.length / 9 > 20000) return null;
@@ -137,7 +137,7 @@ export async function buildFaceted(job, started) {
       score: { volume_error_percent: volumeError,
         volume_comparable: true, valid_brep: true, valid_solid: true, component_count_match: true,
         step_geometry_verified: true },
-      warnings: ['The STEP preserves the STL triangles as CAD faces.'],
+      warnings: [...(reason ? [reason] : []), 'The STEP preserves the STL triangles as CAD faces.'],
       elapsed_seconds: (performance.now() - started) / 1000,
     };
     const text = new TextEncoder();
