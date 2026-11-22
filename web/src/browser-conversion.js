@@ -11,7 +11,7 @@ function discardWorker() {
   worker = undefined;
 }
 
-function run(file, units, { onProgress, signal }, reason = '') {
+function run(file, units, { mode, onProgress, signal }, reason = '') {
   return new Promise((resolve, reject) => {
     const id = Array.from(crypto.getRandomValues(new Uint8Array(16)),
       (value) => value.toString(16).padStart(2, '0')).join('');
@@ -88,7 +88,7 @@ function run(file, units, { onProgress, signal }, reason = '') {
     };
     timeout(STARTUP_TIMEOUT, 'The browser conversion engine took too long to load.');
     file.arrayBuffer().then((bytes) => {
-      if (!finished) worker.postMessage({ id, bytes, filename: file.name, units, reason }, [bytes]);
+      if (!finished) worker.postMessage({ id, bytes, filename: file.name, units, mode, reason }, [bytes]);
     }).catch((error) => finish(error));
   });
 }

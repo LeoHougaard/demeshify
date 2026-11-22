@@ -1,4 +1,5 @@
 import { bootGeometryRuntime } from './browser-runtime.js';
+import { recognizePrism } from './prism-profile.js';
 
 const sources = import.meta.glob(['../../app/*.py', '../browser_python/*.py'], {
   eager: true, import: 'default', query: '?raw',
@@ -33,6 +34,39 @@ self.onmessage = async ({ data: job }) => {
   };
   let phase = 'startup';
   try {
+    if (job.mode === 'faceted' || job.reason) {
+      try {
+        const started = performance.now();
+        const { buildFaceted } = await import('./faceted-step.js');
+        const result = await buildFaceted(job, started);
+        if (result) {
+          send('complete', result, Object.values(result.files).map(bytes => bytes.buffer));
+          return;
+        }
+      } catch (error) {
+        if (job.mode === 'faceted') throw error;
+        // Recovery can still use the existing reconstruction engine.
+      }
+      if (job.mode === 'faceted') {
+        throw new Error('Fast faceted mode needs one closed, consistently oriented solid with up to 20,000 triangles. Try Recognized surfaces for this STL.');
+      }
+    }
+    if (!job.reason) {
+      try {
+        const started = performance.now();
+        const section = recognizePrism(job.bytes, job.units);
+        if (section) {
+          const { buildPrism } = await import('./prism-step.js');
+          const result = await buildPrism(section, job, started);
+          if (result) {
+            send('complete', result, Object.values(result.files).map(bytes => bytes.buffer));
+            return;
+          }
+        }
+      } catch {
+        // Unrecognized or rejected inputs use the full reconstruction engine.
+      }
+    }
     runtime ??= initialize((stage) => send('progress', {
       progress: { stage, detail: 'Preparing the browser conversion engine', percent: 3, status: 'queued' },
     }));

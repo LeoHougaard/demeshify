@@ -95,7 +95,7 @@ app.innerHTML = `
           <div id="confidence" class="confidence"></div>
         </div>
         <div class="quick-metrics">
-          <article><span>Deviation P95</span><strong id="p95">—</strong><small>mm</small></article>
+          <article><span id="deviationLabel">Deviation P95</span><strong id="p95">—</strong><small>mm</small></article>
           <article><span>Construction</span><strong id="construction">—</strong><small id="constructionUnit">CAD model</small></article>
           <article><span>Time</span><strong id="elapsed">—</strong><small>seconds</small></article>
         </div>
@@ -141,7 +141,7 @@ app.innerHTML = `
       <section class="advanced-section">
         <h2>Conversion settings</h2>
         <div class="advanced-settings-grid">
-          <label class="field"><span>Reconstruction method</span><select id="engine"><option value="surface_brep">Recognized surfaces (recommended)</option><option value="feature_tree">Parametric feature history</option></select><small id="engineHelp">Fits analytic and B-spline surfaces, then joins their boundaries.</small></label>
+          <label class="field"><span>Reconstruction method</span><select id="engine"><option value="surface_brep">Recognized surfaces (recommended)</option>${browserLocal ? '<option value="faceted">Fast faceted solid</option>' : '<option value="feature_tree">Parametric feature history</option>'}</select><small id="engineHelp">Fits analytic and B-spline surfaces, then joins their boundaries.</small></label>
         </div>
       </section>
 
@@ -162,9 +162,11 @@ app.innerHTML = `
 `;
 
 function updateEngineCopy() {
-  const surfaceMode = document.querySelector("#engine").value === "surface_brep";
+  const method = document.querySelector("#engine").value;
+  const surfaceMode = method === "surface_brep";
   document.querySelector("#engineHelp").textContent = surfaceMode
     ? "Surface mode reconstructs the final boundary directly from mesh geometry."
+    : method === "faceted" ? "Preserves the STL triangles as CAD faces."
     : "Feature-history mode builds an editable plan from measured mesh geometry.";
   document.querySelector("#reconstructButton span").textContent = "Convert to STEP";
 }
@@ -173,7 +175,6 @@ document.querySelector("#engine").addEventListener("change", updateEngineCopy);
 updateEngineCopy();
 
 if (browserLocal) {
-  document.querySelector("#engine").closest("section").classList.add("hidden");
   document.querySelector("#engineStatus").innerHTML = "<span></span> Browser converter";
   document.querySelector("#cancelConversion").addEventListener("click", () => localController?.abort());
 } else {
@@ -1493,6 +1494,7 @@ button.addEventListener("click", async () => {
       const { convertInBrowser } = await import("./browser-conversion.js");
       if (signal.aborted) return;
       const { report, files } = await convertInBrowser(selectedFile, document.querySelector("#units").value, {
+        mode: document.querySelector("#engine").value,
         onProgress: renderReconstructionProgress,
         signal,
       });
@@ -1583,7 +1585,9 @@ async function renderResult(report, options = {}) {
         ? "Best effort"
         : "Approximation only";
 
-  document.querySelector("#p95").textContent = formatMeasurement(report.score?.chamfer_p95_mm);
+  const bound = report.score?.deviation_bound_mm;
+  document.querySelector("#deviationLabel").textContent = bound === undefined ? "Deviation P95" : "Deviation bound";
+  document.querySelector("#p95").textContent = formatMeasurement(bound ?? report.score?.chamfer_p95_mm);
   const measuredMaxima = [report.score?.chamfer_max_mm, report.score?.local_max_mm]
     .filter(isNonnegativeMeasurement);
   document.querySelector("#maxDeviation").textContent = formatMeasurement(

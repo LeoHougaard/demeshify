@@ -6,6 +6,8 @@ import { chromium, devices, firefox, webkit } from 'playwright';
 
 const here = import.meta.dirname;
 const target = new URL(process.argv[2]);
+const corpus = process.argv.slice(3).map(file => path.resolve(file));
+const units = process.env.SMOKE_UNITS || 'mm';
 const python = process.env.SMOKE_PYTHON || path.resolve(here, '../../.venv',
   process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
 const root = path.join(here, 'artifacts');
@@ -14,7 +16,7 @@ const dir = await mkdtemp(path.join(root, 'run-'));
 console.log(dir);
 const cad = action => execFileSync(python, [path.join(here, 'cad.py'), action, dir],
   { encoding: 'utf8' });
-cad('generate');
+if (!corpus.length) cad('generate');
 const engine = process.env.SMOKE_BROWSER || 'chromium';
 const browser = await { chromium, firefox, webkit }[engine].launch({
   executablePath: process.env.SMOKE_BROWSER_EXE,
@@ -70,33 +72,54 @@ try {
   page.on('requestfailed', req => console.error(req.url(), req.failure()));
   await page.goto(target.href);
   assert.match(await page.locator('#engineStatus').innerText(), /browser/i);
-  for (const name of ['spacer', 'pin']) {
-    if (name === 'pin') {
+  if (process.env.SMOKE_MODE) {
+    await page.locator('#advancedToggle').click();
+    await page.locator('#engine').selectOption(process.env.SMOKE_MODE);
+    await page.locator('#advancedClose').click();
+  }
+  const inputs = corpus.length ? corpus : ['spacer', 'pin'].map(name => path.join(dir, `${name}.stl`));
+  for (const file of inputs) {
+    const name = path.basename(file, '.stl');
+    const outputName = name.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^[._]+|[._]+$/g, '') || 'model';
+    if (!corpus.length && name === 'pin') {
       await context.setOffline(true);
       offline = true;
     }
-    await page.locator('#fileInput').setInputFiles(path.join(dir, name + '.stl'));
-    await page.locator('#units').selectOption('mm');
+    await page.locator('#fileInput').setInputFiles(file);
+    await page.locator('#units').selectOption(units);
     const start = performance.now();
     await page.locator('#reconstructButton').click();
-    const link = page.locator('#downloads a[download="' + name + '_reconstructed.step"]');
+    const link = page.locator('#downloads a[download="' + outputName + '_reconstructed.step"]');
     const error = page.locator('#errorBox');
     await link.or(page.locator('#errorBox:visible')).first().waitFor({timeout: 360000});
-    if (await error.isVisible()) throw new Error(await error.innerText());
-    conversions.push({ model: name, milliseconds: Math.round(performance.now() - start) });
+    if (await error.isVisible()) {
+      if (!corpus.length) throw new Error(await error.innerText());
+      conversions.push({ model: name, error: await error.innerText() });
+      console.log('Failed', JSON.stringify(conversions.at(-1)));
+      continue;
+    }
+    const milliseconds = Math.round(performance.now() - start);
+    const reportLink = page.locator('#advancedDownloads a[download="report.json"]');
+    const report = await reportLink.evaluate(async link => (await fetch(link.href)).json());
+    conversions.push({ model: name, milliseconds, implementation: report.implementation || 'reconstruction' });
     const [download] = await Promise.all([page.waitForEvent('download'), link.click()]);
     await download.saveAs(path.join(dir, name + '.step'));
     console.log('Downloaded', name);
   }
   assert.ok(requests.some(r => !r.offline), 'Expected online HTTP traffic');
   assert.deepEqual(violations, []);
-  const report = cad('verify');
+  const report = corpus.length ? execFileSync(python,
+    [path.join(here, 'cad.py'), 'verify-corpus', dir, '--units', units, ...corpus], { encoding: 'utf8' }) : cad('verify');
   await writeFile(path.join(dir, 'geometry.json'), report);
   console.log(report);
   const assets = await Promise.all(transfers);
   const metrics = { conversions, httpsAssetBytes: assets.reduce((sum, bytes) => sum + bytes, 0) };
   await writeFile(path.join(dir, 'metrics.json'), JSON.stringify(metrics, null, 2));
   console.log(JSON.stringify(metrics));
+  if (corpus.length) {
+    const failures = JSON.parse(report).filter(result => !result.verified);
+    assert.deepEqual(failures, [], 'Some downloaded STEP files failed independent verification');
+  }
 } finally {
   await browser.close();
   await writeFile(path.join(dir, 'network.json'), JSON.stringify({requests, violations}, null, 2));

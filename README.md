@@ -29,9 +29,12 @@ cd web
 npm exec -- vite preview --mode browser
 ```
 
-The static build is in `web/dist-browser`. Large meshes can exceed the browser's
-available memory. The browser build applies the same verification gates, with
-fewer mesh-simplification options for faceted recovery.
+The static build is in `web/dist-browser`. The default mode uses a quick CAD
+path for straight extrusions with polygonal or circular profiles and runs the
+full reconstruction for other shapes. **Advanced → Fast faceted solid** keeps
+the original STL triangles as STEP faces. It accepts one closed, consistently
+oriented body with up to 20,000 triangles and checks the solid by reopening
+the exported STEP. Large meshes can exceed the browser's available memory.
 
 ## Run the native engine
 

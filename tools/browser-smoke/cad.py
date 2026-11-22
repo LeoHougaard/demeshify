@@ -4,6 +4,8 @@ import argparse
 import hashlib
 import json
 import math
+import sys
+from collections import Counter
 from pathlib import Path
 
 import cadquery as cq
@@ -11,6 +13,40 @@ from OCP.BRepAdaptor import BRepAdaptor_Surface
 
 # (outer radius, bore radius, height), all in mm
 CASES = {"spacer": (12, 4, 6), "pin": (7, 0, 15)}
+
+
+def verify_corpus(directory, sources, units):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from app.mesh import load_mesh
+    from app.scoring import score_exported_shape
+    from app.verification import acceptance_threshold, passes_geometry_gate
+
+    results = []
+    for source in sources:
+        target = directory / f"{source.stem}.step"
+        if not target.is_file():
+            results.append({"file": source.name, "verified": False, "error": "No STEP downloaded"})
+            continue
+        job = directory / source.stem
+        job.mkdir(exist_ok=True)
+        (job / "reconstruction.step").write_bytes(target.read_bytes())
+        try:
+            mesh = load_mesh(source, source.name, units)
+            score = score_exported_shape(mesh, job)
+            model = cq.importers.importStep(str(target)).val()
+            results.append({
+                "file": source.name,
+                "verified": passes_geometry_gate(score, acceptance_threshold(mesh.diagonal)),
+                "triangles": mesh.report.triangle_count,
+                "faces": dict(sorted(Counter(
+                    face.geomType() for face in model.Faces()
+                ).items())),
+                "max_deviation_mm": score.local_max_mm,
+                "volume_error_percent": score.volume_error_percent,
+            })
+        except Exception as error:
+            results.append({"file": source.name, "verified": False, "error": str(error)})
+    return results
 
 
 def generate(directory):
@@ -51,10 +87,14 @@ def verify(name, path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("generate", "verify"))
+    parser.add_argument("action", choices=("generate", "verify", "verify-corpus"))
     parser.add_argument("directory", type=Path)
-    args = parser.parse_args()
+    parser.add_argument("sources", nargs="*", type=Path)
+    parser.add_argument("--units", default="mm", choices=("mm", "m", "cm", "in"))
+    args = parser.parse_intermixed_args()
     if args.action == "generate":
         generate(args.directory)
-    else:
+    elif args.action == "verify":
         print(json.dumps([verify(n, args.directory / f"{n}.step") for n in CASES], indent=2))
+    else:
+        print(json.dumps(verify_corpus(args.directory, args.sources, args.units), indent=2))

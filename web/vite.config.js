@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { defineConfig } from "vite";
 
 export default defineConfig(({ mode }) => ({
+  worker: { format: 'es' },
   define: {
     'import.meta.env.VITE_BROWSER_LOCAL': JSON.stringify(String(mode === 'browser')),
   },
