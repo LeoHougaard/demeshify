@@ -73,6 +73,20 @@ self.onmessage = async ({ data: job }) => {
       } catch {
         // Unrecognized or rejected inputs use the full reconstruction engine.
       }
+      try {
+        const { recognizeLayered } = await import('./layered-profile.js');
+        const proposal = recognizeLayered(job.bytes, job.units);
+        if (proposal) {
+          const { buildLayered } = await import('./layered-step.js');
+          const result = await buildLayered(proposal, job, started);
+          if (result) {
+            complete(result);
+            return;
+          }
+        }
+      } catch {
+        // Continue to full reconstruction if the layered candidate is rejected.
+      }
     }
     let pyodide;
     try {
@@ -111,6 +125,10 @@ self.onmessage = async ({ data: job }) => {
         }
       }
       complete({ report, files });
+    } catch (error) {
+      if (!job.reason && error.type === 'ValueError' && String(error.message).includes('Preview tessellation')
+          && await tryFaceted('The fitted model could not produce a valid preview.')) return;
+      throw error;
     } finally {
       convert?.destroy();
       pyodide.runPython(`import shutil; shutil.rmtree("${directory}", ignore_errors=True)`);

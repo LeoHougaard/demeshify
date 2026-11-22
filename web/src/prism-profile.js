@@ -29,7 +29,7 @@ function arcAngle(a, b, center) {
   return Math.atan2(cross(x, y), x[0] * y[0] + x[1] * y[1]);
 }
 
-function circle(loop, epsilon) {
+export function circle(loop, epsilon) {
   if (loop.length < 12) return null;
   const fit = circumcircle(loop[0], loop[Math.floor(loop.length / 3)],
     loop[Math.floor(2 * loop.length / 3)], epsilon);
@@ -67,7 +67,7 @@ function fitArc(points, start, end, epsilon) {
   return { a, b, mid, addedArea, deviation: radius * (1 - Math.cos(maxAngle / 2)) + epsilon * 8 };
 }
 
-function profileSegments(loop, epsilon) {
+export function profileSegments(loop, epsilon, maxSegments = 8) {
   if (loop.length > 256) return null;
   let corner = 0, strongestTurn = 0;
   for (let i = 0; i < loop.length; i++) {
@@ -80,7 +80,7 @@ function profileSegments(loop, epsilon) {
   }
   const points = [...loop.slice(corner), ...loop.slice(0, corner), loop[corner]];
   const segments = [];
-  for (let start = 0; start < loop.length && segments.length < 8;) {
+  for (let start = 0; start < loop.length && segments.length < maxSegments;) {
     let arc;
     let end = loop.length;
     for (; end >= start + 6; end--) {
