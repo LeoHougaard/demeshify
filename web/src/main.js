@@ -10,6 +10,21 @@ import "./styles.css";
 CameraControls.install({ THREE });
 
 const app = document.querySelector("#app");
+const browserLocal = import.meta.env.VITE_BROWSER_LOCAL === "true";
+let localController = null;
+const localUrls = new Map();
+
+function clearLocalArtifacts() {
+  for (const url of localUrls.values()) URL.revokeObjectURL(url);
+  localUrls.clear();
+  document.querySelector("#results").classList.add("hidden");
+  for (const id of ["advancedDownloads", "downloads", "featurePlan", "warnings"]) {
+    document.getElementById(id).replaceChildren();
+  }
+  document.querySelector("#volumeError").textContent = "—";
+  document.querySelector("#baseWarnings").classList.add("hidden");
+}
+
 let selectedFile = null;
 let selectedDimensions = null;
 let inputViewer;
@@ -42,7 +57,7 @@ const escapeHtml = (value) =>
 // focused on import, convert, inspect, and export.
 app.innerHTML = `
   <header class="topbar">
-    <a class="brand" href="/" aria-label="STL to STEP Converter home">
+    <a class="brand" href="${import.meta.env.BASE_URL}" aria-label="STL to STEP Converter home">
       <span class="brand-file">STL</span>
       <span>STL to STEP <b>Converter</b></span>
     </a>
@@ -57,7 +72,7 @@ app.innerHTML = `
       <section class="import-panel">
         <div class="section-heading"><span>1</span><div><strong>Import STL</strong><small>Choose the mesh to convert</small></div></div>
         <label id="dropzone" class="dropzone compact-dropzone" role="button" tabindex="0">
-          <input id="fileInput" type="file" accept=".stl,model/stl" aria-label="Choose an STL file" />
+          <input id="fileInput" type="file" accept=".stl,model/stl,application/sla,application/vnd.ms-pki.stl,application/octet-stream" aria-label="Choose an STL file" />
           <div class="upload-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v5h14v-5"/></svg></div>
           <strong>Drop STL here</strong><span>or click to choose a file</span>
         </label>
@@ -70,6 +85,7 @@ app.innerHTML = `
       <button id="reconstructButton" class="primary-button convert-button" disabled>
         <span>Convert to STEP</span><svg viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></svg>
       </button>
+      ${browserLocal ? '<button id="cancelConversion" class="advanced-toggle hidden" type="button">Cancel conversion</button>' : ""}
       <div id="errorBox" class="error-box hidden" role="alert"></div>
       <div id="baseWarnings" class="base-warnings hidden" aria-live="polite"></div>
 
@@ -156,17 +172,23 @@ function updateEngineCopy() {
 document.querySelector("#engine").addEventListener("change", updateEngineCopy);
 updateEngineCopy();
 
-fetch("/api/health")
-  .then((response) => {
-    if (!response.ok) throw new Error("Converter unavailable");
-    return response.json();
-  })
-  .then(() => {
-    document.querySelector("#engineStatus").innerHTML = "<span></span> Converter ready";
-  })
-  .catch(() => {
-    document.querySelector("#engineStatus").innerHTML = "<span></span> Converter offline";
-  });
+if (browserLocal) {
+  document.querySelector("#engine").closest("section").classList.add("hidden");
+  document.querySelector("#engineStatus").innerHTML = "<span></span> Browser converter";
+  document.querySelector("#cancelConversion").addEventListener("click", () => localController?.abort());
+} else {
+  fetch("/api/health")
+    .then((response) => {
+      if (!response.ok) throw new Error("Converter unavailable");
+      return response.json();
+    })
+    .then(() => {
+      document.querySelector("#engineStatus").innerHTML = "<span></span> Converter ready";
+    })
+    .catch(() => {
+      document.querySelector("#engineStatus").innerHTML = "<span></span> Converter offline";
+    });
+}
 
 class MeshViewer {
   constructor(canvas, color) {
@@ -1063,7 +1085,7 @@ document.querySelector("#redoEdit").addEventListener("click", () => {
 document.querySelector("#resetAllDimensions").addEventListener("click", () => resetMeasuredValues());
 
 applyFeatureEdits.addEventListener("click", async () => {
-  if (!activeReport?.plan || !editablePlan || editorBusy || !plansDiffer()) return;
+  if (browserLocal || !activeReport?.plan || !editablePlan || editorBusy || !plansDiffer()) return;
   const selectionVersion = fileSelectionVersion;
   editorBusy = true;
   renderEditorFeedback("Rebuilding the ordered feature tree and verifying it against the STL…");
@@ -1166,6 +1188,8 @@ function resetResultForInput() {
 }
 
 async function chooseFile(file) {
+  if (localController) return;
+  if (browserLocal) clearLocalArtifacts();
   const selectionVersion = ++fileSelectionVersion;
   resetResultForInput();
   selectedFile = null;
@@ -1190,13 +1214,22 @@ async function chooseFile(file) {
     fileInput.value = "";
     return;
   }
-  const showPreview = file.size <= MAX_PREVIEW_BYTES;
+  let showPreview = file.size <= MAX_PREVIEW_BYTES;
+  let viewerUnavailable = false;
+  if (showPreview && !inputViewer) {
+    try {
+      inputViewer = new MeshViewer(inputCanvas, 0x8ebbd2);
+    } catch {
+      viewerUnavailable = true;
+      showPreview = false;
+      projectionTabs.classList.add("hidden");
+    }
+  }
   errorBox.classList.add("hidden");
   if (showPreview) {
     try {
       const buffer = await file.arrayBuffer();
       if (selectionVersion !== fileSelectionVersion) return;
-      inputViewer ||= new MeshViewer(inputCanvas, 0x8ebbd2);
       await inputViewer.load(buffer);
     } catch {
       if (selectionVersion !== fileSelectionVersion) return;
@@ -1226,10 +1259,10 @@ async function chooseFile(file) {
   viewerEmpty.classList.toggle("hidden", showPreview);
   viewerEmpty.querySelector("strong").textContent = showPreview
     ? "Import a model to inspect it"
-    : "Preview skipped for this large STL";
+    : viewerUnavailable ? "3D preview unavailable" : "Preview skipped for this large STL";
   viewerEmpty.querySelector("p").textContent = showPreview
     ? "Drag to orbit · pinch or scroll to zoom"
-    : "Convert it to create a lighter result preview";
+    : viewerUnavailable ? "You can still convert and download this file." : "Convert it to create a lighter result preview";
   inputCanvas.classList.toggle("hidden", !showPreview);
   outputCanvas.classList.add("hidden");
   document.querySelector("#previewSubtitle").textContent = file.name;
@@ -1238,6 +1271,7 @@ async function chooseFile(file) {
 
 function clearFile(event) {
   event?.preventDefault();
+  if (browserLocal) clearLocalArtifacts();
   fileSelectionVersion += 1;
   resetResultForInput();
   selectedFile = null;
@@ -1261,7 +1295,7 @@ sampleButton.addEventListener("click", async () => {
   sampleButton.disabled = true;
   sampleButton.textContent = "Loading sample…";
   try {
-    const response = await fetch("/sample-plate.stl", { cache: "no-store" });
+    const response = await fetch(`${import.meta.env.BASE_URL}sample-plate.stl`, { cache: "no-store" });
     if (!response.ok) throw new Error();
     const blob = await response.blob();
     document.querySelector("#units").value = "mm";
@@ -1330,6 +1364,9 @@ const formatElapsed = (seconds) => {
 
 function renderReconstructionProgress(progress) {
   const percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+  if (browserLocal) {
+    button.querySelector("span").textContent = `${progress.stage || "Converting"} (${Math.round(percent)}%)`;
+  }
   document.querySelector("#processingStage").textContent = progress.stage || "Reconstructing";
   document.querySelector("#processingText").textContent = progress.detail || "Working locally";
   document.querySelector("#progressBar").style.width = `${percent}%`;
@@ -1346,8 +1383,8 @@ function renderReconstructionProgress(progress) {
     counts.push("Geometry calculation still active");
   }
   document.querySelector("#progressCounts").textContent =
-    counts.join(" · ") || "Discovering the first editable features";
-  updateLivePreview(progress);
+    counts.join(" · ") || (browserLocal ? "" : "Discovering the first editable features");
+  if (!browserLocal) updateLivePreview(progress);
 }
 
 async function updateLivePreview(progress) {
@@ -1436,8 +1473,8 @@ button.addEventListener("click", async () => {
   livePreviewGeneration += 1;
   document.querySelector("#results").classList.add("hidden");
   renderReconstructionProgress({
-    stage: "Uploading mesh",
-    detail: "Saving the STL locally",
+    stage: browserLocal ? "Preparing mesh" : "Uploading mesh",
+    detail: browserLocal ? "Starting browser conversion" : "Saving the STL locally",
     percent: 2,
     elapsed_seconds: 0,
     candidates_done: 0,
@@ -1446,11 +1483,29 @@ button.addEventListener("click", async () => {
     seconds_since_update: 0,
     status: "queued",
   });
-  const form = new FormData();
-  form.append("file", selectedFile);
-  form.append("input_units", document.querySelector("#units").value);
-  form.append("engine", document.querySelector("#engine").value);
   try {
+    if (browserLocal) {
+      clearLocalArtifacts();
+      localController = new AbortController();
+      const { signal } = localController;
+      document.querySelector("#clearFile").disabled = true;
+      document.querySelector("#cancelConversion").classList.remove("hidden");
+      const { convertInBrowser } = await import("./browser-conversion.js");
+      if (signal.aborted) return;
+      const { report, files } = await convertInBrowser(selectedFile, document.querySelector("#units").value, {
+        onProgress: renderReconstructionProgress,
+        signal,
+      });
+      if (signal.aborted) return;
+      document.querySelector("#cancelConversion").classList.add("hidden");
+      for (const [name, blob] of Object.entries(files)) localUrls.set(name, URL.createObjectURL(blob));
+      await renderResult(report, { selectionVersion });
+      return;
+    }
+    const form = new FormData();
+    form.append("file", selectedFile);
+    form.append("input_units", document.querySelector("#units").value);
+    form.append("engine", document.querySelector("#engine").value);
     let response;
     try {
       response = await fetch("/api/reconstruct/start", { method: "POST", body: form });
@@ -1467,8 +1522,15 @@ button.addEventListener("click", async () => {
     const report = await waitForReconstruction(payload.id, selectionVersion);
     if (report) await renderResult(report, { selectionVersion });
   } catch (error) {
-    if (selectionVersion === fileSelectionVersion) showError(error.message);
+    if (selectionVersion === fileSelectionVersion && !localController?.signal.aborted) showError(error.message);
   } finally {
+    if (browserLocal) {
+      const clear = document.querySelector("#clearFile");
+      if (clear) clear.disabled = false;
+      document.querySelector("#cancelConversion").classList.add("hidden");
+      localController = null;
+      updateEngineCopy();
+    }
     if (selectionVersion === fileSelectionVersion) {
       processing.classList.add("hidden");
       button.disabled = !selectedFile;
@@ -1654,7 +1716,9 @@ async function renderResult(report, options = {}) {
         report.surface.closed
           ? report.surface.faceted_fallback
             ? report.surface.source_mesh_fallback
-              ? "Closed exact source-mesh faceted solid"
+              ? report.surface.simplified_fallback
+                ? "Closed faceted solid from a reduced mesh"
+                : "Closed source-mesh faceted solid"
               : "Closed hybrid analytic/conforming-facet solid"
             : "Closed analytic/B-spline solid"
           : report.surface.faceted_fallback
@@ -1682,6 +1746,11 @@ async function renderResult(report, options = {}) {
   }
 
   const fileBase = `/api/runs/${report.id}/files`;
+  const artifactUrl = (name, query = "") => {
+    if (!browserLocal) return `${fileBase}/${name}${query}`;
+    if (!localUrls.has(name)) throw new Error(`Missing artifact: ${name}`);
+    return localUrls.get(name);
+  };
   const sourceStem = (report.mesh.file_name || "model.stl")
     .replace(/\.[^.]+$/, "")
     .replace(/[^A-Za-z0-9._-]+/g, "_")
@@ -1698,15 +1767,18 @@ async function renderResult(report, options = {}) {
     : surfaceMode && report.surface.closed
       ? "Verified watertight B-rep"
       : "Reconstructed CAD model";
-  const hasOutput = report.status !== "failed";
+  const hasOutput = browserLocal ? localUrls.has("reconstruction.step") : report.status !== "failed";
   document.querySelector("#downloads").innerHTML = hasOutput
     ? `
-      <a class="download-primary" href="${fileBase}/reconstruction.step" download="${escapeHtml(reconstructedStepName)}">
+      <a class="download-primary" href="${artifactUrl("reconstruction.step")}" download="${escapeHtml(reconstructedStepName)}">
         <span><strong>${downloadTitle}</strong><small>${downloadDetail}</small></span><b>↓</b>
       </a>
     `
     : '<p class="no-output">No STEP file was produced for this run.</p>';
-  document.querySelector("#advancedDownloads").innerHTML = !hasOutput
+  document.querySelector("#advancedDownloads").innerHTML = browserLocal
+    ? [...localUrls].filter(([name]) => name !== "reconstruction.step")
+      .map(([name, url]) => `<a href="${url}" download="${escapeHtml(name)}">${escapeHtml(name)} <b>↓</b></a>`).join("")
+    : !hasOutput
     ? `<a href="${fileBase}/report.json" download>Failure report <b>↓</b></a>`
     : surfaceMode
       ? `
@@ -1737,7 +1809,8 @@ async function renderResult(report, options = {}) {
   document.querySelector("#results").classList.remove("hidden");
 
   if (report.status !== "failed") {
-    if (report.plan) {
+    inputTriangleLegend.classList.add("hidden");
+    if (!browserLocal && report.plan) {
       initializeFeatureEditor(report);
     } else {
       activeReport = report;
@@ -1745,7 +1818,7 @@ async function renderResult(report, options = {}) {
       featureEditor.classList.add("hidden");
     }
     try {
-      const response = await fetch(`${fileBase}/reconstruction.stl?revision=${report.plan?.revision || 0}`, {
+      const response = await fetch(artifactUrl("reconstruction.stl", `?revision=${report.plan?.revision || 0}`), {
         cache: "no-store",
       });
       if (!response.ok) throw new Error();
@@ -1768,15 +1841,19 @@ async function renderResult(report, options = {}) {
     }
     let sourceMeshBuffer = null;
     try {
-      const sourceResponse = await fetch(`${fileBase}/input.stl`, { cache: "no-store" });
-      if (!current()) return;
-      if (sourceResponse.ok && Number(sourceResponse.headers.get("content-length")) <= MAX_PREVIEW_BYTES) {
-        sourceMeshBuffer = await sourceResponse.arrayBuffer();
-        if (!current()) return;
-        inputViewer ||= new MeshViewer(inputCanvas, 0x8ebbd2);
-        await inputViewer.load(sourceMeshBuffer.slice(0));
+      if (browserLocal) {
+        if (inputViewer && selectedFile.size <= MAX_PREVIEW_BYTES) sourceMeshBuffer = await selectedFile.arrayBuffer();
       } else {
-        await sourceResponse.body?.cancel();
+        const sourceResponse = await fetch(`${fileBase}/input.stl`, { cache: "no-store" });
+        if (!current()) return;
+        if (sourceResponse.ok && Number(sourceResponse.headers.get("content-length")) <= MAX_PREVIEW_BYTES) {
+          sourceMeshBuffer = await sourceResponse.arrayBuffer();
+          if (!current()) return;
+          inputViewer ||= new MeshViewer(inputCanvas, 0x8ebbd2);
+          await inputViewer.load(sourceMeshBuffer.slice(0));
+        } else {
+          await sourceResponse.body?.cancel();
+        }
       }
     } catch {
       // The STEP result remains usable if an older saved run has no source preview.
@@ -1784,7 +1861,7 @@ async function renderResult(report, options = {}) {
     if (!current()) return;
     if (surfaceMode) {
       try {
-        const graphResponse = await fetch(`${fileBase}/surface_graph.json`, { cache: "no-store" });
+        const graphResponse = await fetch(artifactUrl("surface_graph.json"), { cache: "no-store" });
         if (graphResponse.ok) {
           const surfaceGraph = await graphResponse.json();
           if (!current()) return;
@@ -1805,7 +1882,7 @@ async function renderResult(report, options = {}) {
         surfaceLegend.classList.add("hidden");
       }
     }
-    viewTabs.classList.remove("hidden");
+    viewTabs.classList.toggle("hidden", !sourceMeshBuffer || outputCanvas.classList.contains("hidden"));
     viewTabs.querySelector('[data-view="input"]').disabled = !sourceMeshBuffer;
     [...viewTabs.children].forEach((item) => {
       const active = item.dataset.view === "output";
@@ -1820,7 +1897,7 @@ async function renderResult(report, options = {}) {
 }
 
 const requestedRun = new URLSearchParams(window.location.search).get("run");
-if (/^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestedRun || "")) {
+if (!browserLocal && /^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestedRun || "")) {
   const selectionVersion = fileSelectionVersion;
   button.disabled = true;
   processing.classList.remove("hidden");
