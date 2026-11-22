@@ -4,6 +4,9 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
+import cadquery as cq
+from OCP.BRep import BRep_Tool
+
 from .progress import apply_stage, new_progress, public_progress
 from .surface_reconstruction import (
     _preserve_analytic_diagnostic,
@@ -11,6 +14,33 @@ from .surface_reconstruction import (
     _report_has_valid_solid,
     reconstruct_surfaces,
 )
+
+
+def _add_step_edges(directory: Path) -> None:
+    graph_path = directory / "surface_graph.json"
+    graph = json.loads(graph_path.read_text(encoding="utf-8")) if graph_path.exists() else {}
+    model = cq.importers.importStep(str(directory / "reconstruction.step"))
+    edges = set()
+    for face in model.faces().vals():
+        for edge in face.Edges():
+            if not BRep_Tool.IsClosed_s(edge.wrapped, face.wrapped):
+                edges.add(edge)
+
+    curves = []
+    for edge in edges:
+        try:
+            deflection = min(0.02, max(edge.Length() * 0.0005, 1e-7))
+            points, _ = edge.sample(deflection)
+        except (ValueError, RuntimeError):
+            continue
+        if len(points) >= 2:
+            curve = [point.toTuple() for point in points]
+            if edge.IsClosed():
+                curve.append(curve[0])
+            curves.append(curve)
+    if curves:
+        graph.setdefault("visualization", {})["step_edges"] = curves
+        graph_path.write_text(json.dumps(graph), encoding="utf-8")
 
 
 def convert(
@@ -38,6 +68,14 @@ def convert(
         if report.mesh.watertight and not _report_has_valid_solid(report):
             _preserve_analytic_diagnostic(path.parent)
             pending_recovery = "the analytic STEP did not pass the solid and geometry checks"
+    surface = report.surface
+    if (not pending_recovery and surface and not surface.faceted_fallback
+            and 0 < surface.brep_face_count <= 2000):
+        try:
+            _add_step_edges(path.parent)
+        except Exception:
+            # An edge display failure must leave the STEP and preview downloadable.
+            pass
     return json.dumps({
         "report": json.loads(report.model_dump_json()),
         "pending_recovery": pending_recovery,

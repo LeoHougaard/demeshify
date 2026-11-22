@@ -21,6 +21,12 @@ whether the result meets the strict CAD checks. Geometry verification and strict
 CAD recovery are recorded separately in `geometry.json` and `reference-audit.json`.
 Each run also keeps the app reports, timings, and recorded network requests.
 
+Capture the 25-part preview suite with `--visual` in place of `--complex`. It
+includes the ten complex parts and fifteen additional parts with bores, curved
+profiles, and cutouts. The runner waits for the STEP preview and its edge legend
+before saving each PNG. Set `SMOKE_SCREENSHOTS=1` to capture other runs, including
+individual STL files supplied on the command line.
+
 Generate additional synthetic fixtures with
 `python tools/browser-smoke/cad.py generate-extended <directory>`. The chamfered
 slot has an exact reference STEP. To verify that a layered test uses the intended

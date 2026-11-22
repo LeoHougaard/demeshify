@@ -1,3 +1,7 @@
+import { meshAgreement } from './mesh-agreement.js';
+import { readStl } from './prism-profile.js';
+import { sampleSolidEdges } from './step-edges.js';
+
 const vec = ([x, y, z]) => ({ x, y, z });
 
 function faceFromSegments(kernel, segments) {
@@ -73,10 +77,6 @@ export function constructLayered(kernel, { mesh, profile, height, lowerChamfer, 
   for (const bore of boreTools(bores, epsilon)) solid = kernel.cut(solid, makeBore(kernel, bore));
   return kernel.translate(kernel.unifySameDomain(solid), ...mesh.min);
 }
-import { meshAgreement } from './mesh-agreement.js';
-import { readStl } from './prism-profile.js';
-
-
 export async function buildLayered(proposal, job, started) {
   const { getKernel } = await import('./prism-step.js');
   const kernel = await getKernel();
@@ -107,6 +107,7 @@ export async function buildLayered(proposal, job, started) {
       if (width < Math.min(0.025, mesh.diagonal * 0.00015) && width * 400 < perimeter) return null;
       counts[kind] = (counts[kind] || 0) + 1;
     }
+    const stepEdges = sampleSolidEdges(kernel, reopened, tolerance);
     const faces = kernel.subShapeCount(reopened, 'face');
     const edges = kernel.subShapeCount(reopened, 'edge');
     const report = {
@@ -126,7 +127,9 @@ export async function buildLayered(proposal, job, started) {
     return { report, files: {
       'reconstruction.step': text.encode(step), 'reconstruction.stl': preview,
       'report.json': text.encode(JSON.stringify(report, null, 2)),
-      'surface_graph.json': text.encode(JSON.stringify({ surface_counts: counts, visualization: {} })),
+      'surface_graph.json': text.encode(JSON.stringify({
+        surface_counts: counts, visualization: { step_edges: stepEdges },
+      })),
     } };
   } finally {
     kernel.releaseSince(checkpoint);

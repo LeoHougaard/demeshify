@@ -1,5 +1,6 @@
 import { OcctKernel } from 'occt-wasm';
 import wasmUrl from 'occt-wasm/dist/occt-wasm.wasm?url';
+import { sampleSolidEdges } from './step-edges.js';
 
 let kernelPromise;
 
@@ -33,11 +34,6 @@ function constructPrism(kernel, section, deviation) {
   }
   const vec = ([x, y, z]) => ({ x, y, z });
   const rotation = frame && { point: vec([0, 0, 0]), direction: vec(frame.axis) };
-
-  function worldPoint(point) {
-    return frame ? frame.origin.map((offset, axis) => offset
-      + frame.basis.reduce((sum, basis, index) => sum + point[index] * basis[axis], 0)) : point;
-  }
 
   function solid({ circle, segments }) {
     if (circle) {
@@ -87,19 +83,7 @@ function constructPrism(kernel, section, deviation) {
     return { counts, volumeError };
   }
 
-  function boundaries() {
-    return loops.flatMap(({ loop, circle, segments }) => {
-      const points = circle ? Array.from({ length: 64 }, (_, i) => {
-        const a = i * Math.PI / 32;
-        return [circle.center[0] + circle.radius * Math.cos(a), circle.center[1] + circle.radius * Math.sin(a)];
-      }) : loop;
-      const closed = [...points, points[0]];
-      return [closed.map(point => worldPoint(xyz(point))), closed.map(point => worldPoint(xyz(point, 1))),
-        ...segments.map(({ a }) => [worldPoint(xyz(a)), worldPoint(xyz(a, 1))])];
-    });
-  }
-
-  return { placed, verify, boundaries, worldMin: section.worldMin, worldMax: section.worldMax };
+  return { placed, verify, worldMin: section.worldMin, worldMax: section.worldMax };
 }
 
 export async function buildPrism({ sections, factor, triangles }, job, started) {
@@ -133,6 +117,9 @@ export async function buildPrism({ sections, factor, triangles }, job, started) 
     }
 
     const deviation = Math.max(...deviations);
+    const tolerance = Math.min(deviation / 2, 0.03);
+    const preview = kernel.exportStl(reopened, tolerance);
+    const stepEdges = sampleSolidEdges(kernel, reopened, tolerance);
     const faceCount = counts.plane + counts.cylinder;
     const report = {
       id: job.id, engine: 'surface_brep', implementation: 'prism', status: 'complete',
@@ -150,14 +137,13 @@ export async function buildPrism({ sections, factor, triangles }, job, started) 
         component_count_match: true, step_geometry_verified: true },
       warnings: [], elapsed_seconds: (performance.now() - started) / 1000,
     };
-    const surfaceBoundaries = bodies.flatMap(body => body.boundaries());
     const text = new TextEncoder();
     const files = {
       'reconstruction.step': text.encode(step),
-      'reconstruction.stl': kernel.exportStl(reopened, Math.min(deviation / 2, 0.03)),
+      'reconstruction.stl': preview,
       'report.json': text.encode(JSON.stringify(report, null, 2)),
       'surface_graph.json': text.encode(JSON.stringify({
-        surface_counts: counts, visualization: { surface_boundaries: surfaceBoundaries },
+        surface_counts: counts, visualization: { step_edges: stepEdges },
       })),
     };
     return { report, files };

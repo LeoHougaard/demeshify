@@ -263,7 +263,7 @@ function rotatedProfile(mesh) {
         projected[i + j] = value;
       }
     }
-    const frame = { basis, origin, axis: [-ny, nx, 0], angle: Math.atan2(Math.hypot(nx, ny), nz) };
+    const frame = { origin, axis: [-ny, nx, 0], angle: Math.atan2(Math.hypot(nx, ny), nz) };
     const section = profile(projected, min, max, 2, epsilon, frame);
     if (section) return section;
   }

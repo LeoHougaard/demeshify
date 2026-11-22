@@ -117,7 +117,7 @@ app.innerHTML = `
       <div id="viewer" class="viewer">
         <div id="viewerEmpty" class="viewer-empty"><div class="empty-file">STL</div><strong>Import a model to inspect it</strong><p>Drag to orbit · pinch or scroll to zoom</p></div>
         <canvas id="inputCanvas"></canvas><canvas id="outputCanvas" class="hidden"></canvas>
-        <div id="surfaceLegend" class="surface-legend hidden"><span><i class="fitted-edge"></i>Fitted surface boundary</span><span><i class="faceted-edge"></i>Fallback triangle edges</span><small id="surfaceLegendStatus"></small></div>
+        <div id="surfaceLegend" class="surface-legend hidden"><span><i class="fitted-edge"></i><span id="surfaceBoundaryLabel">Fitted surface boundary</span></span><span><i class="faceted-edge"></i>Fallback triangle edges</span><small id="surfaceLegendStatus"></small></div>
         <div id="inputTriangleLegend" class="surface-legend input-triangle-legend hidden"><span><i class="source-triangle-edge"></i>Every source STL triangle edge</span><small id="inputTriangleLegendStatus"></small></div>
         <div class="navigation-hint">Right-drag orbit · Middle-drag pan · Wheel zoom · Double-click or F to fit</div>
         <div id="processing" class="processing hidden" role="status" aria-live="polite">
@@ -465,6 +465,7 @@ class MeshViewer {
   }
 
   clearSurfaceOverlay() {
+    if (this.cadEdges) this.cadEdges.visible = true;
     if (!this.surfaceOverlay) return;
     this.scene.remove(this.surfaceOverlay);
     this.surfaceOverlay.traverse((item) => {
@@ -479,6 +480,8 @@ class MeshViewer {
     if (!this.mesh || !this.modelCenter) return { boundaryCount: 0, triangleCount: 0 };
 
     const visualization = surfaceGraph?.visualization || {};
+    const stepEdges = visualization.step_edges;
+    const hasStepEdges = Array.isArray(stepEdges) && stepEdges.length > 0;
     const group = new THREE.Group();
     group.position.copy(this.modelCenter).multiplyScalar(-1);
     let boundaryCount = 0;
@@ -486,7 +489,7 @@ class MeshViewer {
 
     if (!visualization.global_faceted_fallback) {
       const boundaryPositions = [];
-      for (const curve of visualization.surface_boundaries || []) {
+      for (const curve of hasStepEdges ? stepEdges : (visualization.surface_boundaries || [])) {
         if (!Array.isArray(curve) || curve.length < 2) continue;
         for (let index = 0; index < curve.length - 1; index += 1) {
           const first = curve[index];
@@ -497,6 +500,7 @@ class MeshViewer {
         boundaryCount += 1;
       }
       if (boundaryPositions.length) {
+        if (hasStepEdges && this.cadEdges) this.cadEdges.visible = false;
         const geometry = new THREE.BufferGeometry();
         geometry.setAttribute(
           "position",
@@ -505,13 +509,14 @@ class MeshViewer {
         group.add(
           new THREE.LineSegments(
             geometry,
-            new THREE.LineBasicMaterial({ color: 0x17242c, depthTest: true }),
+            new THREE.LineBasicMaterial({ color: 0x111a20, depthTest: true, depthWrite: false }),
           ),
         );
       }
     }
 
-    const sourceGeometry = sourceBuffer && !visualization.global_faceted_fallback
+    const requestedFaces = visualization.faceted_source_face_indices || [];
+    const sourceGeometry = sourceBuffer && requestedFaces.length && !visualization.global_faceted_fallback
       ? new STLLoader().parse(sourceBuffer) : null;
     const sourcePositions = sourceGeometry?.getAttribute("position");
     const sourceFaceCount = Math.floor((sourcePositions?.count || 0) / 3);
@@ -531,7 +536,6 @@ class MeshViewer {
       triangleCount = Math.floor((this.mesh.geometry.index?.count
         || this.mesh.geometry.getAttribute("position").count) / 3);
     } else {
-      const requestedFaces = visualization.faceted_source_face_indices || [];
       const trianglePositions = [];
       for (const rawFaceIndex of requestedFaces) {
         const faceIndex = Number(rawFaceIndex);
@@ -570,7 +574,7 @@ class MeshViewer {
     this.surfaceOverlay = group;
     this.scene.add(group);
     this.render();
-    return { boundaryCount, triangleCount };
+    return { boundaryCount, triangleCount, hasStepEdges: hasStepEdges && boundaryCount > 0 };
   }
 
   resize() {
@@ -1877,6 +1881,8 @@ async function renderResult(report, options = {}) {
             sourceMeshBuffer,
             Number(report.mesh.unit_scale) || 1,
           );
+          document.querySelector("#surfaceBoundaryLabel").textContent = overlay.hasStepEdges
+            ? "STEP edges" : "Fitted surface boundary";
           surfaceLegendStatus.textContent = overlay.triangleCount
             ? `${overlay.triangleCount.toLocaleString()} fallback triangles shown`
             : report.surface.faceted_face_count

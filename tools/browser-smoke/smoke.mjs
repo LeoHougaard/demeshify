@@ -8,10 +8,16 @@ const here = import.meta.dirname;
 const target = new URL(process.argv[2]);
 const inputsArg = process.argv.slice(3);
 const complex = inputsArg[0] === '--complex';
+const visual = inputsArg[0] === '--visual';
 let corpus = inputsArg.map(file => path.resolve(file));
-if (complex) {
-  assert.ok(inputsArg.length <= 2, '--complex takes an optional dataset name prefix');
+if (complex || visual) {
+  assert.ok(inputsArg.length <= (visual ? 1 : 2), 'Only --complex takes a dataset name prefix');
   const fixtureGroups = JSON.parse(await readFile(path.join(here, 'complex-fixtures.json'), 'utf8'));
+  if (visual) {
+    fixtureGroups.fusion_official_test.push(...JSON.parse(
+      await readFile(path.join(here, 'edge-fixtures.json'), 'utf8'),
+    ));
+  }
   const corpusRoot = process.env.SMOKE_CORPUS_ROOT || path.resolve(here, '../../datasets');
   const prefix = inputsArg[1] || '';
   corpus = Object.entries(fixtureGroups).filter(([folder]) => folder.startsWith(prefix))
@@ -115,6 +121,14 @@ try {
     const reportLink = page.locator('#advancedDownloads a[download="report.json"]');
     const report = await reportLink.evaluate(async link => (await fetch(link.href)).json());
     await writeFile(path.join(dir, name + '.report.json'), JSON.stringify(report, null, 2));
+    if (visual || process.env.SMOKE_SCREENSHOTS) {
+      await page.locator('#outputCanvas').waitFor({ state: 'visible' });
+      await page.locator('#surfaceLegend').waitFor({ state: 'visible' });
+      if (process.env.SMOKE_EXPECT_STEP_EDGES && !report.surface.faceted_fallback) {
+        assert.equal(await page.locator('#surfaceBoundaryLabel').innerText(), 'STEP edges');
+      }
+      await page.screenshot({ path: path.join(dir, name + '.png') });
+    }
     conversions.push({ model: name, milliseconds, implementation: report.implementation || 'reconstruction' });
     const [download] = await Promise.all([page.waitForEvent('download'), link.click()]);
     await download.saveAs(path.join(dir, name + '.step'));
