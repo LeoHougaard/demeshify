@@ -14,9 +14,11 @@ __pycache__/
 .ruff_cache/
 web/node_modules/
 web/dist/
+web/dist-browser/
 runs/*
 !runs/.gitkeep
 tests/fixtures/generated/
 datasets/*
 !datasets/README.md
 benchmarks/
+/.lakebed/

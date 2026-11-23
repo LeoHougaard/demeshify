@@ -1,0 +1,29 @@
+name: Browser release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-pages-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm --prefix web ci
+      - run: npm --prefix web run build:browser -- --base=/demeshify/
+      - run: test -s web/dist-browser/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist-browser

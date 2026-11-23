@@ -12,6 +12,21 @@ import { pollReconstruction } from "./reconstruction-polling.js";
 CameraControls.install({ THREE });
 
 const app = document.querySelector("#app");
+const browserLocal = import.meta.env.VITE_BROWSER_LOCAL === "true";
+let localController = null;
+const localUrls = new Map();
+
+function clearLocalArtifacts() {
+  for (const url of localUrls.values()) URL.revokeObjectURL(url);
+  localUrls.clear();
+  document.querySelector("#results").classList.add("hidden");
+  for (const id of ["advancedDownloads", "downloads", "featurePlan", "warnings"]) {
+    document.getElementById(id).replaceChildren();
+  }
+  document.querySelector("#volumeError").textContent = "—";
+  document.querySelector("#baseWarnings").classList.add("hidden");
+}
+
 let selectedFile = null;
 let selectedDimensions = null;
 let inputViewer;
@@ -45,7 +60,7 @@ const escapeHtml = (value) =>
 // focused on import, convert, inspect, and export.
 app.innerHTML = `
   <header class="topbar">
-    <a class="brand" href="/" aria-label="STL to STEP Converter home">
+    <a class="brand" href="${import.meta.env.BASE_URL}" aria-label="STL to STEP Converter home">
       <span class="brand-file">STL</span>
       <span>STL to STEP <b>Converter</b></span>
     </a>
@@ -60,7 +75,7 @@ app.innerHTML = `
       <section class="import-panel">
         <div class="section-heading"><span>1</span><div><strong>Import STL</strong><small>Choose the mesh to convert</small></div></div>
         <label id="dropzone" class="dropzone compact-dropzone" role="button" tabindex="0">
-          <input id="fileInput" type="file" accept=".stl,model/stl" aria-label="Choose an STL file" />
+          <input id="fileInput" type="file" accept=".stl,model/stl,application/sla,application/vnd.ms-pki.stl,application/octet-stream" aria-label="Choose an STL file" />
           <div class="upload-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v5h14v-5"/></svg></div>
           <strong>Drop STL here</strong><span>or click to choose a file</span>
         </label>
@@ -73,6 +88,7 @@ app.innerHTML = `
       <button id="reconstructButton" class="primary-button convert-button" disabled>
         <span>Convert to STEP</span><svg viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></svg>
       </button>
+      ${browserLocal ? '<button id="cancelConversion" class="advanced-toggle hidden" type="button">Cancel conversion</button>' : ""}
       <div id="errorBox" class="error-box hidden" role="alert"></div>
       <div id="baseWarnings" class="base-warnings hidden" aria-live="polite"></div>
 
@@ -82,7 +98,7 @@ app.innerHTML = `
           <div id="confidence" class="confidence"></div>
         </div>
         <div class="quick-metrics">
-          <article><span>Deviation P95</span><strong id="p95">—</strong><small>mm</small></article>
+          <article><span id="deviationLabel">Deviation P95</span><strong id="p95">—</strong><small>mm</small></article>
           <article><span>Construction</span><strong id="construction">—</strong><small id="constructionUnit">CAD model</small></article>
           <article><span>Time</span><strong id="elapsed">—</strong><small>seconds</small></article>
         </div>
@@ -104,7 +120,7 @@ app.innerHTML = `
       <div id="viewer" class="viewer">
         <div id="viewerEmpty" class="viewer-empty"><div class="empty-file">STL</div><strong>Import a model to inspect it</strong><p>Drag to orbit · pinch or scroll to zoom</p></div>
         <canvas id="inputCanvas"></canvas><canvas id="outputCanvas" class="hidden"></canvas>
-        <div id="surfaceLegend" class="surface-legend hidden"><span><i class="fitted-edge"></i>Fitted surface boundary</span><span><i class="faceted-edge"></i>Fallback triangle edges</span><small id="surfaceLegendStatus"></small></div>
+        <div id="surfaceLegend" class="surface-legend hidden"><span><i class="fitted-edge"></i><span id="surfaceBoundaryLabel">Fitted surface boundary</span></span><span><i class="faceted-edge"></i>Fallback triangle edges</span><small id="surfaceLegendStatus"></small></div>
         <div id="inputTriangleLegend" class="surface-legend input-triangle-legend hidden"><span><i class="source-triangle-edge"></i>Every source STL triangle edge</span><small id="inputTriangleLegendStatus"></small></div>
         <div class="navigation-hint">Right-drag orbit · Middle-drag pan · Wheel zoom · Double-click or F to fit</div>
         <div id="processing" class="processing hidden" role="status" aria-live="polite">
@@ -128,7 +144,7 @@ app.innerHTML = `
       <section class="advanced-section">
         <h2>Conversion settings</h2>
         <div class="advanced-settings-grid">
-          <label class="field"><span>Reconstruction method</span><select id="engine"><option value="surface_brep">Recognized surfaces (recommended)</option><option value="feature_tree">Parametric feature history</option></select><small id="engineHelp">Fits analytic and B-spline surfaces, then joins their boundaries.</small></label>
+          <label class="field"><span>Reconstruction method</span><select id="engine"><option value="surface_brep">Recognized surfaces (recommended)</option>${browserLocal ? '<option value="faceted">Fast faceted solid</option>' : '<option value="feature_tree">Parametric feature history</option>'}</select><small id="engineHelp">Fits analytic and B-spline surfaces, then joins their boundaries.</small></label>
         </div>
       </section>
 
@@ -149,9 +165,11 @@ app.innerHTML = `
 `;
 
 function updateEngineCopy() {
-  const surfaceMode = document.querySelector("#engine").value === "surface_brep";
+  const method = document.querySelector("#engine").value;
+  const surfaceMode = method === "surface_brep";
   document.querySelector("#engineHelp").textContent = surfaceMode
     ? "Surface mode reconstructs the final boundary directly from mesh geometry."
+    : method === "faceted" ? "Preserves the STL triangles as CAD faces."
     : "Feature-history mode builds an editable plan from measured mesh geometry.";
   document.querySelector("#reconstructButton span").textContent = "Convert to STEP";
 }
@@ -159,17 +177,22 @@ function updateEngineCopy() {
 document.querySelector("#engine").addEventListener("change", updateEngineCopy);
 updateEngineCopy();
 
-fetch("/api/health")
-  .then((response) => {
-    if (!response.ok) throw new Error("Converter unavailable");
-    return response.json();
-  })
-  .then(() => {
-    document.querySelector("#engineStatus").innerHTML = "<span></span> Converter ready";
-  })
-  .catch(() => {
-    document.querySelector("#engineStatus").innerHTML = "<span></span> Converter offline";
-  });
+if (browserLocal) {
+  document.querySelector("#engineStatus").innerHTML = "<span></span> Browser converter";
+  document.querySelector("#cancelConversion").addEventListener("click", () => localController?.abort());
+} else {
+  fetch("/api/health")
+    .then((response) => {
+      if (!response.ok) throw new Error("Converter unavailable");
+      return response.json();
+    })
+    .then(() => {
+      document.querySelector("#engineStatus").innerHTML = "<span></span> Converter ready";
+    })
+    .catch(() => {
+      document.querySelector("#engineStatus").innerHTML = "<span></span> Converter offline";
+    });
+}
 
 class MeshViewer {
   constructor(canvas, color) {
@@ -445,6 +468,7 @@ class MeshViewer {
   }
 
   clearSurfaceOverlay() {
+    if (this.cadEdges) this.cadEdges.visible = true;
     if (!this.surfaceOverlay) return;
     this.scene.remove(this.surfaceOverlay);
     this.surfaceOverlay.traverse((item) => {
@@ -459,6 +483,8 @@ class MeshViewer {
     if (!this.mesh || !this.modelCenter) return { boundaryCount: 0, triangleCount: 0 };
 
     const visualization = surfaceGraph?.visualization || {};
+    const stepEdges = visualization.step_edges;
+    const hasStepEdges = Array.isArray(stepEdges) && stepEdges.length > 0;
     const group = new THREE.Group();
     group.position.copy(this.modelCenter).multiplyScalar(-1);
     let boundaryCount = 0;
@@ -466,7 +492,7 @@ class MeshViewer {
 
     if (!visualization.global_faceted_fallback) {
       const boundaryPositions = [];
-      for (const curve of visualization.surface_boundaries || []) {
+      for (const curve of hasStepEdges ? stepEdges : (visualization.surface_boundaries || [])) {
         if (!Array.isArray(curve) || curve.length < 2) continue;
         for (let index = 0; index < curve.length - 1; index += 1) {
           const first = curve[index];
@@ -477,6 +503,7 @@ class MeshViewer {
         boundaryCount += 1;
       }
       if (boundaryPositions.length) {
+        if (hasStepEdges && this.cadEdges) this.cadEdges.visible = false;
         const geometry = new THREE.BufferGeometry();
         geometry.setAttribute(
           "position",
@@ -485,13 +512,14 @@ class MeshViewer {
         group.add(
           new THREE.LineSegments(
             geometry,
-            new THREE.LineBasicMaterial({ color: 0x17242c, depthTest: true }),
+            new THREE.LineBasicMaterial({ color: 0x111a20, depthTest: true, depthWrite: false }),
           ),
         );
       }
     }
 
-    const sourceGeometry = sourceBuffer && !visualization.global_faceted_fallback
+    const requestedFaces = visualization.faceted_source_face_indices || [];
+    const sourceGeometry = sourceBuffer && requestedFaces.length && !visualization.global_faceted_fallback
       ? new STLLoader().parse(sourceBuffer) : null;
     const sourcePositions = sourceGeometry?.getAttribute("position");
     const sourceFaceCount = Math.floor((sourcePositions?.count || 0) / 3);
@@ -511,7 +539,6 @@ class MeshViewer {
       triangleCount = Math.floor((this.mesh.geometry.index?.count
         || this.mesh.geometry.getAttribute("position").count) / 3);
     } else {
-      const requestedFaces = visualization.faceted_source_face_indices || [];
       const trianglePositions = [];
       for (const rawFaceIndex of requestedFaces) {
         const faceIndex = Number(rawFaceIndex);
@@ -550,7 +577,7 @@ class MeshViewer {
     this.surfaceOverlay = group;
     this.scene.add(group);
     this.render();
-    return { boundaryCount, triangleCount };
+    return { boundaryCount, triangleCount, hasStepEdges: hasStepEdges && boundaryCount > 0 };
   }
 
   resize() {
@@ -1067,7 +1094,7 @@ document.querySelector("#redoEdit").addEventListener("click", () => {
 document.querySelector("#resetAllDimensions").addEventListener("click", () => resetMeasuredValues());
 
 applyFeatureEdits.addEventListener("click", async () => {
-  if (!activeReport?.plan || !editablePlan || editorBusy || !plansDiffer()) return;
+  if (browserLocal || !activeReport?.plan || !editablePlan || editorBusy || !plansDiffer()) return;
   const selectionVersion = fileSelectionVersion;
   editorBusy = true;
   renderEditorFeedback("Rebuilding the ordered feature tree and verifying it against the STL…");
@@ -1170,6 +1197,8 @@ function resetResultForInput() {
 }
 
 async function chooseFile(file) {
+  if (localController) return;
+  if (browserLocal) clearLocalArtifacts();
   const selectionVersion = ++fileSelectionVersion;
   resetResultForInput();
   selectedFile = null;
@@ -1190,17 +1219,26 @@ async function chooseFile(file) {
     return;
   }
   if (file.size > MAX_UPLOAD_BYTES) {
-    showError("This STL is larger than the 250 MB upload limit.");
+    showError("Choose an STL under 250 MiB.");
     fileInput.value = "";
     return;
   }
-  const showPreview = file.size <= MAX_PREVIEW_BYTES;
+  let showPreview = file.size <= MAX_PREVIEW_BYTES;
+  let viewerUnavailable = false;
+  if (showPreview && !inputViewer) {
+    try {
+      inputViewer = new MeshViewer(inputCanvas, 0x8ebbd2);
+    } catch {
+      viewerUnavailable = true;
+      showPreview = false;
+      projectionTabs.classList.add("hidden");
+    }
+  }
   errorBox.classList.add("hidden");
   if (showPreview) {
     try {
       const buffer = await file.arrayBuffer();
       if (selectionVersion !== fileSelectionVersion) return;
-      inputViewer ||= new MeshViewer(inputCanvas, 0x8ebbd2);
       await inputViewer.load(buffer);
     } catch {
       if (selectionVersion !== fileSelectionVersion) return;
@@ -1230,10 +1268,10 @@ async function chooseFile(file) {
   viewerEmpty.classList.toggle("hidden", showPreview);
   viewerEmpty.querySelector("strong").textContent = showPreview
     ? "Import a model to inspect it"
-    : "Preview skipped for this large STL";
+    : viewerUnavailable ? "3D preview unavailable" : "Preview skipped for this large STL";
   viewerEmpty.querySelector("p").textContent = showPreview
     ? "Drag to orbit · pinch or scroll to zoom"
-    : "Convert it to create a lighter result preview";
+    : viewerUnavailable ? "You can still convert and download this file." : "Convert it to create a lighter result preview";
   inputCanvas.classList.toggle("hidden", !showPreview);
   outputCanvas.classList.add("hidden");
   document.querySelector("#previewSubtitle").textContent = file.name;
@@ -1242,6 +1280,7 @@ async function chooseFile(file) {
 
 function clearFile(event) {
   event?.preventDefault();
+  if (browserLocal) clearLocalArtifacts();
   fileSelectionVersion += 1;
   resetResultForInput();
   selectedFile = null;
@@ -1265,7 +1304,7 @@ sampleButton.addEventListener("click", async () => {
   sampleButton.disabled = true;
   sampleButton.textContent = "Loading sample…";
   try {
-    const response = await fetch("/sample-plate.stl", { cache: "no-store" });
+    const response = await fetch(`${import.meta.env.BASE_URL}sample-plate.stl`, { cache: "no-store" });
     if (!response.ok) throw new Error();
     const blob = await response.blob();
     document.querySelector("#units").value = "mm";
@@ -1334,6 +1373,9 @@ const formatElapsed = (seconds) => {
 
 function renderReconstructionProgress(progress) {
   const percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+  if (browserLocal) {
+    button.querySelector("span").textContent = `${progress.stage || "Converting"} (${Math.round(percent)}%)`;
+  }
   document.querySelector("#processingStage").textContent = progress.stage || "Reconstructing";
   document.querySelector("#processingText").textContent = progress.detail || "Working locally";
   document.querySelector("#progressBar").style.width = `${percent}%`;
@@ -1350,8 +1392,8 @@ function renderReconstructionProgress(progress) {
     counts.push("Geometry calculation still active");
   }
   document.querySelector("#progressCounts").textContent =
-    counts.join(" · ") || "Discovering the first editable features";
-  updateLivePreview(progress);
+    counts.join(" · ") || (browserLocal ? "" : "Discovering the first editable features");
+  if (!browserLocal) updateLivePreview(progress);
 }
 
 async function updateLivePreview(progress) {
@@ -1407,7 +1449,7 @@ function announceConversionComplete(report) {
 
 button.addEventListener("click", async () => {
   if (!selectedFile) return;
-  void conversionNotifications.requestPermission();
+  if (!browserLocal) void conversionNotifications.requestPermission();
   const selectionVersion = fileSelectionVersion;
   button.disabled = true;
   document.querySelector("#units").disabled = true;
@@ -1420,8 +1462,8 @@ button.addEventListener("click", async () => {
   livePreviewGeneration += 1;
   document.querySelector("#results").classList.add("hidden");
   renderReconstructionProgress({
-    stage: "Uploading mesh",
-    detail: "Saving the STL locally",
+    stage: browserLocal ? "Preparing mesh" : "Uploading mesh",
+    detail: browserLocal ? "Starting browser conversion" : "Saving the STL locally",
     percent: 2,
     elapsed_seconds: 0,
     candidates_done: 0,
@@ -1430,11 +1472,30 @@ button.addEventListener("click", async () => {
     seconds_since_update: 0,
     status: "queued",
   });
-  const form = new FormData();
-  form.append("file", selectedFile);
-  form.append("input_units", document.querySelector("#units").value);
-  form.append("engine", document.querySelector("#engine").value);
   try {
+    if (browserLocal) {
+      clearLocalArtifacts();
+      localController = new AbortController();
+      const { signal } = localController;
+      document.querySelector("#clearFile").disabled = true;
+      document.querySelector("#cancelConversion").classList.remove("hidden");
+      const { convertInBrowser } = await import("./browser-conversion.js");
+      if (signal.aborted) return;
+      const { report, files } = await convertInBrowser(selectedFile, document.querySelector("#units").value, {
+        mode: document.querySelector("#engine").value,
+        onProgress: renderReconstructionProgress,
+        signal,
+      });
+      if (signal.aborted) return;
+      document.querySelector("#cancelConversion").classList.add("hidden");
+      for (const [name, blob] of Object.entries(files)) localUrls.set(name, URL.createObjectURL(blob));
+      await renderResult(report, { selectionVersion });
+      return;
+    }
+    const form = new FormData();
+    form.append("file", selectedFile);
+    form.append("input_units", document.querySelector("#units").value);
+    form.append("engine", document.querySelector("#engine").value);
     let response;
     try {
       response = await fetch("/api/reconstruct/start", { method: "POST", body: form });
@@ -1454,8 +1515,15 @@ button.addEventListener("click", async () => {
       await renderResult(report, { selectionVersion });
     }
   } catch (error) {
-    if (selectionVersion === fileSelectionVersion) showError(error.message);
+    if (selectionVersion === fileSelectionVersion && !localController?.signal.aborted) showError(error.message);
   } finally {
+    if (browserLocal) {
+      const clear = document.querySelector("#clearFile");
+      if (clear) clear.disabled = false;
+      document.querySelector("#cancelConversion").classList.add("hidden");
+      localController = null;
+      updateEngineCopy();
+    }
     if (selectionVersion === fileSelectionVersion) {
       processing.classList.add("hidden");
       button.disabled = !selectedFile;
@@ -1476,6 +1544,8 @@ async function renderResult(report, options = {}) {
   const surfaceMode = report.engine === "surface_brep" && report.surface;
   const surfaceFallback = Boolean(surfaceMode && report.surface.faceted_fallback);
   const verifiedFallback = Boolean(surfaceFallback && report.surface.fallback_geometry_verified);
+  const exactFacets = verifiedFallback && report.implementation === "faceted";
+  const partialRecovery = verifiedFallback && report.implementation === "hybrid";
   const semantic = report.plan?.representation !== "sampled_approximation";
   document.querySelector("#resultTitle").textContent = complete
     ? surfaceMode
@@ -1484,7 +1554,8 @@ async function renderResult(report, options = {}) {
     : report.status === "best_effort"
       ? surfaceMode
         ? surfaceFallback
-          ? verifiedFallback ? "Faceted STEP ready" : "Analytic fit incomplete"
+          ? partialRecovery ? "Partial STEP ready"
+          : verifiedFallback ? "Faceted STEP ready" : "Analytic fit incomplete"
           : report.surface.closed
           ? "Best fitted surface solid produced"
           : "Surface recognition result ready"
@@ -1493,10 +1564,10 @@ async function renderResult(report, options = {}) {
         : "Geometric approximation produced"
       : "Automatic reconstruction stopped";
   const confidence = document.querySelector("#confidence");
-  confidence.className = `confidence ${complete ? "good" : "caution"}`;
-  confidence.textContent = report.status === "failed"
-    ? "Conversion failed"
-    : complete
+  confidence.className = `confidence ${complete || exactFacets ? "good" : "caution"}`;
+  confidence.textContent = report.status === "failed" ? "Conversion failed"
+    : partialRecovery ? "Verified solid"
+    : exactFacets ? "Verified faceted solid" : complete
     ? surfaceMode
       ? "Watertight verified solid"
       : "High-confidence match"
@@ -1510,7 +1581,9 @@ async function renderResult(report, options = {}) {
         ? "Best effort"
         : "Approximation only";
 
-  document.querySelector("#p95").textContent = formatMeasurement(report.score?.chamfer_p95_mm);
+  const bound = report.score?.deviation_bound_mm;
+  document.querySelector("#deviationLabel").textContent = bound === undefined ? "Deviation P95" : "Deviation bound";
+  document.querySelector("#p95").textContent = formatMeasurement(bound ?? report.score?.chamfer_p95_mm);
   const measuredMaxima = [report.score?.chamfer_max_mm, report.score?.local_max_mm]
     .filter(isNonnegativeMeasurement);
   document.querySelector("#maxDeviation").textContent = formatMeasurement(
@@ -1532,17 +1605,18 @@ async function renderResult(report, options = {}) {
   };
   document.querySelector("#construction").textContent =
     surfaceMode
-      ? `${report.surface.recognized_surface_count} surfaces`
+      ? exactFacets || partialRecovery ? `${report.surface.brep_face_count.toLocaleString()} faces` : `${report.surface.recognized_surface_count} surfaces`
       : featureCount > 1
       ? `${featureCount} features`
       : baseLabels[report.plan?.base?.kind] || "Parametric solid";
   document.querySelector("#constructionUnit").textContent = surfaceMode
-    ? surfaceFallback
+    ? partialRecovery ? "Planes merged"
+    : exactFacets ? "Source STL triangles" : surfaceFallback
       ? `${report.surface.brep_face_count} B-rep faces · ${report.surface.faceted_face_count} fallback`
       : `${report.surface.brep_face_count} fitted B-rep faces`
     : "parametric feature construction";
   document.querySelector("#constructionHeading").textContent = surfaceMode
-    ? "Recognized surface model"
+    ? partialRecovery ? "Partially reconstructed solid" : exactFacets ? "Faceted solid" : "Recognized surface model"
     : "Editable feature plan";
 
   const base = report.plan?.base;
@@ -1642,8 +1716,12 @@ async function renderResult(report, options = {}) {
         "STEP representation",
         report.surface.closed
           ? report.surface.faceted_fallback
-            ? report.surface.source_mesh_fallback
-              ? "Closed exact source-mesh faceted solid"
+            ? partialRecovery
+              ? "Closed solid with merged planar faces"
+              : report.surface.source_mesh_fallback
+              ? report.surface.simplified_fallback
+                ? "Closed faceted solid from a reduced mesh"
+                : "Closed source-mesh faceted solid"
               : "Closed hybrid analytic/conforming-facet solid"
             : "Closed analytic/B-spline solid"
           : report.surface.faceted_fallback
@@ -1660,7 +1738,7 @@ async function renderResult(report, options = {}) {
       ["Canonical vertices", String(report.surface.topology_vertex_count || 0)],
       ["Canonical edges", String(report.surface.topology_edge_count || 0)],
       ["Adjacent surface pairs", String(report.surface.adjacency_count)],
-      ["Sewn solids", String(report.surface.solid_count)],
+      ["Solid bodies", String(report.surface.solid_count)],
       ["Free edges", String(report.surface.free_edge_count)],
     );
     plan.innerHTML = details
@@ -1671,6 +1749,11 @@ async function renderResult(report, options = {}) {
   }
 
   const fileBase = `/api/runs/${report.id}/files`;
+  const artifactUrl = (name, query = "") => {
+    if (!browserLocal) return `${fileBase}/${name}${query}`;
+    if (!localUrls.has(name)) throw new Error(`Missing artifact: ${name}`);
+    return localUrls.get(name);
+  };
   const sourceStem = (report.mesh.file_name || "model.stl")
     .replace(/\.[^.]+$/, "")
     .replace(/[^A-Za-z0-9._-]+/g, "_")
@@ -1682,20 +1765,27 @@ async function renderResult(report, options = {}) {
     ? surfaceFallback
       ? `Rejected analytic fit · ${report.surface.faceted_face_count} fallback faces`
       : "Not accepted · inspect verification report"
+    : partialRecovery
+      ? "Verified STEP with remaining facets"
+    : exactFacets
+      ? "Verified solid with the original STL triangles"
     : verifiedFallback
       ? "Geometry verified; CAD surface recovery incomplete"
     : surfaceMode && report.surface.closed
       ? "Verified watertight B-rep"
       : "Reconstructed CAD model";
-  const hasOutput = report.status !== "failed";
+  const hasOutput = browserLocal ? localUrls.has("reconstruction.step") : report.status !== "failed";
   document.querySelector("#downloads").innerHTML = hasOutput
     ? `
-      <a class="download-primary" href="${fileBase}/reconstruction.step" download="${escapeHtml(reconstructedStepName)}">
+      <a class="download-primary" href="${artifactUrl("reconstruction.step")}" download="${escapeHtml(reconstructedStepName)}">
         <span><strong>${downloadTitle}</strong><small>${downloadDetail}</small></span><b>↓</b>
       </a>
     `
     : '<p class="no-output">No STEP file was produced for this run.</p>';
-  document.querySelector("#advancedDownloads").innerHTML = !hasOutput
+  document.querySelector("#advancedDownloads").innerHTML = browserLocal
+    ? [...localUrls].filter(([name]) => name !== "reconstruction.step")
+      .map(([name, url]) => `<a href="${url}" download="${escapeHtml(name)}">${escapeHtml(name)} <b>↓</b></a>`).join("")
+    : !hasOutput
     ? `<a href="${fileBase}/report.json" download>Failure report <b>↓</b></a>`
     : surfaceMode
       ? `
@@ -1726,7 +1816,8 @@ async function renderResult(report, options = {}) {
   document.querySelector("#results").classList.remove("hidden");
 
   if (report.status !== "failed") {
-    if (report.plan) {
+    inputTriangleLegend.classList.add("hidden");
+    if (!browserLocal && report.plan) {
       initializeFeatureEditor(report);
     } else {
       activeReport = report;
@@ -1734,7 +1825,7 @@ async function renderResult(report, options = {}) {
       featureEditor.classList.add("hidden");
     }
     try {
-      const response = await fetch(`${fileBase}/reconstruction.stl?revision=${report.plan?.revision || 0}`, {
+      const response = await fetch(artifactUrl("reconstruction.stl", `?revision=${report.plan?.revision || 0}`), {
         cache: "no-store",
       });
       if (!response.ok) throw new Error();
@@ -1757,15 +1848,19 @@ async function renderResult(report, options = {}) {
     }
     let sourceMeshBuffer = null;
     try {
-      const sourceResponse = await fetch(`${fileBase}/input.stl`, { cache: "no-store" });
-      if (!current()) return;
-      if (sourceResponse.ok && Number(sourceResponse.headers.get("content-length")) <= MAX_PREVIEW_BYTES) {
-        sourceMeshBuffer = await sourceResponse.arrayBuffer();
-        if (!current()) return;
-        inputViewer ||= new MeshViewer(inputCanvas, 0x8ebbd2);
-        await inputViewer.load(sourceMeshBuffer.slice(0));
+      if (browserLocal) {
+        if (inputViewer && selectedFile.size <= MAX_PREVIEW_BYTES) sourceMeshBuffer = await selectedFile.arrayBuffer();
       } else {
-        await sourceResponse.body?.cancel();
+        const sourceResponse = await fetch(`${fileBase}/input.stl`, { cache: "no-store" });
+        if (!current()) return;
+        if (sourceResponse.ok && Number(sourceResponse.headers.get("content-length")) <= MAX_PREVIEW_BYTES) {
+          sourceMeshBuffer = await sourceResponse.arrayBuffer();
+          if (!current()) return;
+          inputViewer ||= new MeshViewer(inputCanvas, 0x8ebbd2);
+          await inputViewer.load(sourceMeshBuffer.slice(0));
+        } else {
+          await sourceResponse.body?.cancel();
+        }
       }
     } catch {
       // The STEP result remains usable if an older saved run has no source preview.
@@ -1773,7 +1868,7 @@ async function renderResult(report, options = {}) {
     if (!current()) return;
     if (surfaceMode) {
       try {
-        const graphResponse = await fetch(`${fileBase}/surface_graph.json`, { cache: "no-store" });
+        const graphResponse = await fetch(artifactUrl("surface_graph.json"), { cache: "no-store" });
         if (graphResponse.ok) {
           const surfaceGraph = await graphResponse.json();
           if (!current()) return;
@@ -1782,8 +1877,11 @@ async function renderResult(report, options = {}) {
             sourceMeshBuffer,
             Number(report.mesh.unit_scale) || 1,
           );
+          document.querySelector("#surfaceBoundaryLabel").textContent = overlay.hasStepEdges
+            ? "STEP edges" : "Fitted surface boundary";
           surfaceLegendStatus.textContent = overlay.triangleCount
             ? `${overlay.triangleCount.toLocaleString()} fallback triangles shown`
+            : partialRecovery ? `${report.surface.faceted_face_count.toLocaleString()} source facets retained`
             : report.surface.faceted_face_count
             ? "Fallback faces present; detailed overlay unavailable"
             : "No triangle fallback used";
@@ -1794,7 +1892,7 @@ async function renderResult(report, options = {}) {
         surfaceLegend.classList.add("hidden");
       }
     }
-    viewTabs.classList.remove("hidden");
+    viewTabs.classList.toggle("hidden", !sourceMeshBuffer || outputCanvas.classList.contains("hidden"));
     viewTabs.querySelector('[data-view="input"]').disabled = !sourceMeshBuffer;
     [...viewTabs.children].forEach((item) => {
       const active = item.dataset.view === "output";
@@ -1809,7 +1907,7 @@ async function renderResult(report, options = {}) {
 }
 
 const requestedRun = new URLSearchParams(window.location.search).get("run");
-if (/^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestedRun || "")) {
+if (!browserLocal && /^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestedRun || "")) {
   const selectionVersion = fileSelectionVersion;
   button.disabled = true;
   processing.classList.remove("hidden");

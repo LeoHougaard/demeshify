@@ -1,0 +1,18 @@
+{
+  "fusion_official_test": [
+    "23010_f07fdf61_15",
+    "134602_7dd4fb67_0",
+    "41142_1bf94ee2_13",
+    "36451_1a7f9437_9",
+    "81145_14516907_0"
+  ],
+  "voron_stealthburner_cw2": [
+    "voron-stealthburner-cw2-a-guidler-b-039a7215df",
+    "voron-stealthburner-cw2-main-body-243f74cac6",
+    "voron-stealthburner-cw2-motor-plate-a324e43b15",
+    "voron-stealthburner-cw2-stealthburner-printhead-revo-voron-rear-cw-d99784c244"
+  ],
+  "voron_tap_r8": [
+    "voron-tap-r8-printed-cut-guide-2855f7a654"
+  ]
+}
