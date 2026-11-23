@@ -55,6 +55,92 @@ def _direction_vector(
     return vector.normalized().multiply(depth)
 
 
+def _through_extent(
+    shape: cq.Workplane,
+    origin: cq.Vector,
+    direction: cq.Vector,
+    depth: float,
+) -> tuple[cq.Vector, float]:
+    """Extend an operation across the current solid without losing its measured span."""
+
+    bounds = shape.val().BoundingBox()
+    direction = direction.normalized()
+    corners = [
+        cq.Vector(x, y, z)
+        for x in (bounds.xmin, bounds.xmax)
+        for y in (bounds.ymin, bounds.ymax)
+        for z in (bounds.zmin, bounds.zmax)
+    ]
+    projections = [(point - origin).dot(direction) for point in corners]
+    margin = max(bounds.DiagonalLength * 1e-9, 1e-9)
+    start = min(projections) - margin
+    end = max(projections) + margin
+    return origin + direction.multiply(start), end - start
+
+
+def _round_hole_cutter_for_result(
+    result: cq.Workplane,
+    operation: RoundHoleFeature,
+) -> cq.Workplane:
+    if not operation.through:
+        return _hole_cutter(operation)
+    if operation.axis == Axis.X:
+        origin = cq.Vector(operation.start, *operation.center)
+        direction = cq.Vector(1, 0, 0)
+        axis_index = 0
+    elif operation.axis == Axis.Y:
+        origin = cq.Vector(operation.center[0], operation.start, -operation.center[1])
+        direction = cq.Vector(0, 1, 0)
+        axis_index = 1
+    else:
+        origin = cq.Vector(*operation.center, operation.start)
+        direction = cq.Vector(0, 0, 1)
+        axis_index = 2
+    through_origin, through_depth = _through_extent(
+        result, origin, direction, operation.depth
+    )
+    adjusted = operation.model_copy(deep=True)
+    adjusted.start = through_origin.toTuple()[axis_index]
+    adjusted.depth = through_depth
+    return _hole_cutter(adjusted)
+
+
+def _oriented_cylinder_for_result(
+    result: cq.Workplane,
+    operation: OrientedCylinderFeature,
+) -> cq.Workplane:
+    if not operation.through:
+        return _oriented_cylinder(operation)
+    origin, depth = _through_extent(
+        result,
+        cq.Vector(*operation.origin),
+        cq.Vector(*operation.direction),
+        operation.depth,
+    )
+    adjusted = operation.model_copy(deep=True)
+    adjusted.origin = origin.toTuple()
+    adjusted.depth = depth
+    return _oriented_cylinder(adjusted)
+
+
+def _oriented_extrusion_for_result(
+    result: cq.Workplane,
+    operation: OrientedBooleanExtrudeFeature,
+) -> cq.Workplane:
+    if operation.extent_kind != "through_all":
+        return _oriented_boolean_extrusion(operation)
+    origin, depth = _through_extent(
+        result,
+        cq.Vector(*operation.origin),
+        cq.Vector(*operation.direction),
+        operation.depth,
+    )
+    adjusted = operation.model_copy(deep=True)
+    adjusted.origin = origin.toTuple()
+    adjusted.depth = depth
+    return _oriented_boolean_extrusion(adjusted)
+
+
 def _profile_solid(profile: Profile, plane: cq.Plane, depth: float) -> cq.Workplane:
     workplane = cq.Workplane(plane)
     if isinstance(profile, CircleProfile):
@@ -612,7 +698,9 @@ def build_plan(plan: ReconstructionPlan) -> cq.Workplane:
         result = _apply_edge_finish(result, finish)
     for operation_index, operation in enumerate(plan.operations):
         if isinstance(operation, RoundHoleFeature):
-            result = result.cut(_hole_cutter(operation))
+            result = result.cut(_round_hole_cutter_for_result(result, operation))
+            for finish in feature_finishes.get(operation_index, []):
+                result = _apply_edge_finish(result, finish)
         elif isinstance(operation, ConicalHoleFeature):
             result = result.cut(_conical_hole_cutter(operation))
         elif isinstance(operation, ConicalAddFeature):
@@ -622,20 +710,37 @@ def build_plan(plan: ReconstructionPlan) -> cq.Workplane:
             result = result.union(tool)
         elif isinstance(operation, BooleanExtrudeFeature):
             tool = _boolean_extrusion(operation)
-            for finish in feature_finishes.get(operation_index, []):
-                tool = _apply_edge_finish(tool, finish)
-            result = result.union(tool) if operation.mode == "add" else result.cut(tool)
+            if operation.mode == "add":
+                for finish in feature_finishes.get(operation_index, []):
+                    tool = _apply_edge_finish(tool, finish)
+                result = result.union(tool)
+            else:
+                result = result.cut(tool)
+                for finish in feature_finishes.get(operation_index, []):
+                    result = _apply_edge_finish(result, finish)
         elif isinstance(operation, OrientedCylinderFeature):
-            tool = _oriented_cylinder(operation)
-            for finish in feature_finishes.get(operation_index, []):
-                tool = _apply_edge_finish(tool, finish)
-            result = result.union(tool) if operation.mode == "add" else result.cut(tool)
+            tool = _oriented_cylinder_for_result(result, operation)
+            if operation.mode == "add":
+                for finish in feature_finishes.get(operation_index, []):
+                    tool = _apply_edge_finish(tool, finish)
+                result = result.union(tool)
+            else:
+                result = result.cut(tool)
+                for finish in feature_finishes.get(operation_index, []):
+                    result = _apply_edge_finish(result, finish)
         elif isinstance(operation, SphereFeature):
             tool = _sphere(operation)
             result = result.union(tool) if operation.mode == "add" else result.cut(tool)
         elif isinstance(operation, OrientedBooleanExtrudeFeature):
-            tool = _oriented_boolean_extrusion(operation)
-            result = result.union(tool) if operation.mode == "add" else result.cut(tool)
+            tool = _oriented_extrusion_for_result(result, operation)
+            if operation.mode == "add":
+                for finish in feature_finishes.get(operation_index, []):
+                    tool = _apply_edge_finish(tool, finish)
+                result = result.union(tool)
+            else:
+                result = result.cut(tool)
+                for finish in feature_finishes.get(operation_index, []):
+                    result = _apply_edge_finish(result, finish)
         elif isinstance(operation, TaperedAddFeature):
             result = result.union(_tapered_addition(operation))
         elif isinstance(operation, EdgeFinishFeature) and operation.feature_index is None:
@@ -893,6 +998,30 @@ def plan_to_source(plan: ReconstructionPlan) -> str:
         "import cadquery as cq",
         "",
     ]
+    if any(
+        getattr(operation, "through", False)
+        or getattr(operation, "extent_kind", None) == "through_all"
+        for operation in plan.operations
+    ):
+        lines.extend(
+            [
+                "def _through_extent(shape, origin, direction, depth):",
+                "    bounds = shape.val().BoundingBox()",
+                "    direction = direction.normalized()",
+                "    corners = [",
+                "        cq.Vector(x, y, z)",
+                "        for x in (bounds.xmin, bounds.xmax)",
+                "        for y in (bounds.ymin, bounds.ymax)",
+                "        for z in (bounds.zmin, bounds.zmax)",
+                "    ]",
+                "    projections = [(point - origin).dot(direction) for point in corners]",
+                "    margin = max(bounds.DiagonalLength * 1e-9, 1e-9)",
+                "    start = min(projections) - margin",
+                "    end = max(projections) + margin",
+                "    return origin + direction.multiply(start), end - start",
+                "",
+            ]
+        )
     if isinstance(base, RevolveFeature):
         if base.axis == Axis.X:
             origin = f"cq.Vector(0, {base.center[0]!r}, {base.center[1]!r})"
@@ -1028,13 +1157,26 @@ def plan_to_source(plan: ReconstructionPlan) -> str:
                 lines.extend(_edge_finish_source(operation, index, "result"))
             continue
         if isinstance(operation, OrientedCylinderFeature):
+            if operation.through:
+                lines.append(
+                    f"feature_origin_{index}, feature_depth_{index} = _through_extent("
+                    f"result, cq.Vector{operation.origin!r}, "
+                    f"cq.Vector{operation.direction!r}, {operation.depth!r})"
+                )
+            else:
+                lines.extend(
+                    [
+                        f"feature_origin_{index} = cq.Vector{operation.origin!r}",
+                        f"feature_depth_{index} = {operation.depth!r}",
+                    ]
+                )
             lines.extend(
                 [
                     "",
                     f"feature_{index} = cq.Workplane(obj=cq.Solid.makeCylinder(",
                     f"    {operation.radius!r},",
-                    f"    {operation.depth!r},",
-                    f"    cq.Vector{operation.origin!r},",
+                    f"    feature_depth_{index},",
+                    f"    feature_origin_{index},",
                     f"    cq.Vector{operation.direction!r}.normalized(),",
                     "))",
                 ]
@@ -1045,8 +1187,8 @@ def plan_to_source(plan: ReconstructionPlan) -> str:
                         f"feature_{index}_inner = cq.Workplane(",
                         "    obj=cq.Solid.makeCylinder(",
                         f"        {operation.inner_radius!r},",
-                        f"        {operation.depth!r},",
-                        f"        cq.Vector{operation.origin!r},",
+                        f"        feature_depth_{index},",
+                        f"        feature_origin_{index},",
                         f"        cq.Vector{operation.direction!r}.normalized(),",
                         "    )",
                         ")",
@@ -1054,12 +1196,18 @@ def plan_to_source(plan: ReconstructionPlan) -> str:
                         f"feature_{index}_inner)",
                     ]
                 )
-            for finish_index, finish in feature_finishes.get(index, []):
-                lines.extend(
-                    _edge_finish_source(finish, finish_index, f"feature_{index}")
-                )
-            method = "union" if operation.mode == "add" else "cut"
-            lines.append(f"result = result.{method}(feature_{index})")
+            if operation.mode == "add":
+                for finish_index, finish in feature_finishes.get(index, []):
+                    lines.extend(
+                        _edge_finish_source(finish, finish_index, f"feature_{index}")
+                    )
+                lines.append(f"result = result.union(feature_{index})")
+            else:
+                lines.append(f"result = result.cut(feature_{index})")
+                for finish_index, finish in feature_finishes.get(index, []):
+                    lines.extend(
+                        _edge_finish_source(finish, finish_index, "result")
+                    )
             continue
         if isinstance(operation, SphereFeature):
             method = "union" if operation.mode == "add" else "cut"
@@ -1078,18 +1226,28 @@ def plan_to_source(plan: ReconstructionPlan) -> str:
             plane_name = f"feature_plane_{index}"
             profile_name = f"feature_profile_{index}"
             plane_normal = operation.plane_normal or operation.direction
-            direction_length = sum(
-                value * value for value in operation.direction
-            ) ** 0.5
-            vector = tuple(
-                float(component) / direction_length * operation.depth
-                for component in operation.direction
+            if operation.extent_kind == "through_all":
+                lines.append(
+                    f"feature_origin_{index}, feature_depth_{index} = _through_extent("
+                    f"result, cq.Vector{operation.origin!r}, "
+                    f"cq.Vector{operation.direction!r}, {operation.depth!r})"
+                )
+            else:
+                lines.extend(
+                    [
+                        f"feature_origin_{index} = cq.Vector{operation.origin!r}",
+                        f"feature_depth_{index} = {operation.depth!r}",
+                    ]
+                )
+            vector = (
+                f"cq.Vector{operation.direction!r}.normalized()"
+                f".multiply(feature_depth_{index})"
             )
             lines.extend(
                 [
                     "",
                     f"{plane_name} = cq.Plane(",
-                    f"    origin={operation.origin!r},",
+                    f"    origin=feature_origin_{index},",
                     f"    xDir={operation.x_direction!r},",
                     f"    normal={plane_normal!r},",
                     ")",
@@ -1108,7 +1266,7 @@ def plan_to_source(plan: ReconstructionPlan) -> str:
                     f"feature_{index} = cq.Workplane(obj=cq.Solid.extrudeLinear(",
                     f"    {profile_name}.val(),",
                     f"    [{', '.join(hole_names)}],",
-                    f"    cq.Vector{vector!r},",
+                    f"    {vector},",
                     "))",
                 ]
             )
@@ -1119,14 +1277,24 @@ def plan_to_source(plan: ReconstructionPlan) -> str:
                     [
                         f"{region_name}_solid = cq.Workplane("
                         "obj=cq.Solid.extrudeLinear(",
-                        f"    {region_name}.val(), [], cq.Vector{vector!r},",
+                        f"    {region_name}.val(), [], {vector},",
                         "))",
                         f"feature_{index} = feature_{index}.union("
                         f"{region_name}_solid)",
                     ]
                 )
-            method = "union" if operation.mode == "add" else "cut"
-            lines.append(f"result = result.{method}(feature_{index})")
+            if operation.mode == "add":
+                for finish_index, finish in feature_finishes.get(index, []):
+                    lines.extend(
+                        _edge_finish_source(finish, finish_index, f"feature_{index}")
+                    )
+                lines.append(f"result = result.union(feature_{index})")
+            else:
+                lines.append(f"result = result.cut(feature_{index})")
+                for finish_index, finish in feature_finishes.get(index, []):
+                    lines.extend(
+                        _edge_finish_source(finish, finish_index, "result")
+                    )
             continue
         if operation.axis == Axis.X:
             operation_plane = (
@@ -1317,19 +1485,70 @@ def plan_to_source(plan: ReconstructionPlan) -> str:
                 ]
             )
         elif isinstance(operation, RoundHoleFeature):
+            if operation.through:
+                if operation.axis == Axis.X:
+                    origin = (
+                        f"cq.Vector({operation.start!r}, {operation.center[0]!r}, "
+                        f"{operation.center[1]!r})"
+                    )
+                    direction = "cq.Vector(1, 0, 0)"
+                    start = f"hole_origin_{index}.x"
+                    plane = (
+                        f"cq.Plane(origin=({start}, 0, 0), "
+                        "xDir=(0, 1, 0), normal=(1, 0, 0))"
+                    )
+                elif operation.axis == Axis.Y:
+                    origin = (
+                        f"cq.Vector({operation.center[0]!r}, {operation.start!r}, "
+                        f"{-operation.center[1]!r})"
+                    )
+                    direction = "cq.Vector(0, 1, 0)"
+                    start = f"hole_origin_{index}.y"
+                    plane = (
+                        f"cq.Plane(origin=(0, {start}, 0), "
+                        "xDir=(1, 0, 0), normal=(0, 1, 0))"
+                    )
+                else:
+                    origin = (
+                        f"cq.Vector({operation.center[0]!r}, {operation.center[1]!r}, "
+                        f"{operation.start!r})"
+                    )
+                    direction = "cq.Vector(0, 0, 1)"
+                    start = f"hole_origin_{index}.z"
+                    plane = (
+                        f"cq.Plane(origin=(0, 0, {start}), "
+                        "xDir=(1, 0, 0), normal=(0, 0, 1))"
+                    )
+                lines.extend(
+                    [
+                        f"hole_origin_{index}, hole_depth_{index} = _through_extent("
+                        f"result, {origin}, {direction}, {operation.depth!r})",
+                        f"hole_plane_{index} = {plane}",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        f"hole_depth_{index} = {operation.depth!r}",
+                        f"hole_plane_{index} = {operation_plane}",
+                    ]
+                )
             lines.extend(
                 [
                     "",
-                    f"hole_plane_{index} = {operation_plane}",
                     f"cutter_{index} = (",
                     f"    cq.Workplane(hole_plane_{index})",
                     f"    .center({operation.center[0]!r}, {operation.center[1]!r})",
                     f"    .circle({operation.diameter / 2!r})",
-                    f"    .extrude({operation.depth!r})",
+                    f"    .extrude(hole_depth_{index})",
                     ")",
-                    f"result = result.cut(cutter_{index})",
                 ]
             )
+            lines.append(f"result = result.cut(cutter_{index})")
+            for finish_index, finish in feature_finishes.get(index, []):
+                lines.extend(
+                    _edge_finish_source(finish, finish_index, "result")
+                )
         elif isinstance(operation, BooleanExtrudeFeature):
             plane_name = f"feature_plane_{index}"
             profile_name = f"feature_profile_{index}"
@@ -1350,12 +1569,18 @@ def plan_to_source(plan: ReconstructionPlan) -> str:
                     f"feature_{index} = feature_{index}.union("
                     f"{region_name}.extrude({operation.depth!r}))"
                 )
-            for finish_index, finish in feature_finishes.get(index, []):
-                lines.extend(
-                    _edge_finish_source(finish, finish_index, f"feature_{index}")
-                )
-            method = "union" if operation.mode == "add" else "cut"
-            lines.append(f"result = result.{method}(feature_{index})")
+            if operation.mode == "add":
+                for finish_index, finish in feature_finishes.get(index, []):
+                    lines.extend(
+                        _edge_finish_source(finish, finish_index, f"feature_{index}")
+                    )
+                lines.append(f"result = result.union(feature_{index})")
+            else:
+                lines.append(f"result = result.cut(feature_{index})")
+                for finish_index, finish in feature_finishes.get(index, []):
+                    lines.extend(
+                        _edge_finish_source(finish, finish_index, "result")
+                    )
     lines.extend(
         [
             "",

@@ -95,29 +95,83 @@ def _step_mesh(shape: cq.Shape, tolerance: float) -> trimesh.Trimesh:
     )
 
 
+def _spatial_samples(points: np.ndarray, maximum: int) -> np.ndarray:
+    """Select deterministic voxel representatives and global geometric extrema."""
+
+    ordered = points[np.lexsort((points[:, 2], points[:, 1], points[:, 0]))]
+    extrema = []
+    for axis in range(3):
+        coordinates = ordered[:, axis]
+        for value in (np.min(coordinates), np.max(coordinates)):
+            # Lexicographic tie-breaking makes the result independent of input order.
+            extrema.append(ordered[np.flatnonzero(coordinates == value)[0]])
+    extrema = np.unique(np.asarray(extrema), axis=0)
+    if len(extrema) >= maximum:
+        return extrema[:maximum]
+
+    origin = np.min(ordered, axis=0)
+    span = np.ptp(ordered, axis=0)
+    span[span == 0] = 1
+    budget = maximum - len(extrema)
+
+    def cell_starts(resolution: int) -> np.ndarray:
+        cells = ((ordered - origin) / span * resolution).astype(np.int64)
+        cells = np.minimum(cells, resolution - 1)
+        keys = (cells[:, 0] * resolution + cells[:, 1]) * resolution + cells[:, 2]
+        return np.unique(keys, return_index=True)[1]
+
+    # Use the finest grid that fits the budget. On surfaces this adapts to their
+    # occupied voxels instead of wasting most probes on an empty 3-D grid.
+    low = 1
+    best = cell_starts(low)
+    high = 2
+    while len(best) < budget:
+        current = cell_starts(high)
+        if len(current) > budget:
+            while high - low > 1:
+                middle = (low + high) // 2
+                candidate = cell_starts(middle)
+                if len(candidate) <= budget:
+                    low, best = middle, candidate
+                else:
+                    high = middle
+            break
+        low, best = high, current
+        if len(best) == budget or high == budget:
+            break
+        high = min(high * 2, budget)
+
+    return np.unique(np.vstack((extrema, ordered[best])), axis=0)
+
+
 def _local_samples(mesh: trimesh.Trimesh) -> np.ndarray:
     """Include mesh nodes and small triangle interiors regardless of their area.
 
     Uniform area sampling alone can miss a narrow bore. Bound the extra work on
-    dense inputs; component correspondence is checked separately and never sampled.
+    dense inputs with spatial representatives rather than arbitrary file ordering;
+    component correspondence is checked separately and never sampled.
     """
 
     maximum = 20_000
     vertices = np.asarray(mesh.vertices)
     if len(vertices) > maximum:
-        vertices = vertices[np.linspace(0, len(vertices) - 1, maximum, dtype=int)]
-    count = len(mesh.faces)
-    indices = (
-        np.arange(count)
-        if count <= maximum
-        else np.unique(
-            np.r_[
-                np.linspace(0, count - 1, maximum // 2, dtype=int),
-                np.argpartition(mesh.area_faces, maximum // 2)[: maximum // 2],
-            ]
+        vertices = _spatial_samples(vertices, maximum)
+    centers = mesh.vertices[mesh.faces].mean(axis=1)
+    if len(centers) > maximum:
+        # Preserve the small-triangle bias, with geometric tie-breaking for the
+        # equal-area triangles produced by regular tessellations.
+        order = np.lexsort(
+            (centers[:, 2], centers[:, 1], centers[:, 0], mesh.area_faces)
         )
-    )
-    centers = mesh.vertices[mesh.faces[indices]].mean(axis=1)
+        centers = np.unique(
+            np.vstack(
+                (
+                    _spatial_samples(centers, maximum // 2),
+                    centers[order[: maximum // 2]],
+                )
+            ),
+            axis=0,
+        )
     return np.vstack((vertices, centers))
 
 

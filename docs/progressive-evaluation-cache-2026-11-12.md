@@ -54,8 +54,11 @@ actual Git revision. Cached results retain the original conversion revision.
 Different code, geometry, settings or runtime require a new run. Legacy output
 contracts are preserved and are not silently migrated.
 
-An immutable shared case cache allows a larger cohort to reuse identical prior
-cases. Reports explicitly distinguish fresh conversions, shared reuse and reuse
+A shared case cache allows a larger cohort to locate identical prior cases. Its
+JSON records are editable evidence, not immutable proof of acceptance. Passing
+outcomes are freshly converted and graded before they can be published again;
+non-passing outcomes may resume directly, and contradictory records are rejected.
+Reports explicitly distinguish fresh work, shared reuse, revalidation and reuse
 within the same resumed run. `--fresh` skips the shared cache while still resuming
 completed cases in that run; use a new output path for a fresh matched experiment.
 Artifacts remain at their recorded original location. Existing strict gates,
@@ -70,8 +73,10 @@ shared cache, and the original run can resume after the source is restored. Thes
 use fake worker bytes and do not count as CAD fixtures or reconstruction evidence.
 The final selected regression suite passes 26 tests in 19.56 seconds; Ruff passes.
 
-The actual workflow was then exercised on development q01, q00 and q09 of source
-`5b7f2dd6f8dee0946745`, with converter source `6ead82d`:
+The reuse workflow below predates mandatory passing-result revalidation. Current
+builds freshly convert and grade those cached successes instead of publishing
+them without new work. The actual historical workflow was exercised on development
+q01, q00 and q09 of source `5b7f2dd6f8dee0946745`, with converter source `6ead82d`:
 
 1. A two-case run performs two fresh conversions.
 2. Expanding to three cases reuses those two and performs one new conversion.

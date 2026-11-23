@@ -168,6 +168,8 @@ class OrientedExtrudeFeature(FeatureNode):
             )
         if abs(dot) / (normal_length * x_length) > 1e-4:
             raise ValueError("plane_normal and x_direction must be perpendicular")
+        if self.extent_kind == "through_all":
+            raise ValueError("A base extrusion cannot be through-all")
         if self.extent_kind == "up_to_patch" and not self.terminating_patch_id:
             raise ValueError("up_to_patch extrusions require terminating_patch_id")
         return self

@@ -14,6 +14,31 @@ printing, or using it as a manufacturing reference.
 
 ## Use it in a browser
 
+[Open Demeshify](https://demeshify.lakebed.app/) for the browser beta.
+
+The browser-local build runs surface reconstruction and STEP verification on the
+device. The first conversion downloads the CAD runtime. STL inputs and generated
+files stay in the tab. Save the STEP before closing or reloading it.
+
+To build and try the browser-local version from this checkout:
+
+```text
+npm --prefix web ci
+npm --prefix web run build:browser
+cd web
+npm exec -- vite preview --mode browser
+```
+
+The static build is in `web/dist-browser`. The default mode quickly reconstructs
+straight extrusions at any orientation, including files containing separate
+extruded bodies. Other shapes use the full surface reconstruction engine.
+**Advanced ? Fast faceted solid** preserves the STL triangles as STEP faces. It
+supports up to 32 separated, closed shells and 20,000 total triangles. Both
+paths reopen each STEP to verify the export. Conversion has no fixed time limit;
+use **Cancel** to stop it. Large meshes can exceed the browser's available memory.
+
+## Run the native engine
+
 The quickest path is the **Open in GitHub Codespaces** button above. GitHub builds
 the environment, starts the converter, and opens port 8421 in a private browser
 tab. The first setup can take several minutes and uses roughly 1.1 GiB for the
@@ -52,7 +77,10 @@ download flow without finding an STL first.
 Choose the STL export units before converting and check the displayed output
 size. STL files do not store units. For example, a 0.18 × 0.25 model exported in
 metres should become 180 × 250 mm. The viewer loads the file in your browser;
-conversion and downloads require the local server to remain running.
+conversion and downloads require the local server to remain running. You can switch
+tabs while a conversion runs. If you allow browser notifications when prompted,
+the converter notifies you when a background conversion finishes; clicking the
+notification reopens that run's result.
 
 ## Reconstruction modes
 

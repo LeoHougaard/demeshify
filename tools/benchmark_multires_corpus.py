@@ -19,9 +19,9 @@ from app.jobs import reconstruct_in_worker, run_bounded_process  # noqa: E402
 from app.storage import atomic_write_text  # noqa: E402
 from tools import benchmark_surface_corpus as benchmark  # noqa: E402
 from tools.evaluation_identity import (  # noqa: E402
-    cached_result,
     case_identity,
     digest,
+    read_cached_result,
     runtime_identity,
     source_identity,
 )
@@ -149,6 +149,7 @@ def summary(results: list[dict], expected: list[dict]) -> dict:
         'complete': len(results) == len(expected),
         'fresh_cases': sum(not r.get('reused', False) for r in results),
         'reused_cases': sum(bool(r.get('reused')) for r in results),
+        'revalidated_cases': sum(bool(r.get('cache_revalidated')) for r in results),
         'strict_case_passes': sum(bool(r.get('accepted')) for r in results),
         'strict_case_rate': (sum(bool(r.get('accepted')) for r in results) / len(results)
                              if results else None),
@@ -225,10 +226,19 @@ def main() -> None:
         fingerprint = case_identity(case, source_hashes, runtime)
         path = cache / f'{case["id"]}.json'
         shared_path = shared_cache / f'{fingerprint}.json'
-        result = cached_result(path, fingerprint)
+        cached = read_cached_result(path, fingerprint)
+        # An editable JSON success is only a locator for work to revalidate, never
+        # authority to publish its old acceptance/metrics. Non-passing outcomes
+        # can still resume without manufacturing a pass.
+        cache_revalidated = cached is not None and cached.get('accepted') is True
+        cache_revalidated_from = 'this_run' if cache_revalidated else None
+        result = None if cache_revalidated else cached
         reused_from = 'this_run' if result is not None else None
-        if result is None and not args.fresh:
-            result = cached_result(shared_path, fingerprint)
+        if result is None and not cache_revalidated and not args.fresh:
+            cached = read_cached_result(shared_path, fingerprint)
+            cache_revalidated = cached is not None and cached.get('accepted') is True
+            cache_revalidated_from = 'shared_cache' if cache_revalidated else None
+            result = None if cache_revalidated else cached
             if result is not None:
                 reused_from = 'shared_cache'
                 atomic_write_text(path, json.dumps(result, indent=2))
@@ -273,8 +283,12 @@ def main() -> None:
             atomic_write_text(path, json.dumps(result, indent=2))
             if not shared_path.exists():
                 atomic_write_text(shared_path, json.dumps(result, indent=2))
-            fresh_completed += 1
-        results.append({**result, 'reused': reused, 'reused_from': reused_from})
+            # Revalidating an old success is fresh conversion/grading work, but
+            # does not consume a new-case batch slot or starve later case IDs.
+            fresh_completed += int(not cache_revalidated)
+        results.append({**result, 'reused': reused, 'reused_from': reused_from,
+                        'cache_revalidated': cache_revalidated,
+                        'cache_revalidated_from': cache_revalidated_from})
         if source_identity(ROOT) != source_hashes:
             raise RuntimeError('Source changed during evaluation; do not combine results')
         batch_complete = bool(args.batch_cases and fresh_completed >= args.batch_cases)

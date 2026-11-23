@@ -24,6 +24,7 @@ from collections import Counter
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = (
@@ -545,6 +546,9 @@ def _summary(results: list[dict], expected: list[dict], backend, manifest: dict)
         "complete": len(results) == len(expected) and certified == len(expected),
         "fresh_cases": sum(row["reused"] is False for row in results),
         "reused_cases": sum(row["reused"] is True for row in results),
+        "cache_revalidated_cases": sum(
+            row.get("cache_revalidated") is True for row in results
+        ),
         "strict_case_passes": passed,
         "strict_case_rate_among_attempted": passed / len(results) if results else None,
         "strict_case_rate_among_certified": passed / certified if certified else None,
@@ -657,10 +661,25 @@ def _load_completed(path: Path, fingerprint: str, root: Path) -> dict | None:
         or envelope["result"].get("execution_certified") is not True
     ):
         raise ControllerError("Completed cache record is foreign, changed or uncertified")
+    result = envelope["result"]
+    accepted = result.get("accepted")
+    if type(accepted) is not bool:
+        raise ControllerError("Completed cache record has non-boolean acceptance")
+    if (
+        accepted and (
+            result.get("stl_strict_accepted") is False
+            or result.get("reference_geometry_accepted") is False
+        )
+    ) or (
+        not accepted
+        and result.get("stl_strict_accepted") is True
+        and result.get("reference_geometry_accepted") is True
+    ):
+        raise ControllerError("Completed cache record contradicts its component gates")
     retained = Path(envelope["retained"])
     if _retained_hashes(retained, root) != envelope["retained_sha256"]:
         raise ControllerError("Completed retained output changed; preserve evidence")
-    return envelope["result"]
+    return result
 
 
 def _save_completed(
@@ -909,16 +928,97 @@ def run_controller(configuration: Configuration, *, _backend=None) -> dict:
             cleanup()
 
 
+def _revalidate_scored_cache(
+    reused: dict,
+    case: dict,
+    identity: dict,
+    configuration: Configuration,
+    backend,
+    root: Path,
+) -> dict:
+    """Reuse a sealed conversion only after a fresh grade proves its outcome."""
+
+    if reused.get("accepted") is not True:
+        return reused
+    try:
+        _check_identities(backend, identity)
+        retained = Path(reused["attempt"]) / "retained"
+        attestation = reused["conversion_attestation"]
+        hashes = _validate_attestation(
+            SimpleNamespace(attestation=attestation), case, identity, retained, root
+        )
+        attempt_root = configuration.output.parent / (
+            configuration.output.stem + "-cache-revalidations"
+        )
+        attempt_root.mkdir(exist_ok=True)
+        attempt = attempt_root / uuid.uuid4().hex
+        attempt.mkdir()
+        configuration_data = {
+            "grader_manifest_sha256": configuration.grader_sha256,
+            "case": case,
+            "manifest_parent": str(configuration.manifest.parent.resolve()),
+            "scratch_root": _scratch_root(root),
+            "retained_sha256": {
+                name: value
+                for name, value in hashes.items()
+                if name in backend.allowed_outputs
+            },
+        }
+        case_path = attempt / "grader-case.json"
+        _atomic(case_path, configuration_data, root, exclusive=True)
+        grade_artifacts = (
+            configuration.artifacts / attempt.name
+            if configuration.artifacts is not None
+            else None
+        )
+        started = time.perf_counter()
+        grade = backend.grade(
+            case_path,
+            retained,
+            attempt / "grade.json",
+            grade_artifacts,
+            timeout=GRADING_TIMEOUT,
+        )
+        grade_wall = time.perf_counter() - started
+        _validate_grade(grade, configuration_data, case_path, identity)
+        _fixture(case)
+        _check_identities(backend, identity)
+        if _retained_hashes(retained, root) != hashes:
+            raise ControllerError("Retained output changed during cache revalidation")
+    except Exception as exc:
+        # Preserve the native seal proof's type for callers monitoring catalog
+        # changes; all other failed revalidations fail closed as controller errors.
+        if type(exc).__name__ == "SealError":
+            raise
+        # A cached success is only a locator, never authority to publish a pass.
+        raise ControllerError("Cached success could not be freshly revalidated") from exc
+    row = {**reused, **grade}
+    scored = grade.get("fixture_readiness", {}).get("fixture_ready") is True
+    row.update(
+        execution_certified=True,
+        certified=scored,
+        solver_outcome_scored=scored,
+        cache_revalidated=True,
+        cache_revalidation_attempt=str(attempt),
+        frozen_grader_wall_seconds=grade_wall,
+        grader_artifact_copy_wall_seconds=grade.get("artifact_copy_wall_seconds"),
+        timing_provenance="historical_conversion_fresh_grade",
+    )
+    if not scored:
+        row["accepted"] = False
+    return row
+
+
 def _load_scored_cached_prefix(
     expected: list[dict], identity: dict, cache: Path, root: Path, backend,
-    manifest: Path, manifest_hash: str,
+    manifest: Path, manifest_hash: str, configuration: Configuration,
 ) -> tuple[list[dict], str | None]:
-    """Read certified history as one transaction; publish only after full checks.
+    """Read cached history with fresh grading for every reused success.
 
     The live seal continuously locks bytes and monitors all directory changes.
-    No grading, readiness preparation or conversion runs inside this transaction.
-    Cache envelopes, retained output bytes and both fixtures are still checked
-    for every row. Incomplete/unscored records return to the normal case loop.
+    Cache envelopes, retained output bytes and both fixtures are checked for every
+    row. A passing row also requires its sealed conversion attestation and a fresh
+    grade. Incomplete/unscored records return to the normal case loop.
     """
     rows, halt = [], None
     for case in expected:
@@ -941,9 +1041,16 @@ def _load_scored_cached_prefix(
         if not rows:
             _check_identities(backend, identity)
         _fixture(case)
+        reused = _revalidate_scored_cache(
+            reused, case, identity, configuration, backend, root
+        )
         row = {
             **reused, "reused": True, "reused_from": str(completed),
-            "timing_provenance": "historical_verified_case",
+            "timing_provenance": (
+                        "historical_conversion_fresh_grade"
+                        if reused.get("cache_revalidated")
+                        else "historical_verified_case"
+                    ),
             "reuse_lookup_wall_seconds": time.perf_counter() - started,
             "fixture_preparation_fresh": False,
             "cache_lookup_protocol": "certified-prefix-full-boundary-checks-v1",
@@ -1004,6 +1111,7 @@ def _run_controller(configuration: Configuration, backend) -> dict:
     _atomic(launches_path, launches, root)
     results, halt = _load_scored_cached_prefix(
         expected, identity, cache, root, backend, configuration.manifest, manifest_hash,
+        configuration,
     )
     fresh = 0
     for case in expected[len(results):]:
@@ -1024,13 +1132,21 @@ def _run_controller(configuration: Configuration, backend) -> dict:
         except FixtureError:
             reused = None
         if reused is not None:
+            reused = _revalidate_scored_cache(
+                reused, case, identity, configuration, backend, root
+            )
+        if reused is not None:
             _check_identities(backend, identity)
             _fixture(case)
             reused_row = {
                 **reused,
                 "reused": True,
                 "reused_from": str(completed),
-                "timing_provenance": "historical_verified_case",
+                "timing_provenance": (
+                        "historical_conversion_fresh_grade"
+                        if reused.get("cache_revalidated")
+                        else "historical_verified_case"
+                    ),
                 "reuse_lookup_wall_seconds": time.perf_counter() - before,
                 "fixture_preparation_fresh": False,
             }

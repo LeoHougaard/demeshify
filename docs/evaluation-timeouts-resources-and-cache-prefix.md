@@ -24,22 +24,24 @@ expensive preparation or conversion. Retrying grading/preparation requires an
 explicit newly qualified workflow; it cannot silently reuse a fresh solve
 budget or overwrite the original outcome.
 
-Already scored, source-ready consecutive cache records can now be read as one
+Already scored, source-ready consecutive cache records can be read as one
 transaction with full live identity checks at its boundaries. Every record
 still checks its checksum, frozen case identity, both fixture hashes and actual
 retained output hashes. The live seal continues to block writes/deletes and
-monitor transient catalog changes. The transaction performs no grading,
-conversion or readiness work and stops at the first missing, unscored or unready
-record. Fresh-case limits therefore retain their existing meaning. Reused
-measurements remain explicitly historical.
+monitor transient catalog changes. A passing record then revalidates its sealed
+conversion attestation and freshly grades the retained output; editable JSON
+booleans are never sufficient proof of acceptance. No new conversion or readiness
+work is required for a valid cached success. The transaction stops at the first
+missing, unscored or unready record. Conversion timings remain historical, while
+revalidated grading timings and provenance are recorded separately.
 
 The controller source hash changes cache identity. Older records are preserved;
 they are not recertified under this implementation. The historical unscored
-resource-heavy attempt remains unchanged. A fresh full conversion/reference
-grading workflow and an independent-process cached-prefix resume subsequently
-passed on the final pinned warm pipeline: one strict pass, then zero fresh
-conversions/grades with identical retained outputs and native attestation.
-This is a one-case workflow proof, not a new full-corpus evaluation.
+resource-heavy attempt remains unchanged. The earlier one-case cached-prefix
+proof reused a native conversion with no fresh grade; current builds deliberately
+repeat grading for every cached success while preserving its conversion and
+retained bytes. The older zero-grade resume is historical evidence only, not the
+current acceptance path or a new full-corpus evaluation.
 
 Focused controller checks exercise late host timeouts, known/unknown/unready
 sources, retained attestation, no reconversion on resume, resource failure with

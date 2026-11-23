@@ -194,7 +194,15 @@ def load_mesh(path: Path, file_name: str, input_units: str = "mm") -> MeshData:
     source_face_indices = np.arange(len(mesh.faces), dtype=np.int64)
     if not np.all(np.isfinite(mesh.vertices)):
         raise ValueError("The STL contains non-finite coordinates")
-    mesh.merge_vertices()
+    # STL vertices are already quantized by the file format. Merge only exact
+    # coordinate rows; trimesh's default tolerance can join distinct nearby bodies.
+    _, first_vertices, inverse_vertices = np.unique(
+        mesh.vertices,
+        axis=0,
+        return_index=True,
+        return_inverse=True,
+    )
+    mesh.update_vertices(mask=first_vertices, inverse=inverse_vertices.reshape(-1))
     scale = UNIT_SCALE[input_units]
     if scale != 1.0:
         mesh.apply_scale(scale)

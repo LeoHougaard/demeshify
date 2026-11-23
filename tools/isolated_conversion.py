@@ -126,7 +126,7 @@ class _JobGrant:
             check=True,
             capture_output=True,
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             timeout=30,
         )
 

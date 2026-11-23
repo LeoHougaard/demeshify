@@ -7,6 +7,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
+from threading import Lock
 
 from . import storage
 from .schemas import PlanEditRequest, ReconstructionReport
@@ -15,6 +16,77 @@ CONVERSION_TIMEOUT_SECONDS = 3600
 # The outer watchdog starts before the analytic worker. Allow time for
 # startup and faceted recovery if analytic fitting uses its full budget.
 SURFACE_RECOVERY_ALLOWANCE_SECONDS = 240
+
+_ACTIVE_PROCESSES: dict[int, tuple[str | None, subprocess.Popen]] = {}
+_ACTIVE_PROCESSES_LOCK = Lock()
+_CANCELLED_JOBS: set[str] = set()
+_SHUTDOWN = False
+
+
+class JobCancelledError(RuntimeError):
+    pass
+
+
+def reset_job_system() -> None:
+    global _SHUTDOWN
+    with _ACTIVE_PROCESSES_LOCK:
+        _SHUTDOWN = False
+        _CANCELLED_JOBS.clear()
+
+
+def allow_job(run_id: str) -> None:
+    """Permit a newly admitted operation after its predecessor has drained."""
+
+    with _ACTIVE_PROCESSES_LOCK:
+        if _SHUTDOWN:
+            raise JobCancelledError("The server is shutting down")
+        _CANCELLED_JOBS.discard(run_id)
+
+
+def _terminate_process(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    if sys.platform == "win32":
+        flags = subprocess.CREATE_NO_WINDOW
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if process.poll() is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def terminate_job_processes(run_id: str | None = None) -> None:
+    """Terminate active workers and prevent late registration after cancellation."""
+
+    global _SHUTDOWN
+    with _ACTIVE_PROCESSES_LOCK:
+        if run_id is None:
+            _SHUTDOWN = True
+        else:
+            _CANCELLED_JOBS.add(run_id)
+        processes = [
+            process
+            for owner, process in _ACTIVE_PROCESSES.values()
+            if run_id is None or owner == run_id
+        ]
+    for process in processes:
+        _terminate_process(process)
 
 
 def run_bounded_process(
@@ -25,6 +97,7 @@ def run_bounded_process(
     stdout_path: Path,
     stderr_path: Path,
     env: dict[str, str] | None = None,
+    job_id: str | None = None,
 ) -> int:
     """Supervise native work and terminate its descendants when the deadline expires."""
 
@@ -41,29 +114,23 @@ def run_bounded_process(
             creationflags=flags,
             start_new_session=sys.platform != "win32",
         )
+        with _ACTIVE_PROCESSES_LOCK:
+            _ACTIVE_PROCESSES[process.pid] = (job_id, process)
+            cancelled = job_id is not None and (
+                _SHUTDOWN or job_id in _CANCELLED_JOBS
+            )
         try:
-            return process.wait(timeout=timeout)
-        except BaseException:
-            if sys.platform == "win32":
-                try:
-                    subprocess.run(
-                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=flags,
-                        timeout=10,
-                        check=False,
-                    )
-                finally:
-                    if process.poll() is None:
-                        process.kill()
-            else:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            process.wait()
-            raise
+            try:
+                if cancelled:
+                    raise JobCancelledError(job_id or "Job cancelled during shutdown")
+                return process.wait(timeout=timeout)
+            except BaseException:
+                _terminate_process(process)
+                process.wait()
+                raise
+        finally:
+            with _ACTIVE_PROCESSES_LOCK:
+                _ACTIVE_PROCESSES.pop(process.pid, None)
 
 
 def _run_job(directory: Path, request: dict[str, object]) -> ReconstructionReport:
@@ -82,6 +149,7 @@ def _run_job(directory: Path, request: dict[str, object]) -> ReconstructionRepor
             stdout_path=directory / "geometry-worker.stdout.log",
             stderr_path=directory / "geometry-worker.stderr.log",
             env=environment,
+            job_id=str(request["run_id"]) if "run_id" in request else None,
         )
         if returncode:
             if error_path.is_file():

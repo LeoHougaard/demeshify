@@ -26,6 +26,12 @@ from app.schemas import (  # noqa: E402
     SplineProfile,
 )
 from app.step import load_step_shape  # noqa: E402
+from tools.evaluation_identity import (  # noqa: E402
+    case_identity,
+    digest,
+    runtime_identity,
+    source_identity,
+)
 
 
 def count_arcs(profile: Profile) -> int:
@@ -427,6 +433,33 @@ def _worker(
     output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
 
+def evaluation_fingerprint(
+    case: dict[str, object],
+    manifest_path: Path,
+    case_timeout: int,
+) -> str:
+    """Identify all inputs that can affect a resumable feature-history case."""
+    identity_case = dict(case)
+    for field in ("stl", "source_step"):
+        value = case.get(field)
+        if value:
+            path = Path(str(value))
+            if not path.is_absolute():
+                path = manifest_path.parent / path
+            identity_case[f"{field}_content_sha256"] = (
+                digest(path) if path.is_file() else None
+            )
+    sources = source_identity(PROJECT_ROOT)
+    benchmark_source = Path(__file__).resolve()
+    sources[str(benchmark_source.relative_to(PROJECT_ROOT))] = digest(benchmark_source)
+    return case_identity(
+        identity_case,
+        sources,
+        runtime_identity(),
+        case_timeout=case_timeout,
+    )
+
+
 def _run_bounded_case(
     case: dict[str, object],
     manifest_path: Path,
@@ -438,10 +471,18 @@ def _run_bounded_case(
 ) -> dict[str, object]:
     identifier = str(case["id"])
     cache_path = cache_directory / f"{identifier}.json"
-    should_run = not (resume and cache_path.is_file())
-    if not should_run and retry_statuses:
-        cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        should_run = str(cached.get("status", "")) in retry_statuses
+    fingerprint = evaluation_fingerprint(case, manifest_path, case_timeout)
+    should_run = True
+    if resume and cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cached = None
+        if (
+            isinstance(cached, dict)
+            and cached.get("evaluation_fingerprint") == fingerprint
+        ):
+            should_run = str(cached.get("status", "")) in retry_statuses
     if should_run:
         command = [
             sys.executable,
@@ -506,6 +547,7 @@ def _run_bounded_case(
             result.get("complexity", "unknown"),
         )
     result = refresh_result_metrics(result)
+    result["evaluation_fingerprint"] = fingerprint
     cache_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 

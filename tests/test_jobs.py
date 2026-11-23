@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 import sys
 import time
@@ -7,6 +8,7 @@ import trimesh
 from fastapi.testclient import TestClient
 
 from app import jobs, storage
+from app import main as main_module
 from app.jobs import run_bounded_process
 from app.main import app
 
@@ -95,3 +97,91 @@ def test_feature_conversion_and_revision_edit_use_isolated_worker(tmp_path, monk
         stale = client.put(f"/api/runs/{run_id}/plan", json=request)
         assert stale.status_code == 409
     assert (tmp_path / run_id / "geometry-worker.stdout.log").is_file()
+
+
+def test_background_cancellation_terminates_worker_and_descendants(tmp_path, monkeypatch):
+    marker = tmp_path / "orphan.txt"
+    stdout = tmp_path / "stdout.log"
+    child = (
+        "import sys,time; from pathlib import Path; time.sleep(2); "
+        "Path(sys.argv[1]).write_text('orphan')"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}, {str(marker)!r}]); "
+        "print('child started', flush=True); time.sleep(60)"
+    )
+
+    def reconstruct(run_id, *_args, **_kwargs):
+        code = run_bounded_process(
+            [sys.executable, "-c", parent],
+            cwd=tmp_path,
+            timeout=60,
+            stdout_path=stdout,
+            stderr_path=tmp_path / "stderr.log",
+            job_id=run_id,
+        )
+        raise RuntimeError(f"worker stopped with {code}")
+
+    monkeypatch.setattr(main_module, "_reconstructor", lambda _engine: reconstruct)
+
+    async def run():
+        run_id = "c" * 32
+        target = tmp_path / "input.stl"
+        main_module.RUN_PROGRESS[run_id] = main_module.new_progress(run_id)
+        task = asyncio.create_task(
+            main_module._run_reconstruction_job(
+                run_id, target, "input.stl", "mm", "surface_brep"
+            )
+        )
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if stdout.is_file() and "child started" in stdout.read_text():
+                break
+        else:
+            raise AssertionError("worker did not start")
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("background task did not retain cancellation")
+
+    jobs.reset_job_system()
+    asyncio.run(run())
+    time.sleep(2.2)
+    assert not marker.exists()
+    jobs.reset_job_system()
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_cancelled_work_cannot_register_after_the_termination_sweep(tmp_path, shutdown):
+    marker = tmp_path / "late-worker.txt"
+    job_id = "late-registration"
+    if shutdown:
+        jobs.terminate_job_processes()
+    else:
+        jobs.terminate_job_processes(job_id)
+    try:
+        with pytest.raises(jobs.JobCancelledError):
+            run_bounded_process(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys,time; from pathlib import Path; time.sleep(1); "
+                        "Path(sys.argv[1]).write_text('late')"
+                    ),
+                    str(marker),
+                ],
+                cwd=tmp_path,
+                timeout=30,
+                stdout_path=tmp_path / "late.stdout.log",
+                stderr_path=tmp_path / "late.stderr.log",
+                job_id=job_id,
+            )
+        time.sleep(1.2)
+        assert not marker.exists()
+    finally:
+        jobs.reset_job_system()

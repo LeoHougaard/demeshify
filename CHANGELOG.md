@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Made dense STEP verification probes spatially deterministic and independent of
+  STL vertex/face ordering, so capped local sampling cannot skip entire localized
+  bosses or bores merely because of index ordering.
+- Honored through-hole and through-all feature edits, applied round-hole local
+  finishes in runtime and generated CadQuery, and stopped calling best-effort
+  revisions verified. Failed edits now roll every published artifact back together.
+- Required fresh grading for cached passing evaluations, fresh conversion and
+  grading for multiresolution cached successes, and content-bound feature-history
+  resume records. Editable cache JSON can no longer fabricate accepted outcomes.
+- Exposed background validation errors, made failed reports accessible in the
+  browser, terminated worker process trees on cancellation and shutdown, merged
+  only exactly equal STL vertices, and fixed the ACL protocol tests on non-Windows.
+
 - Raised the analytic worker deadline to one hour for all mesh sizes. Surface
   conversions have a 64-minute total deadline to allow for faceted recovery.
   Feature-based conversions and edits have a one-hour total deadline.

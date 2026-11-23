@@ -168,7 +168,7 @@ def test_controller_summarizes_snapshot_boundaries_and_resumes_durable_case_reco
         identifier = command[command.index('--worker-id') + 1]
         calls.append(identifier)
         Path(command[command.index('--output') + 1]).write_text(json.dumps({
-            'id': identifier, 'accepted': True, 'status': 'complete',
+            'id': identifier, 'accepted': False, 'status': 'best_effort',
         }))
         return 0
 

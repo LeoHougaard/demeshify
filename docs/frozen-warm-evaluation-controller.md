@@ -131,11 +131,12 @@ grading. Native conversion took 10.05 seconds and the case took 49.87 seconds,
 including deferred worker startup; sampled whole-tree peak RSS was 963 MB.
 Those are one-case observations, not full-corpus throughput claims.
 
-A second process resumed the same case with zero fresh conversions or grades.
-Its cached-prefix row retained exactly the same native attempt, output hashes
+A second process historically resumed the same case with zero fresh conversions
+or grades. Its cached-prefix row retained the same native attempt, output hashes
 and drained/revoked conversion attestation, with explicit historical timings.
-The lookup took 2.25 seconds, excluding bootstrap and closing checks. Exact
-source pins, receipt and result hashes are preserved in
+Current builds instead repeat grading for every cached success, because editable
+result JSON is not proof of acceptance. Exact source pins, receipt and result
+hashes from that older workflow are preserved in
 `experiments/b11w5/native-workflow-and-resume-proof.json` under the ignored
 evaluation root. Earlier warm observations remain distinct historical evidence;
 no old cache was recertified under the new controller hash.
