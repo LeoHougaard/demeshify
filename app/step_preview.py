@@ -28,6 +28,10 @@ from OCP.TopLoc import TopLoc_Location
 from OCP.TopTools import TopTools_IndexedMapOfShape
 
 
+class DegeneratePreviewTriangle(ValueError):
+    """The native tessellation cannot be represented as complete binary STL."""
+
+
 def _collapsed_uv_edge(face, poly, indices, corners) -> bool:
     """Certify a repeated native vertex as the image of a collapsed UV edge.
 
@@ -118,7 +122,9 @@ def _complete_triangles(shape: cq.Shape) -> int:
         if len(zero):
             for index in zero:
                 if not _collapsed_uv_edge(face, poly, triangles[index], native_corners[index]):
-                    raise ValueError("Preview tessellation contains a degenerate triangle")
+                    raise DegeneratePreviewTriangle(
+                        "Preview tessellation contains a degenerate triangle"
+                    )
             # Only exact zero-geometric singular artifacts are removed, on the
             # independent mesh copy. No positive native area may be discarded.
             triangles = np.delete(triangles, zero, axis=0)
@@ -131,7 +137,7 @@ def _complete_triangles(shape: cq.Shape) -> int:
         corners = encoded.astype(float)[triangles]
         cross = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
         if not np.all(np.isfinite(cross)) or np.any(np.linalg.norm(cross, axis=1) == 0):
-            raise ValueError("Preview tessellation contains a degenerate triangle")
+            raise DegeneratePreviewTriangle("Preview tessellation contains a degenerate triangle")
         count += len(triangles)
     return count
 

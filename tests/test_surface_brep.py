@@ -158,6 +158,26 @@ def test_export_surface_brep_can_be_called_directly(tmp_path) -> None:
     assert all("surface_function" in surface for surface in graph["surfaces"])
 
 
+def test_export_retries_degenerate_preview_with_verified_step(tmp_path, monkeypatch):
+    result = build_surface_brep(_mesh_data(trimesh.creation.box(extents=(5, 4, 3))))
+    preview = surface_brep.export_stl_preview
+    attempts = []
+
+    def reject_original_tessellation(shape, destination, **options):
+        attempts.append(shape)
+        if shape is result.shape:
+            raise surface_brep.DegeneratePreviewTriangle("Degenerate native triangle")
+        return preview(shape, destination, **options)
+
+    monkeypatch.setattr(surface_brep, "export_stl_preview", reject_original_tessellation)
+    export_surface_brep(result, tmp_path)
+
+    assert len(attempts) == 2
+    assert attempts[0] is result.shape and attempts[1].isValid()
+    exported = trimesh.load_mesh(tmp_path / "reconstruction.stl")
+    assert exported.is_watertight and exported.volume == pytest.approx(60)
+
+
 def test_freeform_region_is_one_node_fitted_bspline_not_triangle_faces() -> None:
     size = 6
     x, y = np.meshgrid(np.linspace(0, 5, size), np.linspace(0, 5, size))

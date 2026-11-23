@@ -100,7 +100,7 @@ from shapely.geometry import LineString
 
 from .mesh import MeshData, closed_shell_topology, containment_parents, shell_depths
 from .step import load_step_shape, unowned_geometry_counts
-from .step_preview import export_stl_preview
+from .step_preview import DegeneratePreviewTriangle, export_stl_preview
 from .surface_graph import (
     ConicalPatch,
     CylindricalPatch,
@@ -5495,6 +5495,7 @@ def export_surface_brep(
         result.shape, str(step_path),
         opt={"write_pcurves": not result.source_mesh_fallback},
     )
+    roundtrip = None
     if result.closed and verify_roundtrip:
         try:
             roundtrip = load_step_shape(step_path)
@@ -5530,12 +5531,15 @@ def export_surface_brep(
     ):
         shutil.copy2(source_stl_path, reconstruction_stl)
     elif result.closed and result.valid:
-        export_stl_preview(
-            result.shape,
-            reconstruction_stl,
-            linear_deflection=max(min(result.sewing_tolerance * 0.5, 0.01), 1e-7),
-            angular_deflection=0.04,
-        )
+        deflection = max(min(result.sewing_tolerance * 0.5, 0.01), 1e-7)
+        try:
+            export_stl_preview(result.shape, reconstruction_stl, linear_deflection=deflection)
+        except DegeneratePreviewTriangle:
+            if roundtrip is None:
+                raise
+            # STEP round-tripping can regularize trim representations. The retry
+            # must still produce a complete tessellation of the delivered solid.
+            export_stl_preview(roundtrip, reconstruction_stl, linear_deflection=deflection)
     else:
         if not result.shape.exportStl(
             str(reconstruction_stl),
