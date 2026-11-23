@@ -52,7 +52,10 @@ download flow without finding an STL first.
 Choose the STL export units before converting and check the displayed output
 size. STL files do not store units. For example, a 0.18 × 0.25 model exported in
 metres should become 180 × 250 mm. The viewer loads the file in your browser;
-conversion and downloads require the local server to remain running.
+conversion and downloads require the local server to remain running. You can switch
+tabs while a conversion runs. If you allow browser notifications when prompted,
+the converter notifies you when a background conversion finishes; clicking the
+notification reopens that run's result.
 
 ## Reconstruction modes
 
