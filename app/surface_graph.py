@@ -887,6 +887,134 @@ def _circular_extrusion_cylinder(
     return cylinder if isinstance(cylinder, CylindricalPatch) else None
 
 
+def _piecewise_linear_revolution_regions(
+    data: MeshData,
+    patch: SurfaceOfRevolutionPatch,
+    distance_tolerance: float,
+    normal_tolerance_degrees: float,
+    minimum_area: float,
+) -> list[tuple[_AnalyticFit, np.ndarray]]:
+    return _piecewise_linear_axis_regions(
+        data, patch.face_indices, patch.axis, distance_tolerance,
+        normal_tolerance_degrees, minimum_area,
+    )
+
+
+def _piecewise_linear_axis_regions(
+    data: MeshData,
+    face_indices: np.ndarray,
+    axis: np.ndarray,
+    distance_tolerance: float,
+    normal_tolerance_degrees: float,
+    minimum_area: float,
+) -> list[tuple[_AnalyticFit, np.ndarray]]:
+    """Recover complete straight meridian runs without approximating fillets.
+
+    Cone/cylinder normals have a constant axial component. Source adjacency
+    separates their plateaus at existing meridian breakpoints; every entire
+    plateau must then pass the original primitive fit, or nothing is changed.
+    """
+
+    mesh = data.mesh
+    indices = np.asarray(face_indices, dtype=np.int64)
+    if len(indices) < 16:
+        return []
+    local_index = np.full(len(mesh.faces), -1, dtype=np.int64)
+    local_index[indices] = np.arange(len(indices))
+    adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    pairs = local_index[adjacency]
+    pairs = pairs[np.all(pairs >= 0, axis=1)]
+    normals = np.asarray(mesh.face_normals[indices], dtype=float)
+    axial_angles = np.arcsin(np.clip(normals @ axis, -1.0, 1.0))
+    # Unequal angular rows can alternate the axial facet normal even on an
+    # exact cone. Use the caller's existing normal envelope for proposals;
+    # the original complete-union fits still decide acceptance below.
+    seed_angle = math.radians(normal_tolerance_degrees)
+    pairs = pairs[np.abs(axial_angles[pairs[:, 0]] - axial_angles[pairs[:, 1]]) <= seed_angle]
+    graph = coo_matrix(
+        (np.ones(len(pairs), dtype=np.uint8), (pairs[:, 0], pairs[:, 1])),
+        shape=(len(indices), len(indices)),
+    )
+    count, labels = connected_components(graph, directed=False)
+    # Retain the existing conservative local-consensus limit for smaller
+    # mechanical parts rather than launching an unbounded new set of fits.
+    maximum_regions = 24 if len(mesh.faces) >= 60_000 else 4
+    if not 2 <= count <= maximum_regions:
+        return []
+    components = [indices[labels == label] for label in range(count)]
+    if any(len(component) < 8 or float(np.sum(mesh.area_faces[component])) < minimum_area
+           for component in components):
+        return []
+    result: list[tuple[_AnalyticFit, np.ndarray]] = []
+    for component in components:
+        fit = _fit_component(
+            data, component, distance_tolerance, normal_tolerance_degrees,
+            allowed_kinds=("cylinder", "cone"),
+        )
+        # A straight meridian needs stronger evidence than a generic surface
+        # approximation. Keep the existing one-tenth-tolerance convention.
+        if fit is None or fit.max_error > distance_tolerance * 0.1:
+            return []
+        if fit.kind == "cone":
+            points = np.asarray(mesh.vertices[np.unique(mesh.faces[component])], dtype=float)
+            axial = np.sort(points @ np.asarray(fit.parameters["axis"], dtype=float))
+            level_tolerance = max(distance_tolerance * 0.1, data.diagonal * 1e-7)
+            level_count = 1 + int(np.sum(np.diff(axial) > level_tolerance))
+            # Two rings also describe one chord of a true rounded meridian.
+            # Require an independently sampled interior level before calling
+            # a sloped run elementary, and retain the whole original if not.
+            if level_count < 3:
+                return []
+        result.append((fit, component))
+    return result if any(fit.kind == "cone" for fit, _ in result) else []
+
+
+def _coaxial_profile_regions(
+    data: MeshData, face_indices: np.ndarray, axis: np.ndarray,
+    distance_tolerance: float, normal_tolerance_degrees: float, minimum_area: float,
+) -> list[tuple[_AnalyticFit, np.ndarray]]:
+    """Prefer an entire source cone before proposing meridian breakpoints."""
+    indices = np.asarray(face_indices, dtype=np.int64)
+    if len(indices) < 16 or float(np.sum(data.mesh.area_faces[indices])) < minimum_area:
+        return []
+    fit = _fit_component(
+        data, indices, distance_tolerance, normal_tolerance_degrees,
+        allowed_kinds=("cone",),
+    )
+    if fit is not None and fit.max_error <= distance_tolerance * 0.1:
+        points = np.asarray(data.mesh.vertices[np.unique(data.mesh.faces[indices])], dtype=float)
+        axial = np.sort(points @ np.asarray(fit.parameters["axis"], dtype=float))
+        level_tolerance = max(distance_tolerance * 0.1, data.diagonal * 1e-7)
+        if 1 + int(np.sum(np.diff(axial) > level_tolerance)) >= 3:
+            return [(fit, indices)]
+    return _piecewise_linear_axis_regions(
+        data, indices, axis, distance_tolerance, normal_tolerance_degrees, minimum_area,
+    )
+
+
+def _coaxial_cylinder_axis(
+    cylinders: list[CylindricalPatch], diagonal: float, distance_tolerance: float,
+) -> np.ndarray | None:
+    """Propose one source-supported axis before local fits fragment a profile."""
+    ordered = sorted(cylinders, key=lambda patch: -patch.area)
+    for number, first in enumerate(ordered):
+        axis = _canonical_direction(first.axis)
+        for second in ordered[number + 1:]:
+            if first.patch_id == second.patch_id:
+                continue
+            other_axis = _canonical_direction(second.axis)
+            if np.linalg.norm(np.cross(axis, other_axis)) * diagonal > distance_tolerance:
+                continue
+            delta = second.origin - first.origin
+            if np.linalg.norm(delta - float(delta @ axis) * axis) > distance_tolerance:
+                continue
+            if np.intersect1d(first.face_indices, second.face_indices).size:
+                continue
+            return axis
+    return None
+
+
+
 def _constant_radius_revolution_cylinder(
     patch: SurfaceOfRevolutionPatch,
     mesh: object,
@@ -3634,6 +3762,118 @@ def _regularize_axis_relations(
     return changed
 
 
+def _same_cylinder_support(first: CylindricalPatch, second: CylindricalPatch) -> bool:
+    """Compare infinite supports at floating-point precision, not fit tolerance."""
+    values = np.r_[first.origin, first.axis, first.radius,
+                   second.origin, second.axis, second.radius]
+    if not np.all(np.isfinite(values)):
+        return False
+    first_length, second_length = np.linalg.norm(first.axis), np.linalg.norm(second.axis)
+    if min(first_length, second_length) <= 0:
+        return False
+    first_axis, second_axis = first.axis / first_length, second.axis / second_length
+    angular_precision = np.finfo(float).eps * 64
+    position_scale = max(1.0, np.linalg.norm(first.origin), np.linalg.norm(second.origin))
+    position_precision = np.finfo(float).eps * position_scale * 64
+    radius_precision = np.finfo(float).eps * max(1.0, first.radius, second.radius) * 64
+    delta = second.origin - first.origin
+    offset = delta - np.dot(delta, first_axis) * first_axis
+    return bool(
+        np.linalg.norm(np.cross(first_axis, second_axis)) <= angular_precision
+        and np.linalg.norm(offset) <= position_precision
+        and abs(first.radius - second.radius) <= radius_precision
+    )
+
+
+def _joint_chord_cylinder_fit(
+    mesh: object,
+    cylinders: list[CylindricalPatch],
+    union: np.ndarray,
+    distance_tolerance: float,
+    normal_tolerance_degrees: float,
+    coordinate_scale: float,
+) -> _AnalyticFit | None:
+    """Explain independent cylinder fits by one equation at input precision.
+
+    This does not widen numerical support identity or the reconstruction gates.
+    Both the existing owner fits and the joint fit must agree with their nodes
+    at measured float32 storage precision (double roundoff for other nodes).
+    All source normals and triangle chords still pass the original validator.
+    """
+    if len(cylinders) < 2 or not math.isfinite(coordinate_scale) or coordinate_scale <= 0:
+        return None
+    points = np.asarray(mesh.vertices[np.unique(mesh.faces[union])], dtype=float)
+    if not len(points) or not np.all(np.isfinite(points)):
+        return None
+    numerical_floor = np.finfo(float).eps * max(1.0, float(np.max(np.abs(points)))) * 128
+    raw = points / coordinate_scale
+    with np.errstate(over="ignore", invalid="ignore"):
+        stored = raw.astype(np.float32)
+    float32_nodes = bool(
+        np.all(np.isfinite(stored))
+        and np.all(np.abs(raw - stored.astype(float))
+                   <= np.finfo(float).eps * np.maximum(np.abs(raw), 1) * 8)
+    )
+    uncertainty = np.zeros(len(points))
+    if float32_nodes:
+        # A node has at most half an ulp of uncertainty per stored coordinate.
+        # Allow that measurement error plus one equal model-estimation error.
+        uncertainty = np.linalg.norm(
+            np.spacing(np.abs(stored)).astype(float) * .5, axis=1,
+        ) * coordinate_scale
+    max_limit = max(float(np.max(uncertainty)) * 2, numerical_floor)
+    rms_limit = max(float(np.sqrt(np.mean(uncertainty**2))) * 2, numerical_floor)
+
+    def radial_errors(nodes: np.ndarray, axis: np.ndarray,
+                      origin: np.ndarray, radius: float) -> np.ndarray:
+        relative = nodes - origin
+        return np.linalg.norm(relative - (relative @ axis)[:, None] * axis, axis=1) - radius
+
+    previous = []
+    for cylinder in cylinders:
+        nodes = np.asarray(mesh.vertices[cylinder.vertex_indices])
+        errors = radial_errors(nodes, cylinder.axis, cylinder.origin, cylinder.radius)
+        rms, maximum = _fit_statistics(errors)
+        if rms > rms_limit or maximum > max_limit:
+            return None
+        previous.append((nodes, rms, maximum))
+
+    seed = cylinders[0]
+    axis = seed.axis.copy()
+    first, second = _plane_basis(axis)
+    anchor = np.mean(points, axis=0)
+    initial = seed.origin + float((anchor - seed.origin) @ axis) * axis
+
+    def model(parameters: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+        direction = _canonical_direction(axis + parameters[3] * first + parameters[4] * second)
+        origin = anchor + parameters[0] * first + parameters[1] * second
+        return direction, origin, float(parameters[2])
+
+    try:
+        fitted = least_squares(
+            lambda parameters: radial_errors(points, *model(parameters)),
+            [(initial - anchor) @ first, (initial - anchor) @ second, seed.radius, 0, 0],
+            bounds=([-np.inf, -np.inf, 0, -np.inf, -np.inf], [np.inf] * 5),
+            x_scale="jac", max_nfev=100, xtol=1e-13, ftol=1e-13, gtol=1e-13,
+        )
+    except (ValueError, np.linalg.LinAlgError):
+        return None
+    if not fitted.success or not np.all(np.isfinite(fitted.x)):
+        return None
+    joint_axis, joint_origin, radius = model(fitted.x)
+    rms, maximum = _fit_statistics(radial_errors(points, joint_axis, joint_origin, radius))
+    if rms > rms_limit or maximum > max_limit:
+        return None
+    for nodes, previous_rms, previous_max in previous:
+        rms, maximum = _fit_statistics(radial_errors(nodes, joint_axis, joint_origin, radius))
+        if rms > previous_rms + rms_limit or maximum > previous_max + max_limit:
+            return None
+    return _validated_seeded_cylinder_fit(
+        mesh, union, joint_axis, joint_origin, radius,
+        distance_tolerance, normal_tolerance_degrees,
+    )
+
+
 def _absorb_cylindrical_chord_fragments(
     mesh: object,
     planar_patches: list[PlanarPatch],
@@ -3641,14 +3881,18 @@ def _absorb_cylindrical_chord_fragments(
     face_patch_ids: np.ndarray,
     distance_tolerance: float,
     normal_tolerance_degrees: float,
+    *,
+    coordinate_scale: float = 1.0,
 ) -> None:
     """Return tiny tangent chords to an adjacent analytic cylinder.
 
     A coarse circular tessellation can leave one or two triangles as an exact
     plane even though all their nodes and normals continue the neighboring
     cylinder.  Treating that chord as a CAD plane creates artificial trim
-    edges and prevents sewing.  The node, normal, tangent, size, and adjacency
-    gates below deliberately exclude planar end caps and real planar walls.
+    edges and prevents sewing. Several adjacent owners may describe the exact
+    same cylinder, separated only by this chord. The node, normal, tangent,
+    size, and adjacency gates still exclude planar end caps and real walls;
+    the complete combined ownership must also pass the original seed validator.
     """
 
     if not planar_patches or not cylindrical_patches:
@@ -3663,20 +3907,19 @@ def _absorb_cylindrical_chord_fragments(
         neighbors.setdefault(first_id, set()).add(second_id)
         neighbors.setdefault(second_id, set()).add(first_id)
 
-    retained: list[PlanarPatch] = []
-    for plane in planar_patches:
-        adjacent = [
-            cylinders_by_id[patch_id]
-            for patch_id in neighbors.get(plane.patch_id, set())
-            if patch_id in cylinders_by_id
-        ]
-        if len(plane.face_indices) > 4 or len(adjacent) != 1:
-            retained.append(plane)
-            continue
-        cylinder = adjacent[0]
+    aliases: dict[str, str] = {}
+
+    def current_owner(identifier: str) -> str:
+        while identifier in aliases:
+            identifier = aliases[identifier]
+        return identifier
+
+    def eligible(plane: PlanarPatch, cylinder: CylindricalPatch) -> bool:
+        # End fillets may touch a chord's short borders without supporting its
+        # surface. Apply the original geometric checks independently before
+        # comparing the supports that genuinely explain the planar region.
         if abs(float(plane.normal @ cylinder.axis)) > math.sin(math.radians(1.0)):
-            retained.append(plane)
-            continue
+            return False
 
         points = np.asarray(mesh.vertices[plane.vertex_indices], dtype=float)
         relative = points - cylinder.origin
@@ -3685,8 +3928,7 @@ def _absorb_cylindrical_chord_fragments(
         node_errors = np.abs(np.linalg.norm(radial, axis=1) - cylinder.radius)
         strict_distance = max(distance_tolerance * 0.1, 1e-8)
         if len(node_errors) == 0 or float(np.max(node_errors)) > strict_distance:
-            retained.append(plane)
-            continue
+            return False
 
         centers = np.asarray(mesh.triangles_center[plane.face_indices], dtype=float)
         center_relative = centers - cylinder.origin
@@ -3694,32 +3936,342 @@ def _absorb_cylindrical_chord_fragments(
         expected = center_relative - np.outer(center_axial, cylinder.axis)
         expected_norms = np.linalg.norm(expected, axis=1)
         if np.any(expected_norms <= 1e-12):
-            retained.append(plane)
-            continue
+            return False
         expected /= expected_norms[:, None]
         actual = np.asarray(mesh.face_normals[plane.face_indices], dtype=float)
         alignments = np.abs(np.sum(expected * actual, axis=1))
         normal_errors = np.degrees(np.arccos(np.clip(alignments, -1.0, 1.0)))
-        if float(np.max(normal_errors)) > min(normal_tolerance_degrees, 1.0):
+        return bool(float(np.max(normal_errors)) <= min(normal_tolerance_degrees, 1.0))
+
+    retained: list[PlanarPatch] = []
+    for plane in planar_patches:
+        if len(plane.face_indices) > 4:
             retained.append(plane)
             continue
-
-        cylinder.face_indices = np.unique(
-            np.concatenate((cylinder.face_indices, plane.face_indices))
-        ).astype(np.int64)
-        cylinder.vertex_indices = np.unique(mesh.faces[cylinder.face_indices])
-        cylinder.area = float(np.sum(mesh.area_faces[cylinder.face_indices]))
-        cylinder.boundary_loops = _boundary_loops(mesh, cylinder.face_indices)
-        cylinder_points = np.asarray(
-            mesh.vertices[cylinder.vertex_indices],
-            dtype=float,
+        adjacent_ids = {current_owner(identifier)
+                        for identifier in neighbors.get(plane.patch_id, set())}
+        adjacent = [
+            cylinders_by_id[identifier]
+            for identifier in sorted(adjacent_ids)
+            if identifier in cylinders_by_id and eligible(plane, cylinders_by_id[identifier])
+        ]
+        if not adjacent:
+            retained.append(plane)
+            continue
+        cylinder = adjacent[0]
+        owners = [*adjacent, plane]
+        combined = np.concatenate([patch.face_indices for patch in owners])
+        union = np.unique(combined).astype(np.int64)
+        if (len(union) != len(combined)
+                or any(not np.all(face_patch_ids[patch.face_indices] == patch.patch_id)
+                       for patch in owners)):
+            retained.append(plane)
+            continue
+        identical = all(_same_cylinder_support(cylinder, other) for other in adjacent[1:])
+        fit = (
+            _validated_seeded_cylinder_fit(
+                mesh, union, cylinder.axis.copy(), cylinder.origin.copy(), cylinder.radius,
+                distance_tolerance, normal_tolerance_degrees,
+            ) if identical else _joint_chord_cylinder_fit(
+                mesh, adjacent, union, distance_tolerance, normal_tolerance_degrees,
+                coordinate_scale,
+            )
         )
-        cylinder_axial = (cylinder_points - cylinder.origin) @ cylinder.axis
+        if fit is None:
+            retained.append(plane)
+            continue
+        # Compute the complete new region before changing any owner. Exact
+        # supports keep their frame; a precision-supported joint fit may refine
+        # that frame to one equation shared by all participating regions.
+        vertex_indices = np.unique(mesh.faces[union])
+        loops = _boundary_loops(mesh, union)
+        area = float(np.sum(mesh.area_faces[union]))
+        origin = cylinder.origin if identical else np.asarray(fit.parameters["origin"])
+        axis = cylinder.axis if identical else np.asarray(fit.parameters["axis"])
+        radius = cylinder.radius if identical else float(fit.parameters["radius"])
+        cylinder_axial = (mesh.vertices[vertex_indices] - origin) @ axis
+        cylinder.origin, cylinder.axis, cylinder.radius = origin, axis, radius
+        cylinder.face_indices, cylinder.vertex_indices = union, vertex_indices
+        cylinder.area, cylinder.boundary_loops = area, loops
         cylinder.start = float(np.min(cylinder_axial))
         cylinder.end = float(np.max(cylinder_axial))
-        face_patch_ids[plane.face_indices] = cylinder.patch_id
+        cylinder.rms_error, cylinder.max_error = fit.rms_error, fit.max_error
+        cylinder.normal_error_degrees = fit.normal_error_degrees
+        face_patch_ids[union] = cylinder.patch_id
+        for other in adjacent[1:]:
+            aliases[other.patch_id] = cylinder.patch_id
+            del cylinders_by_id[other.patch_id]
+        # Original adjacency is unchanged geometrically. Resolve these removed
+        # owners for later chords rather than using stale cylinder/plane IDs.
+        aliases[plane.patch_id] = cylinder.patch_id
 
     planar_patches[:] = retained
+    cylindrical_patches[:] = [patch for patch in cylindrical_patches
+                             if patch.patch_id in cylinders_by_id]
+
+
+def _merge_coincident_connected_cylinders(
+    mesh: object,
+    cylindrical_patches: list[CylindricalPatch],
+    face_patch_ids: np.ndarray,
+    distance_tolerance: float,
+    normal_tolerance_degrees: float,
+) -> None:
+    """Unify connected owners of one numerically identical cylinder support.
+
+    Seeded residual recognition can split a single cylinder into several owners.
+    Their artificial internal borders should not become overlapping CAD trims.
+    This joins existing owners only: no residual faces or different supports are
+    grown, and the unchanged seed validator must accept the complete union.
+    """
+    by_id = {patch.patch_id: patch for patch in cylindrical_patches}
+    if len(by_id) < 2 or len(by_id) != len(cylindrical_patches):
+        return
+    neighbors: dict[str, set[str]] = {identifier: set() for identifier in by_id}
+    for first_face, second_face in np.asarray(mesh.face_adjacency, dtype=np.int64):
+        first, second = face_patch_ids[first_face], face_patch_ids[second_face]
+        if first != second and first in by_id and second in by_id:
+            neighbors[first].add(second)
+            neighbors[second].add(first)
+
+    for seed in tuple(cylindrical_patches):
+        if seed.patch_id not in by_id:
+            continue
+        while True:
+            merged = False
+            for identifier in sorted(neighbors[seed.patch_id]):
+                other = by_id.get(identifier)
+                if other is None or not _same_cylinder_support(seed, other):
+                    continue
+                if (not np.all(face_patch_ids[seed.face_indices] == seed.patch_id)
+                        or not np.all(face_patch_ids[other.face_indices] == identifier)
+                        or len(np.intersect1d(seed.face_indices, other.face_indices))):
+                    continue
+                union = np.unique(np.r_[seed.face_indices, other.face_indices])
+                fit = _validated_seeded_cylinder_fit(
+                    mesh, union, seed.axis.copy(), seed.origin.copy(), seed.radius,
+                    distance_tolerance, normal_tolerance_degrees,
+                )
+                if fit is None:
+                    continue
+                seed.face_indices = union
+                seed.vertex_indices = np.unique(mesh.faces[union])
+                seed.area = float(np.sum(mesh.area_faces[union]))
+                seed.boundary_loops = _boundary_loops(mesh, union)
+                axial = (mesh.vertices[seed.vertex_indices] - seed.origin) @ seed.axis
+                seed.start, seed.end = float(np.min(axial)), float(np.max(axial))
+                seed.rms_error, seed.max_error = fit.rms_error, fit.max_error
+                seed.normal_error_degrees = fit.normal_error_degrees
+                face_patch_ids[union] = seed.patch_id
+                neighbors[seed.patch_id].update(neighbors[identifier])
+                neighbors[seed.patch_id].discard(seed.patch_id)
+                neighbors[seed.patch_id].discard(identifier)
+                for adjacent in neighbors.pop(identifier):
+                    if adjacent == seed.patch_id:
+                        continue
+                    neighbors[adjacent].discard(identifier)
+                    neighbors[adjacent].add(seed.patch_id)
+                del by_id[identifier]
+                merged = True
+                break
+            if not merged:
+                break
+    cylindrical_patches[:] = [patch for patch in cylindrical_patches if patch.patch_id in by_id]
+
+
+def _recover_supported_residual_primitives(
+    data: MeshData,
+    planar_patches: list[PlanarPatch],
+    cylindrical_patches: list[CylindricalPatch],
+    freeform_patches: list[FreeformPatch],
+    face_patch_ids: np.ndarray,
+    distance_tolerance: float,
+    normal_tolerance_degrees: float,
+) -> None:
+    """Split mixed residuals using independently validated analytic supports.
+
+    Existing owners and cylinder parameters stay intact. Four coplanar nodes
+    alone do not justify promoting a tessellation cell to a CAD plane: require
+    two adjacent, independent cylinder axes and consistent tangent offsets.
+    """
+    if not freeform_patches or not cylindrical_patches:
+        return
+    mesh = data.mesh
+    residual = np.zeros(len(mesh.faces), dtype=bool)
+    for patch in freeform_patches:
+        residual[patch.face_indices] = True
+    used_ids = set(str(value) for value in face_patch_ids)
+    next_cylinder, next_plane = 1, 1
+    supports = []
+    changed = False
+    for seed in tuple(cylindrical_patches):
+        fit = _validated_seeded_cylinder_fit(
+            mesh, seed.face_indices, seed.axis.copy(), seed.origin.copy(), seed.radius,
+            distance_tolerance, normal_tolerance_degrees,
+        )
+        if fit is None:
+            continue
+        supports.append(seed)
+        indices = np.flatnonzero(residual)
+        if not len(indices):
+            continue
+        eligible = _analytic_inlier_faces(
+            fit, mesh, indices, max(distance_tolerance * 0.2, 2e-8),
+            normal_tolerance_degrees / 1.5,
+        )
+        if not len(eligible):
+            continue
+        available = np.zeros(len(mesh.faces), dtype=bool)
+        available[eligible] = True
+        for group in _smooth_components(mesh, available, 30.0):
+            validated = _validated_seeded_cylinder_fit(
+                mesh, group, seed.axis.copy(), seed.origin.copy(), seed.radius,
+                distance_tolerance, normal_tolerance_degrees,
+            )
+            small = len(group) < 6 or len(np.unique(mesh.faces[group])) < 8
+            if validated is None and small:
+                # A tiny region cannot establish a circle independently. An
+                # adjacent accepted cylinder can supply that missing support,
+                # but the unchanged validator must accept the complete union.
+                selected = np.zeros(len(mesh.faces), dtype=bool)
+                selected[group] = True
+                adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+                touching = selected[adjacency[:, 0]] ^ selected[adjacency[:, 1]]
+                pairs = adjacency[touching]
+                outside = np.where(selected[pairs[:, 0]], pairs[:, 1], pairs[:, 0])
+                if not np.any(face_patch_ids[outside] == seed.patch_id):
+                    continue
+                validated = _validated_seeded_cylinder_fit(
+                    mesh, np.unique(np.r_[seed.face_indices, group]),
+                    seed.axis.copy(), seed.origin.copy(), seed.radius,
+                    distance_tolerance, normal_tolerance_degrees,
+                )
+            if validated is None:
+                continue
+            while f'cylinder-{next_cylinder:03d}' in used_ids:
+                next_cylinder += 1
+            cylinder = _make_analytic_patch(mesh, validated, group, next_cylinder)
+            if small:
+                # Bounds and diagnostics describe this region, not its seed.
+                points = np.asarray(mesh.vertices[cylinder.vertex_indices])
+                relative = points - cylinder.origin
+                axial = relative @ cylinder.axis
+                if float(np.ptp(axial)) <= distance_tolerance * 2:
+                    continue
+                cylinder.start, cylinder.end = float(np.min(axial)), float(np.max(axial))
+                radial = relative - axial[:, None] * cylinder.axis
+                errors = np.abs(np.linalg.norm(radial, axis=1) - cylinder.radius)
+                cylinder.rms_error, cylinder.max_error = _fit_statistics(errors)
+                centers = np.asarray(mesh.triangles_center[group]) - cylinder.origin
+                expected = centers - (centers @ cylinder.axis)[:, None] * cylinder.axis
+                expected /= np.maximum(np.linalg.norm(expected, axis=1)[:, None], 1e-15)
+                cylinder.normal_error_degrees = _normal_error_degrees(
+                    mesh.face_normals[group], expected,
+                )
+            cylindrical_patches.append(cylinder)
+            supports.append(cylinder)
+            used_ids.add(cylinder.patch_id)
+            residual[group] = False
+            face_patch_ids[group] = cylinder.patch_id
+            changed = True
+    by_id = {patch.patch_id: patch for patch in supports}
+    adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    strict_distance = max(distance_tolerance * 0.1, 1e-8)
+    axis_limit = math.sin(math.radians(min(normal_tolerance_degrees, 1.0)))
+    independent_limit = math.sin(math.radians(normal_tolerance_degrees))
+    for group in _smooth_components(mesh, residual, 0.25):
+        vertex_ids = np.unique(mesh.faces[group])
+        if len(group) < 2 or len(vertex_ids) < 4:
+            continue
+        weights = np.asarray(mesh.area_faces[group])
+        normal = np.average(mesh.face_normals[group], axis=0, weights=weights)
+        length = float(np.linalg.norm(normal))
+        if length <= 1e-12:
+            continue
+        normal /= length
+        origin = np.average(mesh.triangles_center[group], axis=0, weights=weights)
+        errors = np.abs((mesh.vertices[vertex_ids] - origin) @ normal)
+        normal_error = _normal_error_degrees(
+            mesh.face_normals[group], np.tile(normal, (len(group), 1)),
+        )
+        if float(np.max(errors)) > 1e-7 or normal_error > 0.25:
+            continue
+        available = np.zeros(len(mesh.faces), dtype=bool)
+        available[group] = True
+        touching = available[adjacency[:, 0]] ^ available[adjacency[:, 1]]
+        pairs = adjacency[touching]
+        outside = np.where(available[pairs[:, 0]], pairs[:, 1], pairs[:, 0])
+        tangent = []
+        for identifier in sorted(set(face_patch_ids[outside])):
+            cylinder = by_id.get(identifier)
+            if cylinder is None or abs(float(normal @ cylinder.axis)) > axis_limit:
+                continue
+            offset = abs(float((cylinder.origin - origin) @ normal))
+            if abs(offset - cylinder.radius) <= strict_distance:
+                tangent.append(cylinder)
+        if not any(
+            np.linalg.norm(np.cross(first.axis, second.axis)) > independent_limit
+            for index, first in enumerate(tangent) for second in tangent[index + 1:]
+        ):
+            continue
+        x_direction, y_direction = _plane_basis(normal)
+        loops_3d = _boundary_loops(mesh, group)
+        loops_2d = [np.column_stack(((loop - origin) @ x_direction,
+                                    (loop - origin) @ y_direction)) for loop in loops_3d]
+        polygons = [Polygon(loop) for loop in loops_2d if len(loop) >= 4]
+        if not polygons or any(not polygon.is_valid for polygon in polygons):
+            continue
+        outer = max(polygons, key=lambda item: item.area)
+        polygon = outer
+        for hole in polygons:
+            if hole is outer:
+                continue
+            if not polygon.contains(hole):
+                polygon = None
+                break
+            polygon = polygon.difference(hole)
+        area = float(np.sum(weights))
+        if (not isinstance(polygon, Polygon)
+                or not np.isclose(polygon.area, area, rtol=1e-6, atol=1e-12)):
+            continue
+        while f'plane-{next_plane:03d}' in used_ids:
+            next_plane += 1
+        plane = PlanarPatch(
+            patch_id=f'plane-{next_plane:03d}', face_indices=group, vertex_indices=vertex_ids,
+            origin=origin, normal=normal, x_direction=x_direction, y_direction=y_direction,
+            area=area, boundary_loops=loops_2d, polygon=polygon, boundary_loops_3d=loops_3d,
+            rms_error=float(np.sqrt(np.mean(errors**2))), max_error=float(np.max(errors)),
+            normal_error_degrees=normal_error,
+        )
+        planar_patches.append(plane)
+        used_ids.add(plane.patch_id)
+        residual[group] = False
+        face_patch_ids[group] = plane.patch_id
+        changed = True
+    if not changed:
+        return
+    retained = []
+    for patch in freeform_patches:
+        remaining = patch.face_indices[residual[patch.face_indices]]
+        if len(remaining) == len(patch.face_indices):
+            retained.append(patch)
+            continue
+        available = np.zeros(len(mesh.faces), dtype=bool)
+        available[remaining] = True
+        for index, group in enumerate(_smooth_components(mesh, available, 180.0)):
+            identifier = patch.patch_id if not index else f'{patch.patch_id}-part-{index}'
+            while index and identifier in used_ids:
+                index += 1
+                identifier = f'{patch.patch_id}-part-{index}'
+            used_ids.add(identifier)
+            retained.append(FreeformPatch(
+                patch_id=identifier, face_indices=group,
+                vertex_indices=np.unique(mesh.faces[group]),
+                area=float(np.sum(mesh.area_faces[group])),
+                boundary_loops=_boundary_loops(mesh, group),
+            ))
+            face_patch_ids[group] = identifier
+    freeform_patches[:] = retained
 
 
 def _absorb_tangent_planar_slivers(
@@ -4214,7 +4766,7 @@ def detect_surface_graph(
     )
     cache = getattr(data, "section_cache", None)
     cache_key = (
-        "surface-graph-v47:"
+        "surface-graph-v60:"
         f"{tolerance:.12g}:"
         f"{normal_tolerance_degrees:.8g}:"
         f"{smooth_angle_degrees:.8g}:"
@@ -4387,6 +4939,36 @@ def detect_surface_graph(
             face_patch_ids[patch.face_indices] = patch.patch_id
     else:
         revolution_patches = []
+
+    # Whole meridian runs are stronger evidence than local approximating
+    # cylinders on a fine cone. Use an independently supported coaxial axis
+    # before local consensus can fragment that source profile. The atomic
+    # partition retains every original primitive/node/normal/level check.
+    profile_axis = (
+        _coaxial_cylinder_axis(base_cylinders, data.diagonal, tolerance)
+        if freeform_patches else None
+    )
+    if freeform_patches and profile_axis is not None:
+        retained_profiles: list[FreeformPatch] = []
+        counters["cylinder"] = len(base_cylinders)
+        counters["cone"] = len(recognized["cone"])
+        for original in freeform_patches:
+            pieces = _coaxial_profile_regions(
+                data, original.face_indices, profile_axis, tolerance,
+                normal_tolerance_degrees, minimum_area,
+            )
+            if not pieces:
+                retained_profiles.append(original)
+                continue
+            for fit, component in pieces:
+                counters[fit.kind] += 1
+                primitive = _make_analytic_patch(mesh, fit, component, counters[fit.kind])
+                if fit.kind == "cylinder":
+                    base_cylinders.append(primitive)
+                else:
+                    recognized[fit.kind].append(primitive)
+                face_patch_ids[component] = primitive.patch_id
+        freeform_patches = retained_profiles
 
     # A provisional general extrusion can itself be a tangent chain of
     # elementary cylinders. Primitive supports are more editable and much
@@ -4956,8 +5538,22 @@ def detect_surface_graph(
                 else None
             )
             if revolution is not None:
-                revolution_patches.append(revolution)
-                face_patch_ids[revolution.face_indices] = revolution.patch_id
+                pieces = _piecewise_linear_revolution_regions(
+                    data, revolution, tolerance, normal_tolerance_degrees, minimum_area,
+                )
+                if pieces:
+                    for fit, component in pieces:
+                        existing = base_cylinders if fit.kind == "cylinder" else recognized["cone"]
+                        index = max(
+                            (int(patch.patch_id.rsplit("-", 1)[-1]) for patch in existing),
+                            default=0,
+                        ) + 1
+                        primitive = _make_analytic_patch(mesh, fit, component, index)
+                        existing.append(primitive)
+                        face_patch_ids[component] = primitive.patch_id
+                else:
+                    revolution_patches.append(revolution)
+                    face_patch_ids[revolution.face_indices] = revolution.patch_id
                 continue
             # Primitive extraction is complete, so it is now safe to split a
             # genuinely non-analytic residual at creases into fit-friendly
@@ -5015,6 +5611,16 @@ def detect_surface_graph(
                 patch = analytic_by_id.get(patch_id)
                 if isinstance(patch, PlanarPatch):
                     errors = np.abs((points - patch.origin) @ patch.normal)
+                    # A tiny region is not planar merely because flattening it
+                    # moves little material. Preserve the original plane-fit
+                    # node and normal limits when changing its owner.
+                    normal_error = _normal_error_degrees(
+                        np.asarray(mesh.face_normals[residual.face_indices]),
+                        np.tile(patch.normal, (len(residual.face_indices), 1)),
+                    )
+                    if (float(np.max(errors)) > max(tolerance * 0.1, 1e-8)
+                            or normal_error > 0.25):
+                        continue
                 elif isinstance(patch, CylindricalPatch):
                     relative = points - patch.origin
                     axial = relative @ patch.axis
@@ -5052,6 +5658,14 @@ def detect_surface_graph(
             target.area = float(np.sum(mesh.area_faces[target.face_indices]))
             loops_3d = _boundary_loops(mesh, target.face_indices)
             if isinstance(target, PlanarPatch):
+                support = np.asarray(mesh.vertices[target.vertex_indices], dtype=float)
+                target.rms_error, target.max_error = _fit_statistics(
+                    np.abs((support - target.origin) @ target.normal),
+                )
+                target.normal_error_degrees = _normal_error_degrees(
+                    np.asarray(mesh.face_normals[target.face_indices]),
+                    np.tile(target.normal, (len(target.face_indices), 1)),
+                )
                 target.boundary_loops_3d = loops_3d
                 target.boundary_loops = [
                     np.column_stack(
@@ -5570,6 +6184,18 @@ def detect_surface_graph(
         tolerance,
         normal_tolerance_degrees,
     )
+    _recover_supported_residual_primitives(
+        data,
+        planar_patches,
+        base_cylinders,
+        freeform_patches,
+        face_patch_ids,
+        tolerance,
+        normal_tolerance_degrees,
+    )
+    _merge_coincident_connected_cylinders(
+        mesh, base_cylinders, face_patch_ids, tolerance, normal_tolerance_degrees,
+    )
     _absorb_cylindrical_chord_fragments(
         mesh,
         planar_patches,
@@ -5577,6 +6203,7 @@ def detect_surface_graph(
         face_patch_ids,
         tolerance,
         normal_tolerance_degrees,
+        coordinate_scale=getattr(getattr(data, "report", None), "unit_scale", 1.0),
     )
     _absorb_tangent_planar_slivers(
         mesh,
