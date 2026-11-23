@@ -33,6 +33,7 @@ export function createConversionNotifier(environment = globalThis) {
       const title = "STEP conversion complete";
       const options = {
         body: `${fileName || "Your STL"} is ready. Open the converter to download the result.`,
+        silent: true,
         tag: `stl-to-step-${runId}`,
         data: { url: resultUrl.href },
       };

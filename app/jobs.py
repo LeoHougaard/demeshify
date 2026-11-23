@@ -57,9 +57,13 @@ def _terminate_process(process: subprocess.Popen) -> None:
                 timeout=10,
                 check=False,
             )
-        finally:
-            if process.poll() is None:
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if process.poll() is None:
+            try:
                 process.kill()
+            except ProcessLookupError:
+                pass
     else:
         try:
             os.killpg(process.pid, signal.SIGKILL)

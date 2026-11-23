@@ -93,3 +93,20 @@ test("returning to the tab wakes the pending poll immediately", async () => {
 
   assert.equal(clearedTimer, 42);
 });
+
+test("a failed conversion still loads its saved verification report", async () => {
+  const failed = { id: runId, status: "failed" };
+  const fetchImpl = async (url) => url.endsWith("/progress")
+    ? response({ status: "failed", error: "Reconstruction failed." })
+    : response(failed);
+
+  assert.equal(await pollReconstruction(runId, { fetchImpl }), failed);
+});
+
+test("a failure without a saved report displays the conversion error", async () => {
+  const fetchImpl = async (url) => url.endsWith("/progress")
+    ? response({ status: "failed", error: "The STL contains non-finite coordinates." })
+    : response({ detail: "Run not found" }, 404);
+
+  await assert.rejects(pollReconstruction(runId, { fetchImpl }), /non-finite coordinates/);
+});

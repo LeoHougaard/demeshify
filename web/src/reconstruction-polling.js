@@ -2,7 +2,9 @@ const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429]);
 
 async function fetchJson(fetchImpl, url) {
   const response = await fetchImpl(url, { cache: "no-store" });
-  const payload = await response.json().catch(() => ({}));
+  const payload = response.ok
+    ? await response.json()
+    : await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(payload.detail || `Request failed (${response.status}).`);
     error.retryable = response.status >= 500 || RETRYABLE_HTTP_STATUSES.has(response.status);
@@ -54,24 +56,24 @@ export async function pollReconstruction(runId, options = {}) {
     }
     if (!isActive()) return null;
 
-    transientFailures = 0;
     onProgress(progress);
-    if (progress.status === "failed") {
-      throw new Error(progress.error || "Reconstruction failed.");
-    }
-    if (progress.status === "complete") {
+    if (progress.status === "complete" || progress.status === "failed") {
       try {
         const report = await fetchJson(fetchImpl, `/api/runs/${runId}`);
         if (!isActive()) return null;
         return report;
       } catch (error) {
         if (!isActive()) return null;
-        if (error.retryable === false) throw error;
+        if (error.retryable === false) {
+          if (progress.status === "failed" && progress.error) throw new Error(progress.error);
+          throw error;
+        }
         transientFailures += 1;
         await pause(Math.min(5000, 750 * 2 ** (transientFailures - 1)));
         continue;
       }
     }
+    transientFailures = 0;
     await pause(650);
   }
   return null;

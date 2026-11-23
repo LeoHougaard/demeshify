@@ -5,7 +5,7 @@ self.addEventListener("notificationclick", (event) => {
       event.notification.data?.url || self.registration.scope,
       self.location.origin,
     );
-    const targetUrl = requestedUrl.origin === self.location.origin
+    const targetUrl = requestedUrl.href.startsWith(self.registration.scope)
       ? requestedUrl.href
       : self.registration.scope;
     const windowClients = await self.clients.matchAll({
@@ -13,8 +13,7 @@ self.addEventListener("notificationclick", (event) => {
       includeUncontrolled: true,
     });
     for (const client of windowClients) {
-      if (new URL(client.url).origin !== self.location.origin) continue;
-      if (client.url !== targetUrl) await client.navigate(targetUrl);
+      if (client.url !== targetUrl) continue;
       return client.focus();
     }
     return self.clients.openWindow(targetUrl);

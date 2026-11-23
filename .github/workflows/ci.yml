@@ -49,5 +49,10 @@ jobs:
       - name: Audit frontend dependencies
         run: npm --prefix web audit --audit-level=high
 
-      - name: Build frontend
-        run: npm --prefix web run build
+      - name: Test frontend
+        run: npm --prefix web test
+
+      - name: Build frontend distributions
+        run: |
+          npm --prefix web run build
+          npm --prefix web run build:browser -- --base=/demeshify/

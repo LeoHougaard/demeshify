@@ -94,6 +94,18 @@ async def _request_job():
         REQUEST_TASKS.discard(task)
 
 
+@asynccontextmanager
+async def _worker_task(run_id: str, operation, *args):
+    allow_job(run_id)
+    task = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        yield task
+    except asyncio.CancelledError:
+        await asyncio.to_thread(terminate_job_processes, run_id)
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+
+
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
@@ -187,32 +199,13 @@ async def reconstruct_endpoint(
     engine: Annotated[str, Form()] = "surface_brep",
 ) -> ReconstructionReport:
     reconstructor = _reconstructor(engine)
-    run_id: str | None = None
-    reconstruction_task = None
     try:
         async with _request_job():
             run_id, target, safe_name = await _receive_upload(file, input_units)
-            async with RECONSTRUCTION_SLOT:
-                allow_job(run_id)
-                reconstruction_task = asyncio.create_task(
-                    asyncio.to_thread(
-                        reconstructor,
-                        run_id,
-                        target,
-                        safe_name,
-                        input_units,
-                    )
-                )
-                return await reconstruction_task
-    except asyncio.CancelledError:
-        if run_id is not None:
-            await asyncio.to_thread(terminate_job_processes, run_id)
-        if reconstruction_task is not None:
-            try:
-                await reconstruction_task
-            except (Exception, asyncio.CancelledError):
-                pass
-        raise
+            async with RECONSTRUCTION_SLOT, _worker_task(
+                run_id, reconstructor, run_id, target, safe_name, input_units
+            ) as task:
+                return await asyncio.shield(task)
     except HTTPException:
         raise
     except ValueError as exc:
@@ -258,9 +251,10 @@ async def _run_reconstruction_job(
                 apply_stage(progress, label)
 
     worker_progress_path = target.parent / "surface-worker-progress.log"
-    reconstruction_task = None
     try:
-        async with RECONSTRUCTION_SLOT:
+        async with RECONSTRUCTION_SLOT, _worker_task(
+            run_id, _reconstructor(engine), run_id, target, safe_name, input_units, update
+        ) as reconstruction_task:
             with RUN_PROGRESS_LOCK:
                 progress = RUN_PROGRESS[run_id]
                 progress.update(
@@ -268,16 +262,6 @@ async def _run_reconstruction_job(
                     stage="Starting reconstruction",
                     detail="Preparing the local geometry engine",
                 )
-            reconstruction_task = asyncio.create_task(
-                asyncio.to_thread(
-                    _reconstructor(engine),
-                    run_id,
-                    target,
-                    safe_name,
-                    input_units,
-                    update,
-                )
-            )
             progress_offset = 0
             while not reconstruction_task.done():
                 progress_offset = _consume_worker_progress(
@@ -326,14 +310,6 @@ async def _run_reconstruction_job(
                         else None
                     ),
                 )
-    except asyncio.CancelledError:
-        await asyncio.to_thread(terminate_job_processes, run_id)
-        if reconstruction_task is not None:
-            try:
-                await reconstruction_task
-            except (Exception, asyncio.CancelledError):
-                pass
-        raise
     except ValueError as exc:
         with RUN_PROGRESS_LOCK:
             progress = RUN_PROGRESS[run_id]
@@ -374,7 +350,6 @@ async def start_reconstruction_endpoint(
             await file.close()
             raise
         run_id, target, safe_name = await _receive_upload(file, input_units)
-        allow_job(run_id)
         with RUN_PROGRESS_LOCK:
             RUN_PROGRESS[run_id] = new_progress(run_id)
         task = asyncio.create_task(
@@ -514,22 +489,11 @@ async def edit_plan_endpoint(
         raise HTTPException(404, "Run not found")
     async with _request_job():
         lock = EDIT_LOCKS.setdefault(run_id, asyncio.Lock())
-        reconstruction_task = None
         try:
-            async with lock, RECONSTRUCTION_SLOT:
-                allow_job(run_id)
-                reconstruction_task = asyncio.create_task(
-                    asyncio.to_thread(edit_in_worker, run_id, request)
-                )
-                return await reconstruction_task
-        except asyncio.CancelledError:
-            await asyncio.to_thread(terminate_job_processes, run_id)
-            if reconstruction_task is not None:
-                try:
-                    await reconstruction_task
-                except (Exception, asyncio.CancelledError):
-                    pass
-            raise
+            async with lock, RECONSTRUCTION_SLOT, _worker_task(
+                run_id, edit_in_worker, run_id, request
+            ) as task:
+                return await asyncio.shield(task)
         except FileNotFoundError as exc:
             raise HTTPException(404, "Run not found") from exc
         except RevisionConflictError as exc:
