@@ -96,8 +96,12 @@ while fixture readiness or scoring remains unresolved.
 Each fresh case has a unique attempt directory. Completed records use a new
 `frozen-controller-completed-v1` namespace, checksummed envelopes and atomic,
 exclusive publication. No legacy non-isolated cache is reused. Changed records,
-inputs, retained bytes or runtime/code identities are refused. Resume preserves
-historical conversion/grade timings and labels them reused; lookup time is separate.
+inputs, retained bytes or runtime/code identities are refused. Checksums identify
+records but do not authenticate their outcome. A cached success is therefore only
+a locator for its sealed conversion: the controller validates that attestation and
+freshly grades the retained output before publishing acceptance. Non-passing
+outcomes can resume without another grade. Reused conversions retain their
+historical timings; revalidated grades receive fresh timing and provenance fields.
 Failures and new fixture preparations count toward `--batch-cases`; unchanged reused
 prefixes do not. Partial or interrupted
 attempts never block a clean retry and are never silently treated as completed.

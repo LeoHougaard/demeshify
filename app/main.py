@@ -16,13 +16,34 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .editor import RevisionConflictError
-from .jobs import edit_in_worker, reconstruct_in_worker
+from .jobs import (
+    allow_job,
+    edit_in_worker,
+    reconstruct_in_worker,
+    reset_job_system,
+    terminate_job_processes,
+)
 from .progress import apply_stage, new_progress, public_progress
 from .schemas import PlanEditRequest, ReconstructionReport
 from .security import LocalRequestMiddleware
 from .storage import ROOT, load_report, run_dir
 
-app = FastAPI(title="STL to STEP Converter", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    reset_job_system()
+    yield
+    tasks = [
+        task for task in [*RUN_TASKS, *REQUEST_TASKS] if isinstance(task, asyncio.Task)
+    ]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.to_thread(terminate_job_processes)
+
+
+app = FastAPI(title="STL to STEP Converter", version="0.1.0", lifespan=_lifespan)
 app.add_middleware(LocalRequestMiddleware)
 LOGGER = logging.getLogger(__name__)
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
@@ -166,17 +187,32 @@ async def reconstruct_endpoint(
     engine: Annotated[str, Form()] = "surface_brep",
 ) -> ReconstructionReport:
     reconstructor = _reconstructor(engine)
+    run_id: str | None = None
+    reconstruction_task = None
     try:
         async with _request_job():
             run_id, target, safe_name = await _receive_upload(file, input_units)
             async with RECONSTRUCTION_SLOT:
-                return await asyncio.to_thread(
-                    reconstructor,
-                    run_id,
-                    target,
-                    safe_name,
-                    input_units,
+                allow_job(run_id)
+                reconstruction_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        reconstructor,
+                        run_id,
+                        target,
+                        safe_name,
+                        input_units,
+                    )
                 )
+                return await reconstruction_task
+    except asyncio.CancelledError:
+        if run_id is not None:
+            await asyncio.to_thread(terminate_job_processes, run_id)
+        if reconstruction_task is not None:
+            try:
+                await reconstruction_task
+            except (Exception, asyncio.CancelledError):
+                pass
+        raise
     except HTTPException:
         raise
     except ValueError as exc:
@@ -222,6 +258,7 @@ async def _run_reconstruction_job(
                 apply_stage(progress, label)
 
     worker_progress_path = target.parent / "surface-worker-progress.log"
+    reconstruction_task = None
     try:
         async with RECONSTRUCTION_SLOT:
             with RUN_PROGRESS_LOCK:
@@ -289,6 +326,25 @@ async def _run_reconstruction_job(
                         else None
                     ),
                 )
+    except asyncio.CancelledError:
+        await asyncio.to_thread(terminate_job_processes, run_id)
+        if reconstruction_task is not None:
+            try:
+                await reconstruction_task
+            except (Exception, asyncio.CancelledError):
+                pass
+        raise
+    except ValueError as exc:
+        with RUN_PROGRESS_LOCK:
+            progress = RUN_PROGRESS[run_id]
+            progress.update(
+                status="failed",
+                stage="Reconstruction stopped",
+                detail="The mesh or reconstruction settings were rejected",
+                percent=min(float(progress["percent"]), 99.0),
+                preview_path=None,
+                error=str(exc),
+            )
     except Exception:
         LOGGER.exception("Background reconstruction failed for run %s", run_id)
         with RUN_PROGRESS_LOCK:
@@ -297,6 +353,7 @@ async def _run_reconstruction_job(
                 status="failed",
                 stage="Reconstruction stopped",
                 detail="The geometry engine could not complete this model",
+                preview_path=None,
                 error="Reconstruction failed. Check the server log for details.",
             )
     finally:
@@ -317,6 +374,7 @@ async def start_reconstruction_endpoint(
             await file.close()
             raise
         run_id, target, safe_name = await _receive_upload(file, input_units)
+        allow_job(run_id)
         with RUN_PROGRESS_LOCK:
             RUN_PROGRESS[run_id] = new_progress(run_id)
         task = asyncio.create_task(
@@ -456,9 +514,22 @@ async def edit_plan_endpoint(
         raise HTTPException(404, "Run not found")
     async with _request_job():
         lock = EDIT_LOCKS.setdefault(run_id, asyncio.Lock())
+        reconstruction_task = None
         try:
             async with lock, RECONSTRUCTION_SLOT:
-                return await asyncio.to_thread(edit_in_worker, run_id, request)
+                allow_job(run_id)
+                reconstruction_task = asyncio.create_task(
+                    asyncio.to_thread(edit_in_worker, run_id, request)
+                )
+                return await reconstruction_task
+        except asyncio.CancelledError:
+            await asyncio.to_thread(terminate_job_processes, run_id)
+            if reconstruction_task is not None:
+                try:
+                    await reconstruction_task
+                except (Exception, asyncio.CancelledError):
+                    pass
+            raise
         except FileNotFoundError as exc:
             raise HTTPException(404, "Run not found") from exc
         except RevisionConflictError as exc:

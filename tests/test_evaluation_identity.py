@@ -1,5 +1,6 @@
 import json
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
@@ -78,8 +79,8 @@ def test_progressive_cache_reuses_only_identical_cases_and_preserves_real_revisi
         identifier = command[command.index('--worker-id') + 1]
         calls.append(identifier)
         from pathlib import Path
-        Path(output).write_text(json.dumps({'id': identifier, 'accepted': True,
-                                          'status': 'complete'}))
+        Path(output).write_text(json.dumps({'id': identifier, 'accepted': False,
+                                          'status': 'best_effort'}))
         return 0
 
     monkeypatch.setattr(benchmark, 'sampled_resources', resources)
@@ -158,3 +159,58 @@ def test_interrupted_worker_never_publishes_a_mislabeled_cache_record(tmp_path, 
     benchmark.main()
     assert attempts[0].exists() and len(attempts) == 2
     assert json.loads(output.read_text())['summary']['fresh_cases'] == 1
+
+
+def test_cached_success_is_freshly_revalidated_and_contradictions_are_rejected(
+    tmp_path, monkeypatch,
+):
+    import tools.benchmark_multires_corpus as benchmark
+
+    stl, step = tmp_path / 'input.stl', tmp_path / 'reference.step'
+    stl.write_bytes(b'protocol STL')
+    step.write_bytes(b'protocol STEP')
+    case = {'id': 'model-q00', 'source_model_id': 'model', 'split': 'development',
+            'preset': 'q00', 'stl': str(stl), 'input_sha256': digest(stl),
+            'source_step': str(step), 'source_sha256': digest(step)}
+    manifest = tmp_path / 'manifest.json'
+    manifest.write_text(json.dumps({'cases': [case]}))
+    monkeypatch.setattr(benchmark, 'runtime_identity', lambda: {})
+    monkeypatch.setattr(benchmark, 'source_identity', lambda root: {'fit': 'code-a'})
+    monkeypatch.setattr(benchmark.subprocess, 'check_output', lambda *a, **k: 'head')
+    calls = []
+
+    @contextmanager
+    def resources():
+        yield {}
+
+    def worker(command, **kwargs):
+        calls.append(command)
+        output = command[command.index('--output') + 1]
+        Path(output).write_text(json.dumps({
+            'id': case['id'], 'accepted': True, 'status': 'complete',
+        }))
+        return 0
+
+    monkeypatch.setattr(benchmark, 'sampled_resources', resources)
+    monkeypatch.setattr(benchmark, 'run_bounded_process', worker)
+
+    def run(label):
+        output = tmp_path / f'{label}.json'
+        monkeypatch.setattr('sys.argv', ['benchmark', str(manifest), '--output', str(output)])
+        benchmark.main()
+        return json.loads(output.read_text())
+
+    run('first')
+    resumed = run('second')
+    assert len(calls) == 2
+    assert resumed['results'][0]['cache_revalidated']
+    assert not resumed['results'][0]['reused']
+    assert resumed['summary']['revalidated_cases'] == 1
+
+    cache = next((tmp_path / 'multires-case-cache').glob('*.json'))
+    forged = json.loads(cache.read_text())
+    forged['reference_geometry_accepted'] = False
+    cache.write_text(json.dumps(forged))
+    with pytest.raises(ValueError, match='contradicts its component gates'):
+        run('forged')
+    assert len(calls) == 2

@@ -288,6 +288,41 @@ def test_resume_reuses_only_matching_results_and_survives_bad_worker_json(tmp_pa
     assert not failed["accepted"]
 
 
+def test_cached_surface_success_is_recomputed_and_contradictions_fail(tmp_path, monkeypatch):
+    source = tmp_path / "input.stl"
+    source.write_bytes(b"protocol input")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{}', encoding="utf-8")
+    case = {"id": "part", "stl": "input.stl"}
+    calls = []
+
+    def worker(command, **kwargs):
+        calls.append(command)
+        path = Path(command[command.index("--worker-output") + 1])
+        path.write_text(json.dumps({
+            "id": "part",
+            "status": "complete",
+            "accepted": True,
+            "geometric_accepted": True,
+            "clean_analytic": True,
+        }))
+        return 0
+
+    monkeypatch.setattr(benchmark_module, "run_bounded_process", worker)
+    first = benchmark_module._bounded_case(case, manifest, tmp_path, 240, True)
+    resumed = benchmark_module._bounded_case(case, manifest, tmp_path, 240, True)
+    assert first["accepted"] and resumed["accepted"]
+    assert resumed["cache_revalidated"]
+    assert len(calls) == 2
+
+    cached = json.loads((tmp_path / "part.json").read_text())
+    cached["geometric_accepted"] = False
+    (tmp_path / "part.json").write_text(json.dumps(cached))
+    with pytest.raises(ValueError, match="contradicts its component gates"):
+        benchmark_module._bounded_case(case, manifest, tmp_path, 240, True)
+    assert len(calls) == 2
+
+
 def test_audit_allowance_cannot_accept_an_overdue_conversion(tmp_path, monkeypatch):
     source = tmp_path / "input.stl"
     source.write_bytes(b"mock input")

@@ -184,6 +184,33 @@ def test_failed_report_is_not_advertised_as_a_completed_model(tmp_path, monkeypa
     assert progress["preview_url"] is None
 
 
+def test_background_validation_error_is_shown_without_a_server_log(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(storage, "RUNS", tmp_path)
+
+    def invalid_mesh(*_args, **_kwargs):
+        raise ValueError("The STL contains no triangles")
+
+    monkeypatch.setattr(main_module, "_reconstructor", lambda _engine: invalid_mesh)
+    stl = trimesh.creation.box().export(file_type="stl")
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        start = client.post(
+            "/api/reconstruct/start",
+            files={"file": ("invalid.stl", stl, "model/stl")},
+        )
+        run_id = start.json()["id"]
+        for _ in range(100):
+            progress = client.get(f"/api/runs/{run_id}/progress").json()
+            if progress["status"] == "failed":
+                break
+            time.sleep(0.01)
+
+    assert progress["error"] == "The STL contains no triangles"
+    assert "server log" not in progress["error"]
+    assert progress["preview_url"] is None
+
+
 def test_full_background_queue_rejects_before_storing_upload(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(storage, "RUNS", tmp_path)
     monkeypatch.setattr(

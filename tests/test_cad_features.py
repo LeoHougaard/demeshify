@@ -19,6 +19,7 @@ from app.schemas import (
     PolygonProfile,
     ReconstructionPlan,
     RevolveFeature,
+    RoundHoleFeature,
     SphereFeature,
     TaperedAddFeature,
 )
@@ -189,9 +190,13 @@ def test_oriented_cylinder_local_chamfer_matches_generated_source(
     )
 
     runtime = build_plan(plan)
+    plain = build_plan(
+        ReconstructionPlan(name=plan.name, base=plan.base, operations=plan.operations[:1])
+    )
     generated = execute_generated_source(plan, tmp_path, monkeypatch)
     surface_types = {face.geomType() for face in runtime.val().Faces()}
 
+    assert runtime.val().Volume() < plain.val().Volume()
     assert runtime.val().isValid()
     assert generated.val().isValid()
     assert generated.val().Volume() == pytest.approx(
@@ -532,3 +537,95 @@ def test_sphere_cut_is_editable_and_generated_source_matches(
         rel=1e-9,
     )
     assert "SPHERE" in {face.geomType() for face in runtime.val().Faces()}
+
+
+def test_through_round_hole_and_local_chamfer_match_generated_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = ReconstructionPlan(
+        name="through-chamfered-hole",
+        base=ExtrudeFeature(
+            axis=Axis.Z,
+            start=0,
+            depth=4,
+            outer=rectangle(-5, -5, 5, 5),
+        ),
+        operations=[
+            RoundHoleFeature(
+                feature_id="hole",
+                axis=Axis.Z,
+                center=(0, 0),
+                diameter=4,
+                start=0,
+                depth=1,
+                through=True,
+            ),
+            EdgeFinishFeature(
+                mode="chamfer",
+                axis=Axis.Z,
+                end="start",
+                size=0.2,
+                selector="circle",
+                center=(0, 0),
+                radius=2,
+                target_feature_id="hole",
+            ),
+        ],
+    )
+
+    runtime = build_plan(plan)
+    plain = build_plan(
+        ReconstructionPlan(name=plan.name, base=plan.base, operations=plan.operations[:1])
+    )
+    generated = execute_generated_source(plan, tmp_path, monkeypatch)
+
+    assert runtime.val().Volume() < plain.val().Volume()
+    assert runtime.val().isValid()
+    assert len(runtime.val().Faces()) == 8
+    assert "CONE" in {face.geomType() for face in runtime.val().Faces()}
+    assert generated.val().Volume() == pytest.approx(runtime.val().Volume(), rel=1e-9)
+
+
+def test_oriented_through_all_matches_generated_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = ReconstructionPlan(
+        name="through-all-cut",
+        base=ExtrudeFeature(
+            axis=Axis.Z,
+            start=0,
+            depth=10,
+            outer=rectangle(-5, -5, 5, 5),
+        ),
+        operations=[
+            OrientedBooleanExtrudeFeature(
+                mode="cut",
+                origin=(0, 0, 0),
+                direction=(0, 0, 1),
+                x_direction=(1, 0, 0),
+                depth=5,
+                outer=CircleProfile(center=(0, 0), radius=1),
+                extent_kind="through_all",
+            )
+        ],
+    )
+
+    runtime = build_plan(plan)
+    generated = execute_generated_source(plan, tmp_path, monkeypatch)
+
+    assert runtime.val().Volume() == pytest.approx(1000 - 10 * 3.141592653589793)
+    assert generated.val().Volume() == pytest.approx(runtime.val().Volume(), rel=1e-9)
+
+
+def test_base_extrusion_rejects_meaningless_through_all() -> None:
+    with pytest.raises(ValueError, match="base extrusion cannot be through-all"):
+        OrientedExtrudeFeature(
+            origin=(0, 0, 0),
+            direction=(0, 0, 1),
+            x_direction=(1, 0, 0),
+            depth=5,
+            outer=CircleProfile(center=(0, 0), radius=1),
+            extent_kind="through_all",
+        )

@@ -546,13 +546,30 @@ def _bounded_case(
     identifier = str(case["id"])
     cache_path = cache_directory / f"{identifier}.json"
     fingerprint = evaluation_fingerprint(case, manifest_path, timeout)
+    cache_revalidated = False
     if resume and cache_path.is_file():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if cached.get("evaluation_fingerprint") == fingerprint:
-                return cached
         except (ValueError, OSError):
-            pass
+            cached = None
+        if cached is not None and cached.get("evaluation_fingerprint") == fingerprint:
+            accepted = cached.get("accepted")
+            if accepted is not None and type(accepted) is not bool:
+                raise ValueError("Cached result has a non-boolean acceptance flag")
+            if accepted is True:
+                if (cached.get("status") != "complete"
+                        or cached.get("geometric_accepted") is not True
+                        or cached.get("clean_analytic") is not True):
+                    raise ValueError("Cached accepted result contradicts its component gates")
+                # A matching unkeyed fingerprint is not a fresh grader proof.
+                # Re-run successful cases instead of trusting editable booleans.
+                cache_revalidated = True
+            else:
+                if (cached.get("status") == "complete"
+                        and cached.get("geometric_accepted") is True
+                        and cached.get("clean_analytic") is True):
+                    raise ValueError("Cached rejected result has all acceptance gates set")
+                return cached
     cache_path.unlink(missing_ok=True)
     command = [
         sys.executable, str(Path(__file__).resolve()), str(manifest_path.resolve()),
@@ -593,6 +610,8 @@ def _bounded_case(
         }
     result["case_wall_seconds"] = time.perf_counter() - started
     result["evaluation_fingerprint"] = fingerprint
+    if cache_revalidated:
+        result["cache_revalidated"] = True
     cache_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 

@@ -144,3 +144,18 @@ def test_touching_nonmanifold_solids_remain_unaccepted(tmp_path: Path):
     assert data.report.nonmanifold_edge_count > 0
     assert data.report.volume_mm3 is None
     assert data.boundary_subdivisions == 0
+
+
+def test_cleanup_does_not_merge_distinct_nearby_vertices(tmp_path: Path):
+    first = trimesh.creation.box(extents=(1e-4, 1e-4, 1e-4))
+    second = first.copy()
+    second.apply_translation((1e-4 + 4e-9, 0, 0))
+    path = tmp_path / "nearby-bodies.stl"
+    trimesh.util.concatenate([first, second]).export(path)
+
+    data = load_mesh(path, path.name)
+
+    assert len(data.mesh.vertices) == 16
+    assert data.report.body_count == data.report.solid_count == 2
+    assert data.report.watertight
+    assert data.report.nonmanifold_edge_count == 0

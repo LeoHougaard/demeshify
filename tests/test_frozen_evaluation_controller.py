@@ -247,7 +247,9 @@ def test_resume_skips_reused_prefix_and_batch_counts_only_fresh(tmp_path):
     assert second["summary"]["fresh_cases"] == 1 and second["summary"]["reused_cases"] == 1
     assert len(fixture.backend.convert_calls) == 2
     assert second["results"][0]["conversion_wall_seconds"] == 1.25
-    assert second["results"][0]["timing_provenance"] == "historical_verified_case"
+    assert second["results"][0]["timing_provenance"] == "historical_conversion_fresh_grade"
+    assert second["results"][0]["cache_revalidated"]
+    assert len(fixture.backend.grade_calls) == 3
     assert "reuse_lookup_wall_seconds" in second["results"][0]
     third = fixture.run(batch=1)
     assert third["summary"]["complete"] and len(fixture.backend.convert_calls) == 3
@@ -291,6 +293,75 @@ def test_cache_rejects_changed_record_or_retained_bytes(tmp_path, tamper):
     with pytest.raises(controller.ControllerError, match="changed"):
         fixture.run()
     assert len(fixture.backend.convert_calls) == 1
+
+
+def test_cached_success_uses_fresh_grade_not_stale_acceptance(tmp_path):
+    fixture = Fixture(tmp_path, cases=1)
+    fixture.run()
+    fixture.backend.grade_change = lambda row: row.update(
+        accepted=False, status="best_effort"
+    )
+
+    resumed = fixture.run()
+
+    assert not resumed["results"][0]["accepted"]
+    assert resumed["results"][0]["cache_revalidated"]
+    assert resumed["results"][0]["reused"]
+    assert len(fixture.backend.convert_calls) == 1
+    assert len(fixture.backend.grade_calls) == 2
+
+
+def test_checksum_valid_forged_success_requires_real_conversion_and_grade(tmp_path):
+    fixture = Fixture(tmp_path, cases=1)
+    fixture.run()
+    path = next((fixture.root / "frozen-controller-completed-v1").glob("*.json"))
+    envelope = json.loads(path.read_text())
+    original = envelope["result"]
+    envelope["result"] = {
+        "id": original["id"],
+        "source_model_id": original["source_model_id"],
+        "split": original["split"],
+        "preset": original["preset"],
+        "attempt": original["attempt"],
+        "accepted": True,
+        "certified": True,
+        "execution_certified": True,
+        "solver_outcome_scored": True,
+        "fixture_readiness": {"fixture_ready": True},
+    }
+    envelope.pop("record_sha256")
+    envelope["record_sha256"] = controller._hash(envelope)
+    path.write_text(json.dumps(envelope))
+
+    with pytest.raises(controller.ControllerError, match="freshly revalidated"):
+        fixture.run()
+    assert len(fixture.backend.convert_calls) == 1
+    assert len(fixture.backend.grade_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("accepted", "error"),
+    [(1, "non-boolean"), (False, "contradicts its component gates")],
+)
+def test_cached_acceptance_must_be_boolean_and_consistent(tmp_path, accepted, error):
+    fixture = Fixture(tmp_path, cases=1)
+    fixture.run()
+    path = next((fixture.root / "frozen-controller-completed-v1").glob("*.json"))
+    envelope = json.loads(path.read_text())
+    envelope["result"]["accepted"] = accepted
+    if accepted is False:
+        envelope["result"].update(
+            stl_strict_accepted=True,
+            reference_geometry_accepted=True,
+        )
+    envelope.pop("record_sha256")
+    envelope["record_sha256"] = controller._hash(envelope)
+    path.write_text(json.dumps(envelope))
+
+    with pytest.raises(controller.ControllerError, match=error):
+        fixture.run()
+    assert len(fixture.backend.convert_calls) == 1
+    assert len(fixture.backend.grade_calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -777,7 +848,7 @@ def _prefix_fixture(tmp_path, cases=15):
     return fixture
 
 
-def test_certified_prefix_uses_two_boundary_checks_without_new_work(tmp_path):
+def test_certified_prefix_regrades_without_repeating_conversion(tmp_path):
     fixture = _prefix_fixture(tmp_path)
     fixture.run()
     previous_conversions = len(fixture.backend.convert_calls)
@@ -791,14 +862,15 @@ def test_certified_prefix_uses_two_boundary_checks_without_new_work(tmp_path):
 
     fixture.backend.verify = verify
     result = fixture.run(batch=1)
-    assert len(checks) == 3  # Initial bootstrap, then before/after cached transaction.
+    assert len(checks) == 33  # Bootstrap/transaction plus two checks for each fresh grade.
     assert len(result['results']) == 15 and result['summary']['fresh_cases'] == 0
+    assert result['summary']['cache_revalidated_cases'] == 15
     assert all(row['cache_lookup_protocol'] == 'certified-prefix-full-boundary-checks-v1'
                for row in result['results'])
-    assert all(row['reused'] and row['timing_provenance'] == 'historical_verified_case'
+    assert all(row['reused'] and row['timing_provenance'] == 'historical_conversion_fresh_grade'
                for row in result['results'])
     assert len(fixture.backend.convert_calls) == previous_conversions
-    assert len(fixture.backend.grade_calls) == previous_gradings
+    assert len(fixture.backend.grade_calls) == previous_gradings * 2
 
 
 def test_prefix_stops_at_first_missing_case_and_preserves_fresh_batch_count(tmp_path):
@@ -850,7 +922,7 @@ def test_unscored_cache_record_does_not_enter_fast_prefix(tmp_path):
                                  fixture.manifest.parent, None)
     rows, halt = controller._load_scored_cached_prefix(
         expected, fixture.backend.identity(), record.parent, fixture.root, fixture.backend,
-        fixture.manifest, controller._digest(fixture.manifest))
+        fixture.manifest, controller._digest(fixture.manifest), fixture.config)
     assert rows == [] and halt is None
     assert len(fixture.backend.grade_calls) == 1 and not fixture.backend.readiness_calls
 
@@ -938,7 +1010,7 @@ def test_ready_source_receipt_cannot_score_partial_invalid_host_resource_grade(t
 
     def grade(case, retained, destination, artifacts, *, timeout):
         calls.append(case)
-        if len(calls) == 1:
+        if len(calls) in (1, 3):
             return original(case, retained, destination, artifacts, timeout=timeout)
         destination.write_text(json.dumps({
             "accepted": False, "fixture_readiness": {"fixture_ready": False},
@@ -958,7 +1030,8 @@ def test_ready_source_receipt_cannot_score_partial_invalid_host_resource_grade(t
     resumed = fixture.run()
     assert all(row["reused"] for row in resumed["results"])
     assert not resumed["results"][1]["solver_outcome_scored"]
-    assert len(fixture.backend.convert_calls) == len(calls) == 2
+    assert len(fixture.backend.convert_calls) == 2
+    assert len(calls) == 3
 
 
 @pytest.mark.parametrize("drained", [False, None])

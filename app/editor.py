@@ -112,34 +112,46 @@ def apply_plan_edit(run_id: str, request: PlanEditRequest) -> ReconstructionRepo
         candidate.report = score_exported_shape(
             data, candidate.directory, candidate_count=candidate.report.candidate_count
         )
+        passed = (
+            passes_geometry_gate(candidate.report, acceptance_threshold(data.diagonal))
+            and candidate.plan.representation == "semantic"
+        )
+        warnings = [
+            warning
+            for warning in current.warnings
+            if not warning.startswith(("Feature tree revision ", "Verification:"))
+        ]
+        warnings.append(
+            f"Feature tree revision {edited.revision} was edited by the user and "
+            "rebuilt against the original STL."
+        )
+        warnings.extend(
+            verification_warnings(candidate.report, acceptance_threshold(data.diagonal))
+        )
+        report = ReconstructionReport(
+            id=run_id,
+            status="complete" if passed else "best_effort",
+            mesh=data.report,
+            plan=candidate.plan,
+            score=candidate.report,
+            warnings=warnings,
+            elapsed_seconds=time.perf_counter() - started,
+        )
         _snapshot(directory, current.plan.revision)
-        for file_name in EDITABLE_ARTIFACTS:
-            shutil.copy2(candidate.directory / file_name, directory / file_name)
-
-    passed = (
-        passes_geometry_gate(candidate.report, acceptance_threshold(data.diagonal))
-        and candidate.plan.representation == "semantic"
-    )
-    warnings = [
-        warning
-        for warning in current.warnings
-        if not warning.startswith(("Feature tree revision ", "Verification:"))
-    ]
-    warnings.append(
-        f"Feature tree revision {edited.revision} was edited by the user and "
-        "rebuilt against the original STL."
-    )
-    warnings.extend(verification_warnings(candidate.report, acceptance_threshold(data.diagonal)))
-    report = ReconstructionReport(
-        id=run_id,
-        status="complete" if passed else "best_effort",
-        mesh=data.report,
-        plan=candidate.plan,
-        score=candidate.report,
-        warnings=warnings,
-        elapsed_seconds=time.perf_counter() - started,
-    )
-    save_report(report)
+        snapshot = directory / "history" / f"revision-{current.plan.revision:04d}"
+        try:
+            for file_name in EDITABLE_ARTIFACTS:
+                shutil.copy2(candidate.directory / file_name, directory / file_name)
+            save_report(report)
+        except BaseException:
+            for file_name in (*EDITABLE_ARTIFACTS, "report.json"):
+                previous = snapshot / file_name
+                destination = directory / file_name
+                if previous.is_file():
+                    shutil.copy2(previous, destination)
+                else:
+                    destination.unlink(missing_ok=True)
+            raise
     return report
 
 

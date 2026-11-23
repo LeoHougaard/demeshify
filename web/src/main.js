@@ -933,7 +933,8 @@ function renderEditorFeedback(message = "") {
   } else if (dirty) {
     editorFeedback.innerHTML = "Unsaved parameter changes · rebuild to update the solid and fit metrics.";
   } else if (activeReport?.score) {
-    editorFeedback.innerHTML = `<strong>Verified revision ${editablePlan.revision}</strong> · P95 ${activeReport.score.chamfer_p95_mm.toFixed(3)} mm · volume ${activeReport.score.volume_error_percent.toFixed(2)}%`;
+    const label = activeReport.status === "complete" ? "Verified revision" : "Best-effort revision";
+    editorFeedback.innerHTML = `<strong>${label} ${editablePlan.revision}</strong> · P95 ${activeReport.score.chamfer_p95_mm.toFixed(3)} mm · volume ${activeReport.score.volume_error_percent.toFixed(2)}%`;
   }
   document.querySelector("#undoEdit").disabled = !undoStack.length || editorBusy;
   document.querySelector("#redoEdit").disabled = !redoStack.length || editorBusy;
@@ -1407,15 +1408,15 @@ async function waitForReconstruction(runId, selectionVersion = fileSelectionVers
     }
     if (selectionVersion !== fileSelectionVersion) return null;
     renderReconstructionProgress(progress);
-    if (progress.status === "failed") {
-      throw new Error(progress.error || "Reconstruction failed.");
-    }
-    if (progress.status === "complete") {
+    if (progress.status === "failed" || progress.status === "complete") {
       const reportResponse = await fetch(`/api/runs/${runId}`, { cache: "no-store" });
-      const report = await reportResponse.json();
+      const report = await reportResponse.json().catch(() => ({}));
       if (selectionVersion !== fileSelectionVersion) return null;
-      if (!reportResponse.ok) throw new Error(report.detail || "Could not load the result.");
-      return report;
+      if (reportResponse.ok) return report;
+      if (progress.status === "failed") {
+        throw new Error(progress.error || report.detail || "Reconstruction failed.");
+      }
+      throw new Error(report.detail || "Could not load the result.");
     }
     await wait(650);
   }
@@ -1507,7 +1508,9 @@ async function renderResult(report, options = {}) {
       : "Automatic reconstruction stopped";
   const confidence = document.querySelector("#confidence");
   confidence.className = `confidence ${complete ? "good" : "caution"}`;
-  confidence.textContent = complete
+  confidence.textContent = report.status === "failed"
+    ? "Conversion failed"
+    : complete
     ? surfaceMode
       ? "Watertight verified solid"
       : "High-confidence match"

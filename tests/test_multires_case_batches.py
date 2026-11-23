@@ -7,7 +7,7 @@ import pytest
 from tools.evaluation_identity import digest
 
 
-def test_bounded_case_batches_resume_without_reconverting_or_hiding_failures(tmp_path, monkeypatch):
+def test_bounded_case_batches_revalidate_passes_without_hiding_failures(tmp_path, monkeypatch):
     import tools.benchmark_multires_corpus as benchmark
 
     # Protocol fixtures, not CAD assets or reconstruction-yield evidence.
@@ -52,16 +52,19 @@ def test_bounded_case_batches_resume_without_reconverting_or_hiding_failures(tmp
     assert not first['summary']['complete'] and first['summary']['evaluated_cases'] == 2
     assert first['summary']['strict_case_passes'] == 1
     second = run(1)
-    assert len(calls) == second['summary']['evaluated_cases'] == 3
-    assert second['summary']['fresh_cases'] == 1 and second['summary']['reused_cases'] == 2
+    assert len(calls) == 4 and second['summary']['evaluated_cases'] == 3
+    assert second['summary']['fresh_cases'] == 2 and second['summary']['reused_cases'] == 1
+    assert second['summary']['revalidated_cases'] == 1
     assert not second['summary']['complete']
     final = run(2)
-    assert len(calls) == final['summary']['evaluated_cases'] == 5
-    assert final['summary']['complete'] and final['summary']['fresh_cases'] == 2
-    assert final['summary']['reused_cases'] == 3 and not final['results'][1]['accepted']
+    assert len(calls) == 8 and final['summary']['evaluated_cases'] == 5
+    assert final['summary']['complete'] and final['summary']['fresh_cases'] == 4
+    assert final['summary']['reused_cases'] == 1 and not final['results'][1]['accepted']
+    assert final['summary']['revalidated_cases'] == 2
     resumed = run(1)
-    assert len(calls) == 5 and resumed['summary']['complete']
-    assert resumed['summary']['fresh_cases'] == 0 and resumed['summary']['reused_cases'] == 5
+    assert len(calls) == 12 and resumed['summary']['complete']
+    assert resumed['summary']['fresh_cases'] == 4 and resumed['summary']['reused_cases'] == 1
+    assert resumed['summary']['revalidated_cases'] == 4
     launches = json.loads(output.with_suffix('.launches.json').read_text())
     assert [row['batch_cases'] for row in launches] == [2, 1, 2, 1]
 

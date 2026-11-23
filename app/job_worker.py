@@ -26,17 +26,19 @@ def main() -> int:
                 stream.write(label.replace("\n", " ") + "\n")
 
         if request["mode"] == "edit":
-            report = apply_plan_edit(
+            # apply_plan_edit publishes the complete revision transactionally.
+            # Do not rewrite its report outside that rollback boundary.
+            apply_plan_edit(
                 request["run_id"], PlanEditRequest.model_validate(request["edit"])
             )
-        else:
-            operation = (
-                reconstruct_surfaces if request["engine"] == "surface_brep" else reconstruct
-            )
-            report = operation(
-                request["run_id"], Path(request["stl_path"]), request["original_name"],
-                request["input_units"], update,
-            )
+            return 0
+        operation = (
+            reconstruct_surfaces if request["engine"] == "surface_brep" else reconstruct
+        )
+        report = operation(
+            request["run_id"], Path(request["stl_path"]), request["original_name"],
+            request["input_units"], update,
+        )
         report.elapsed_seconds = time.perf_counter() - started
         atomic_write_text(request_path.parent / "report.json", report.model_dump_json(indent=2))
         return 0
