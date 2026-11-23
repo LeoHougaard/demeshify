@@ -45,6 +45,40 @@ def test_compiled_snapshot_imports_exact_source_without_copying_base(tmp_path, m
         frozen.freeze(tmp_path, runtime, 'commit', output)
 
 
+@pytest.mark.parametrize(('server_timeout', 'expected'), [(3600, 120), (90, 90)])
+def test_frozen_geometry_worker_keeps_evaluation_analytic_budget(
+    tmp_path, server_timeout, expected
+):
+    application = tmp_path / 'application'
+    app = application / 'app'
+    app.mkdir(parents=True)
+    (app / '__init__.py').write_text('')
+    (app / 'surface_reconstruction.py').write_text(
+        f'CONVERSION_TIMEOUT_SECONDS = {server_timeout}\n'
+    )
+    (app / 'job_worker.py').write_text(
+        'from .surface_reconstruction import CONVERSION_TIMEOUT_SECONDS\n'
+        'def main():\n'
+        '    assert CONVERSION_TIMEOUT_SECONDS == int(__import__("sys").argv[1])\n'
+        '    return 0\n'
+    )
+    (app / 'jobs.py').write_text(
+        'import subprocess, sys\n'
+        'from pathlib import Path\n'
+        'from types import SimpleNamespace\n'
+        'def run_bounded_process(command, **options):\n'
+        '    subprocess.run(command, check=True, **options)\n'
+        'def reconstruct_in_worker(run_id, stl, file_name, units, engine):\n'
+        f'    run_bounded_process([sys.executable, "-m", "app.job_worker", "{expected}"], '
+        'cwd=Path(__file__).parents[1])\n'
+        '    return SimpleNamespace(status="complete")\n'
+    )
+    entry = application / 'converter.pyc'
+    frozen.compile_module(frozen.ENTRY.encode(), 'converter.py', entry)
+    subprocess.run([sys.executable, '-I', '-B', str(entry), str(tmp_path), 'mm'], check=True)
+    assert json.loads((tmp_path / 'bootstrap-result.json').read_text())['complete'] is True
+
+
 @pytest.mark.parametrize('mutation', ['application', 'runtime', 'extra_cad', 'manifest'])
 def test_pinned_verification_rejects_changed_or_extra_artifacts(tmp_path, monkeypatch, mutation):
     runtime, output, identity = artifact(tmp_path, monkeypatch)

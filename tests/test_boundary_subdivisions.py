@@ -159,3 +159,16 @@ def test_cleanup_does_not_merge_distinct_nearby_vertices(tmp_path: Path):
     assert data.report.body_count == data.report.solid_count == 2
     assert data.report.watertight
     assert data.report.nonmanifold_edge_count == 0
+
+
+def test_cleanup_preserves_first_occurrence_order_when_merging_exact_vertices(tmp_path: Path):
+    path = tmp_path / "box.stl"
+    trimesh.creation.box().export(path)
+    source = trimesh.load_mesh(path, process=False)
+    source_vertices = np.asarray(source.vertices)
+    _, first = np.unique(source_vertices, axis=0, return_index=True)
+
+    data = load_mesh(path, path.name)
+
+    np.testing.assert_array_equal(data.mesh.vertices, source_vertices[np.sort(first)])
+    np.testing.assert_array_equal(data.mesh.triangles, source.triangles)
