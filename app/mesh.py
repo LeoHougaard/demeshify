@@ -202,7 +202,11 @@ def load_mesh(path: Path, file_name: str, input_units: str = "mm") -> MeshData:
         return_index=True,
         return_inverse=True,
     )
-    mesh.update_vertices(mask=first_vertices, inverse=inverse_vertices.reshape(-1))
+    # Keep the original STL vertex order for downstream adjacency and curve fits.
+    order = np.argsort(first_vertices)
+    remap = np.empty_like(order)
+    remap[order] = np.arange(len(order))
+    mesh.update_vertices(mask=first_vertices[order], inverse=remap[inverse_vertices.reshape(-1)])
     scale = UNIT_SCALE[input_units]
     if scale != 1.0:
         mesh.apply_scale(scale)
