@@ -986,6 +986,10 @@ def _revalidate_scored_cache(
         if _retained_hashes(retained, root) != hashes:
             raise ControllerError("Retained output changed during cache revalidation")
     except Exception as exc:
+        # Preserve the native seal proof's type for callers monitoring catalog
+        # changes; all other failed revalidations fail closed as controller errors.
+        if type(exc).__name__ == "SealError":
+            raise
         # A cached success is only a locator, never authority to publish a pass.
         raise ControllerError("Cached success could not be freshly revalidated") from exc
     row = {**reused, **grade}

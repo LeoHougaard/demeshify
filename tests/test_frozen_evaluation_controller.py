@@ -927,6 +927,26 @@ def test_unscored_cache_record_does_not_enter_fast_prefix(tmp_path):
     assert len(fixture.backend.grade_calls) == 1 and not fixture.backend.readiness_calls
 
 
+def test_cache_revalidation_preserves_native_seal_error_type(tmp_path):
+    fixture = _prefix_fixture(tmp_path, cases=1)
+    fixture.run()
+
+    class SealError(RuntimeError):
+        pass
+
+    calls = 0
+
+    def verify():
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise SealError("Immutable directory changed during the live session")
+
+    fixture.backend.verify = verify
+    with pytest.raises(SealError, match="Immutable directory changed"):
+        fixture.run()
+
+
 @pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows seal proof')
 def test_native_prefix_boundary_detects_transient_catalog_changes(tmp_path, monkeypatch):
     from tools import sealed_runtime as sealed
