@@ -1,5 +1,4 @@
 const STARTUP_TIMEOUT = 180_000;
-const CONVERSION_TIMEOUT = 120_000;
 const MAX_INPUT_BYTES = 250 * 1024 * 1024;
 const contentTypes = { step: 'application/step', stl: 'model/stl', json: 'application/json' };
 
@@ -69,7 +68,7 @@ function run(file, units, { mode, onProgress, signal }, reason = '') {
       switch (data.type) {
         case 'ready':
           phase = 'conversion';
-          timeout(CONVERSION_TIMEOUT, 'CAD reconstruction exceeded two minutes.', true);
+          clearTimeout(timer);
           break;
         case 'progress':
           onProgress?.({ ...data.progress, elapsed_seconds: (performance.now() - started) / 1000 });

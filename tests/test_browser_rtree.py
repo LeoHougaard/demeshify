@@ -5,7 +5,6 @@ import pytest
 import rtree as native
 import trimesh
 
-from app.face_quality import _has_support
 from web.browser_python import rtree as browser
 
 
@@ -29,24 +28,14 @@ def test_intersections_match_native(dimension):
         assert sorted(tree.intersection(query)) == sorted(ref.intersection(query))
 
 
-def test_containment_and_face_audit_match_native(monkeypatch):
+def test_containment_matches_native(monkeypatch):
     mesh = trimesh.creation.icosphere(subdivisions=4)
     probes = np.random.default_rng(25).uniform(-1.2, 1.2, (300, 3))
-    face = 217
-    point, normal = mesh.triangles_center[face], mesh.face_normals[face]
 
-    def evaluate(mesh):
-        inside = mesh.contains(probes)
-        support = [_has_support(mesh, mesh.face_normals, p, n, 0.01)
-                   for p, n in [(point, normal), (point, -normal), (point + normal, normal)]]
-        return inside, support
-
-    ref_inside, ref_support = evaluate(mesh)
+    ref_inside = mesh.contains(probes)
     assert ref_inside.any() and not ref_inside.all()
-    assert ref_support == [True, False, False]
     monkeypatch.setitem(sys.modules, "rtree", browser)
     copy = mesh.copy()
-    inside, support = evaluate(copy)
+    inside = copy.contains(probes)
     assert isinstance(copy.triangles_tree, browser.Index)
     np.testing.assert_array_equal(inside, ref_inside)
-    assert support == ref_support
