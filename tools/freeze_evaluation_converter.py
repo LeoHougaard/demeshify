@@ -16,7 +16,16 @@ import sys
 from pathlib import Path, PurePosixPath
 
 FORBIDDEN = {'.step', '.stp', '.stl', '.brep', '.3mf'}
-ENTRY = '''import json
+# Keep the frozen evaluation budget independent of the local API's job timeout.
+ANALYTIC_TIMEOUT_SECONDS = 120
+GEOMETRY_JOB = f'''from app import surface_reconstruction
+surface_reconstruction.CONVERSION_TIMEOUT_SECONDS = min(
+    surface_reconstruction.CONVERSION_TIMEOUT_SECONDS, {ANALYTIC_TIMEOUT_SECONDS}
+)
+from app.job_worker import main
+raise SystemExit(main())
+'''
+ENTRY = f'GEOMETRY_JOB = {GEOMETRY_JOB!r}\n' + '''import json
 from pathlib import Path
 import sys
 if len(sys.argv) != 3 or sys.argv[2] not in ('mm', 'cm', 'm', 'in'):
@@ -25,9 +34,19 @@ job = Path(sys.argv[1]).resolve()
 sys.stdout = (job / 'bootstrap.stdout.log').open('w')
 sys.stderr = (job / 'bootstrap.stderr.log').open('w')
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from app.jobs import reconstruct_in_worker
-report = reconstruct_in_worker('case', job / 'input.stl', 'input.stl', sys.argv[2],
-                               engine='surface_brep')
+from app import jobs
+run_bounded_process = jobs.run_bounded_process
+
+
+def run_evaluation_process(command, **options):
+    if command[1:3] == ['-m', 'app.job_worker']:
+        command = [command[0], '-c', GEOMETRY_JOB, *command[3:]]
+    return run_bounded_process(command, **options)
+
+
+jobs.run_bounded_process = run_evaluation_process
+report = jobs.reconstruct_in_worker('case', job / 'input.stl', 'input.stl', sys.argv[2],
+                                    engine='surface_brep')
 (job / 'bootstrap-result.json').write_text(json.dumps({'complete': True,
                                                      'status': report.status}) + '\\n')
 '''
@@ -141,6 +160,7 @@ def freeze(project: Path, python_runtime: Path, revision: str, output: Path) -> 
     manifest = {'schema': 1, 'source_revision': commit, 'source_sha256': hashes,
                 'builder_sha256': builder_hash,
                 'entry_source_sha256': hashlib.sha256(ENTRY.encode()).hexdigest(),
+                'analytic_timeout_seconds': ANALYTIC_TIMEOUT_SECONDS,
                 'python_version': sys.version, 'python_magic': importlib.util.MAGIC_NUMBER.hex(),
                 'python_runtime': str(python_runtime), 'runtime_files': base_files,
                 'application_files': inventory(application),
